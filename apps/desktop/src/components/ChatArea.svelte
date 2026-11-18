@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher, tick } from 'svelte';
   import { getAuthHeaders } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import MessageItem from './MessageItem.svelte';
+  import InlineEmojiPicker from './InlineEmojiPicker.svelte';
 
   export let channelId: string;
 
@@ -32,6 +33,19 @@
   let selectionMode = false;
   let selectedMessages: string[] = [];
   let highlightedMessageId: string | null = null;
+  let messageInput: HTMLInputElement;
+
+  // Insert the picked emoji where the cursor is, then put the cursor after it.
+  async function insertEmoji(event: CustomEvent<string>) {
+    const emoji = event.detail;
+    const start = messageInput?.selectionStart ?? newMessage.length;
+    const end = messageInput?.selectionEnd ?? newMessage.length;
+    newMessage = newMessage.slice(0, start) + emoji + newMessage.slice(end);
+    await tick();
+    messageInput?.focus();
+    const pos = start + emoji.length;
+    messageInput?.setSelectionRange(pos, pos);
+  }
 
   $: if (channelId) {
     loadMessages();
@@ -275,15 +289,12 @@
         <input type="file" class="hidden" accept="image/*,video/*,.pdf,.txt" on:change={handleFileSelect} />
       </label>
 
-      <!-- Emoji Button -->
-      <button type="button" class="px-3 py-2 border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow flex items-center justify-center" title="Emoji (Coming Soon)">
-        <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-        </svg>
-      </button>
+      <!-- Emoji Picker -->
+      <InlineEmojiPicker on:select={insertEmoji} />
 
       <!-- Text Input -->
       <input
+        bind:this={messageInput}
         bind:value={newMessage}
         type="text"
         class="flex-1 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"

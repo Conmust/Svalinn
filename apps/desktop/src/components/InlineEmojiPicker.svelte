@@ -46,7 +46,7 @@
 <div class="inline-emoji-picker relative">
   <button
     type="button"
-    class="h-10 w-10 bg-black border border-[#00ff00] flex items-center justify-center text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow flex-shrink-0"
+    class="px-3 py-2 h-full bg-black border border-[#00ff00] flex items-center justify-center text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow flex-shrink-0"
     on:click|preventDefault={toggle}
     title="Insert emoji"
   >
@@ -56,7 +56,7 @@
   </button>
 
   {#if isOpen}
-    <div class="absolute bottom-full right-0 mb-2 w-80 bg-black border-2 border-[#00ff00] shadow-[0_0_20px_rgba(0,255,0,0.4)] z-50 flex flex-col">
+    <div class="absolute bottom-full left-0 mb-2 w-80 bg-black border-2 border-[#00ff00] shadow-[0_0_20px_rgba(0,255,0,0.4)] z-50 flex flex-col">
       <div class="px-3 py-2 border-b border-[#00ff00] bg-[#0a0e0a] flex items-center gap-2">
         <div class="w-2 h-2 bg-[#00ff00] rounded-full animate-pulse"></div>
         <span class="text-xs font-bold uppercase tracking-widest text-[#00ff00] terminal-glow">
