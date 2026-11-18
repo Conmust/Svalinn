@@ -151,6 +151,16 @@ async fn main() {
             delete(routes::reactions::remove_reaction),
         )
         
+        // --- Conversation (DM) Routes ---
+        .route(
+            "/api/v1/conversations",
+            get(routes::conversations::get_user_conversations).post(routes::conversations::create_or_get_conversation),
+        )
+        .route(
+            "/api/v1/conversations/:conversation_id/messages",
+            get(routes::conversations::get_conversation_messages).post(routes::conversations::send_conversation_message),
+        )
+
         // --- Emoji Routes ---
         .route(
             "/api/v1/servers/:server_id/emojis",
