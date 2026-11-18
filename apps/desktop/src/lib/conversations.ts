@@ -1,5 +1,5 @@
 import { getAuthHeaders, apiFetch, apiBase } from './api';
-import { type Message, type UploadedFile } from './messages';
+import { type UploadedFile } from './messages';
 
 
 export interface Conversation {
@@ -39,8 +39,35 @@ export async function createConversation(participantId: string): Promise<Convers
   return response.json();
 }
 
-export async function fetchConversationMessages(conversationId: string): Promise<any[]> {
-  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
+/** A direct message, as returned by the conversation message endpoints. */
+export interface ConversationMessage {
+  id: string;
+  conversation_id: string;
+  user_id: string;
+  username: string;
+  content: string;
+  attachment_url?: string | null;
+  attachment_filename?: string | null;
+  attachment_size?: number | null;
+  attachment_mime_type?: string | null;
+  is_edited: boolean;
+  created_at: string;
+}
+
+export interface GetConversationMessagesOptions {
+  limit?: number;
+  before?: string;
+}
+
+export async function fetchConversationMessages(
+  conversationId: string,
+  options: GetConversationMessagesOptions = {}
+): Promise<ConversationMessage[]> {
+  const params = new URLSearchParams();
+  if (options.limit) params.append('limit', options.limit.toString());
+  if (options.before) params.append('before', options.before);
+
+  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages?${params}`, {
     headers: getAuthHeaders(),
   });
 
@@ -55,7 +82,7 @@ export async function sendDirectMessage(
   conversationId: string,
   content: string,
   attachment?: UploadedFile | null
-): Promise<Message> {
+): Promise<ConversationMessage> {
   const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
