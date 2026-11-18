@@ -4,6 +4,7 @@ use axum::{
 };
 use uuid::Uuid;
 
+use crate::access::require_member;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -20,18 +21,20 @@ pub struct ServerMember {
 
 pub async fn get_server_members(
     State(db): State<Database>,
-    CurrentUser(_user_id): CurrentUser,
+    CurrentUser(user_id): CurrentUser,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<ServerMember>>, AppError> {
+    require_member(&db, server_id, user_id).await?;
+
     let members: Vec<ServerMember> = sqlx::query_as(
         r#"
         SELECT 
             u.id,
             u.username,
-            u.is_online,
-            u.status,
-            sm.role,
-            u.patron_tier
+            COALESCE(u.is_online, false) AS is_online,
+            COALESCE(u.status, 'offline') AS status,
+            COALESCE(sm.role, 'member') AS role,
+            COALESCE(u.patron_tier, 'free') AS patron_tier
         FROM server_members sm
         JOIN users u ON sm.user_id = u.id
         WHERE sm.server_id = $1

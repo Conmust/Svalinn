@@ -37,29 +37,40 @@
     loadMessages();
   }
 
+  // Named handlers so onDestroy removes only this component's listeners
+  // (ChannelList listens to the same events).
+  function onNewMessage(data: Message) {
+    if (data.channel_id !== channelId) return;
+    addMessage(data);
+    scrollToBottom();
+  }
+
+  function onMessageDeleted(data: { message_id: string }) {
+    messages = messages.filter(m => m.id !== data.message_id);
+  }
+
+  function onMessageUpdated(data: Message) {
+    messages = messages.map(m => m.id === data.id ? { ...m, ...data } : m);
+  }
+
+  // The sender gets their message both from the POST response and from the
+  // WebSocket broadcast, so skip ids we already have.
+  function addMessage(message: Message) {
+    if (messages.some(m => m.id === message.id)) return;
+    messages = [...messages, message];
+  }
+
   onMount(() => {
     wsClient.connect();
-
-    wsClient.on('new_message', (data) => {
-      if (data.channel_id === channelId) {
-        messages = [...messages, data];
-        scrollToBottom();
-      }
-    });
-
-    wsClient.on('message_deleted', (data) => {
-      messages = messages.filter(m => m.id !== data.message_id);
-    });
-
-    wsClient.on('message_updated', (data) => {
-      messages = messages.map(m => m.id === data.id ? { ...m, ...data } : m);
-    });
+    wsClient.on('new_message', onNewMessage);
+    wsClient.on('message_deleted', onMessageDeleted);
+    wsClient.on('message_updated', onMessageUpdated);
   });
 
   onDestroy(() => {
-    wsClient.off('new_message');
-    wsClient.off('message_deleted');
-    wsClient.off('message_updated');
+    wsClient.off('new_message', onNewMessage);
+    wsClient.off('message_deleted', onMessageDeleted);
+    wsClient.off('message_updated', onMessageUpdated);
   });
 
   async function loadMessages() {
@@ -116,7 +127,7 @@
         const createdMessage = await response.json();
         
         // 2. Immediately add it to the local array so it shows up instantly!
-        messages = [...messages, createdMessage];
+        addMessage(createdMessage);
         
         // 3. Clean up the input
         newMessage = '';
@@ -168,6 +179,7 @@
 
     selectedMessages = [];
     selectionMode = false;
+    await loadMessages();
   }
 
   function handleUserClick(userId: string) {

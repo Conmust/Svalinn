@@ -3,8 +3,15 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BroadcastMessage {
+    /// Sent as `type`, which is the field the desktop client's WebSocket
+    /// handler reads (`data.type`).
+    #[serde(rename = "type")]
     pub event_type: String,
     pub payload: serde_json::Value,
+    /// Server the event belongs to. Only members of this server receive it.
+    /// Not sent to clients.
+    #[serde(skip)]
+    pub server_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]

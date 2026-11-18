@@ -6,6 +6,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::access::{channel_server_id, require_member, safe_extension};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -28,26 +29,54 @@ pub struct Message {
 }
 
 /// GET /api/v1/channels/:channel_id/messages
+///
+/// Returns the latest 100 messages (oldest first) and marks the channel as
+/// read for the current user.
 pub async fn get_channel_messages(
     State(db): State<Database>,
-    CurrentUser(_user_id): CurrentUser,
+    CurrentUser(user_id): CurrentUser,
     Path(channel_id): Path<Uuid>,
 ) -> Result<Json<Vec<Message>>, AppError> {
+    let server_id = channel_server_id(&db, channel_id).await?;
+    require_member(&db, server_id, user_id).await?;
+
     let messages: Vec<Message> = sqlx::query_as(
         r#"
-        SELECT 
-            m.id, m.channel_id, m.user_id, u.username, m.content,
-            m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
-            m.is_edited, m.is_locked, m.is_pinned, m.created_at
-        FROM messages m
-        JOIN users u ON m.user_id = u.id
-        WHERE m.channel_id = $1
-        ORDER BY m.created_at ASC
-        LIMIT 100
+        SELECT * FROM (
+            SELECT 
+                m.id, m.channel_id, m.user_id, u.username, m.content,
+                m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
+                COALESCE(m.is_edited, false) AS is_edited,
+                COALESCE(m.is_locked, false) AS is_locked,
+                COALESCE(m.is_pinned, false) AS is_pinned,
+                m.created_at
+            FROM messages m
+            JOIN users u ON m.user_id = u.id
+            WHERE m.channel_id = $1
+            ORDER BY m.created_at DESC
+            LIMIT 100
+        ) latest
+        ORDER BY created_at ASC
         "#,
     )
     .bind(channel_id)
     .fetch_all(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Opening a channel marks it as read, so `has_unread` clears.
+    sqlx::query(
+        r#"
+        INSERT INTO channel_reads (user_id, channel_id, last_read_message_id, last_read_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (user_id, channel_id)
+        DO UPDATE SET last_read_message_id = EXCLUDED.last_read_message_id, last_read_at = NOW()
+        "#,
+    )
+    .bind(user_id)
+    .bind(channel_id)
+    .bind(messages.last().map(|m| m.id))
+    .execute(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -61,6 +90,9 @@ pub async fn create_message(
     Path(channel_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<Json<Message>, AppError> {
+    let server_id = channel_server_id(&db, channel_id).await?;
+    require_member(&db, server_id, user_id).await?;
+
     let mut content = String::new();
     let mut attachment_url: Option<String> = None;
     let mut attachment_filename: Option<String> = None;
@@ -80,12 +112,12 @@ pub async fn create_message(
             let size = bytes.len() as i64;
 
             // Save file locally
-            let file_ext = filename.split('.').last().unwrap_or("bin");
+            let file_ext = safe_extension(&filename, "bin");
             let new_filename = format!("msg_{}_{}.{}", Uuid::new_v4(), user_id, file_ext);
             let file_path = format!("uploads/{}", new_filename);
             
-            std::fs::create_dir_all("uploads").map_err(|e| AppError::Database(e.to_string()))?;
-            std::fs::write(&file_path, bytes).map_err(|e| AppError::Database(e.to_string()))?;
+            tokio::fs::create_dir_all("uploads").await.map_err(|e| AppError::Internal(e.to_string()))?;
+            tokio::fs::write(&file_path, bytes).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
             attachment_url = Some(format!("/uploads/{}", new_filename));
             attachment_filename = Some(filename);
@@ -116,7 +148,7 @@ pub async fn create_message(
 
     // 2. Fetch the full message object with the username joined
     let message: Message = sqlx::query_as(
-        "SELECT m.id, m.channel_id, m.user_id, u.username, m.content, m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size, m.is_edited, m.is_locked, m.is_pinned, m.created_at 
+        "SELECT m.id, m.channel_id, m.user_id, u.username, m.content, m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size, COALESCE(m.is_edited, false) AS is_edited, COALESCE(m.is_locked, false) AS is_locked, COALESCE(m.is_pinned, false) AS is_pinned, m.created_at 
          FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $1"
     )
     .bind(msg_id)
@@ -127,7 +159,8 @@ pub async fn create_message(
     // 3. Broadcast the new message to all connected WebSocket clients!
     let broadcast_msg = crate::models::message::BroadcastMessage {
         event_type: "new_message".to_string(),
-        payload: serde_json::to_value(&message).map_err(|e| AppError::Database(e.to_string()))?,
+        payload: serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?,
+        server_id: Some(server_id),
     };
     
     // Send to broadcast channel (ignore error if no receivers)
@@ -195,6 +228,7 @@ pub async fn delete_message(
     let broadcast_msg = crate::models::message::BroadcastMessage {
         event_type: "message_deleted".to_string(),
         payload: serde_json::json!({ "message_id": message_id }),
+        server_id: Some(server_id),
     };
     let _ = db.message_tx.send(broadcast_msg);
 

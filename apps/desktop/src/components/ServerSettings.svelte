@@ -17,7 +17,26 @@
   let uploadFile: File | null = null;
   let uploadError = '';
 
-  onMount(() => {
+  let loaded = false;
+
+  onMount(async () => {
+    // Load the current values first. Saving the form sends every field, so
+    // saving with unloaded defaults would wipe the server's real name/icon.
+    try {
+      const res = await fetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const server = await res.json();
+        serverName = server.name ?? '';
+        serverDescription = server.description ?? '';
+        serverIconUrl = server.icon_url ?? '';
+      }
+    } catch (e) {
+      console.error('Failed to load server settings:', e);
+    } finally {
+      loaded = true;
+    }
     if (activeTab === 'emojis') loadEmojis();
   });
 
@@ -34,6 +53,7 @@
 
   async function handleSaveOverview(e: Event) {
     e.preventDefault();
+    if (!loaded) return;
     const res = await fetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
@@ -46,7 +66,8 @@
     if (res.ok) {
       dispatch('saved');
     } else {
-      alert('Failed to save server settings');
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Failed to save server settings');
     }
   }
 

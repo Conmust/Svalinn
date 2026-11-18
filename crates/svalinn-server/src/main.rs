@@ -1,3 +1,4 @@
+mod access;
 mod db;
 mod errors;
 mod extractors;
@@ -27,8 +28,10 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
-    // 3. Build the application router
+    // 4. Build the application router
     let app = Router::new()
+        .route("/health", get(routes::health::health_check))
+
         // --- Auth Routes ---
         .route("/api/v1/auth/register", post(routes::auth::register))
         .route("/api/v1/auth/login", post(routes::auth::login))
@@ -36,9 +39,20 @@ async fn main() {
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))
         .route("/api/v1/servers", post(routes::servers::create_server))
-        .route("/api/v1/servers/:server_id", patch(routes::servers::update_server))
-        
-        // --- Channel Routes (ADD THESE TWO LINES) ---
+        .route(
+            "/api/v1/servers/:server_id",
+            get(routes::servers::get_server).patch(routes::servers::update_server),
+        )
+        .route("/api/v1/servers/:server_id/members", get(routes::members::get_server_members))
+        .route("/api/v1/servers/:server_id/role", get(routes::members::get_user_role_in_server))
+
+        // --- User Routes ---
+        .route("/api/v1/users/me", get(routes::users::get_current_user))
+        .route("/api/v1/users/me/status", patch(routes::users::update_status))
+        .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
+        .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))
+
+        // --- Channel Routes ---
         .route("/api/v1/servers/:server_id/channels", get(routes::channels::get_server_channels))
         .route("/api/v1/servers/:server_id/channels", post(routes::channels::create_channel))
         
@@ -80,7 +94,7 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(db); // Now receives the unwrapped `Database` struct
 
-    // 4. Start the server
+    // 5. Start the server
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
         .await
         .expect("Failed to bind to port 3001");

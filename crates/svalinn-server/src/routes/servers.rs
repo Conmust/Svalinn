@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::access::{require_admin, require_member};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -14,11 +15,6 @@ use crate::extractors::auth::CurrentUser;
 
 #[derive(Deserialize)]
 pub struct CreateServerRequest {
-    pub name: String,
-}
-
-#[derive(Deserialize)]
-pub struct CreateChannelRequest {
     pub name: String,
 }
 
@@ -39,23 +35,6 @@ pub struct Server {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub icon_url: Option<String>,
     pub description: Option<String>,
-}
-
-#[derive(Serialize, FromRow)]
-pub struct Channel {
-    pub id: Uuid,
-    pub server_id: Uuid,
-    pub name: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Serialize, FromRow)]
-pub struct ChannelWithUnread {
-    pub id: Uuid,
-    pub server_id: Uuid,
-    pub name: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub has_unread: bool,
 }
 
 // ---------- GET USER SERVERS ----------
@@ -128,82 +107,24 @@ pub async fn create_server(
     Ok(Json(server))
 }
 
-// ---------- GET SERVER CHANNELS (with unread status) ----------
+// ---------- GET SERVER ----------
 
-pub async fn get_server_channels(
+pub async fn get_server(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Path(server_id): Path<Uuid>,
-) -> Result<Json<Vec<ChannelWithUnread>>, AppError> {
-    let channels: Vec<ChannelWithUnread> = sqlx::query_as(
-        r#"
-        SELECT 
-            c.id, c.server_id, c.name, c.created_at,
-            COALESCE(
-                EXISTS(
-                    SELECT 1 FROM messages m
-                    WHERE m.channel_id = c.id
-                    AND m.id != COALESCE(
-                        (SELECT last_read_message_id FROM channel_reads WHERE user_id = $2 AND channel_id = c.id),
-                        '00000000-0000-0000-0000-000000000000'::uuid
-                    )
-                    AND m.created_at > COALESCE(
-                        (SELECT last_read_at FROM channel_reads WHERE user_id = $2 AND channel_id = c.id),
-                        '1970-01-01'::timestamptz
-                    )
-                ),
-                false
-            ) as has_unread
-        FROM channels c
-        JOIN server_members sm ON c.server_id = sm.server_id
-        WHERE c.server_id = $1 AND sm.user_id = $2
-        ORDER BY c.created_at ASC
-        "#,
+) -> Result<Json<Server>, AppError> {
+    require_member(&db, server_id, user_id).await?;
+
+    let server: Server = sqlx::query_as(
+        "SELECT id, name, owner_id, created_at, icon_url, description FROM servers WHERE id = $1",
     )
     .bind(server_id)
-    .bind(user_id)
-    .fetch_all(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    Ok(Json(channels))
-}
-
-// ---------- CREATE CHANNEL ----------
-
-pub async fn create_channel(
-    State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
-    Path(server_id): Path<Uuid>,
-    Json(payload): Json<CreateChannelRequest>,
-) -> Result<Json<Channel>, AppError> {
-    if payload.name.trim().is_empty() {
-        return Err(AppError::BadRequest("Channel name cannot be empty".into()));
-    }
-
-    let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
-    )
-    .bind(server_id)
-    .bind(user_id)
     .fetch_one(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if !is_member {
-        return Err(AppError::Forbidden("You are not a member of this server".into()));
-    }
-
-    let channel: Channel = sqlx::query_as(
-        "INSERT INTO channels (server_id, name) VALUES ($1, $2) RETURNING id, server_id, name, created_at",
-    )
-    .bind(server_id)
-    .bind(&payload.name)
-    .fetch_one(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    Ok(Json(channel))
+    Ok(Json(server))
 }
 
 // ---------- UPDATE SERVER ----------
@@ -214,25 +135,19 @@ pub async fn update_server(
     Path(server_id): Path<Uuid>,
     Json(payload): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
-    // Check if user is admin/owner
-    let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    require_admin(&db, server_id, user_id).await?;
 
-    if !matches!(role.as_deref(), Some("admin" | "owner")) {
-        return Err(AppError::Forbidden("Only admins can update server settings".into()));
+    if let Some(name) = &payload.name {
+        if name.trim().is_empty() {
+            return Err(AppError::BadRequest("Server name cannot be empty".into()));
+        }
     }
 
     // Use COALESCE to update only the provided fields, keeping existing values for None
     sqlx::query(
         "UPDATE servers SET name = COALESCE($1, name), description = COALESCE($2, description), icon_url = COALESCE($3, icon_url) WHERE id = $4",
     )
-    .bind(&payload.name)
+    .bind(payload.name.as_deref().map(str::trim))
     .bind(&payload.description)
     .bind(&payload.icon_url)
     .bind(server_id)

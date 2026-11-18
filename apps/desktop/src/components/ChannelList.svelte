@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, createEventDispatcher } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { getAuthHeaders } from '../lib/api';
   import { logout } from '../lib/auth';
   import { wsClient } from '../lib/websocket';
@@ -7,6 +7,7 @@
 
   export let currentUser: any;
   export let activeServer: string | null = null;
+  export let activeChannel: string | null = null;
 
   const dispatch = createEventDispatcher();
 
@@ -21,7 +22,6 @@
   let channels: Channel[] = [];
   let loading = true;
   let showServerSettings = false;
-  let currentServerName = 'Server';
   let showCreateChannelModal = false;
   let newChannelName = '';
   let createChannelError = '';
@@ -30,16 +30,21 @@
     loadChannels(activeServer);
   }
 
+  function onNewMessage(data: { channel_id?: string; user_id?: string }) {
+    if (!data.channel_id || data.channel_id === activeChannel) return;
+    if (data.user_id === currentUser?.id) return;
+    channels = channels.map(c =>
+      c.id === data.channel_id ? { ...c, has_unread: true } : c
+    );
+  }
+
   onMount(() => {
     wsClient.connect();
-    
-    wsClient.on('new_message', (data) => {
-      if (data.channel_id) {
-        channels = channels.map(c => 
-          c.id === data.channel_id ? { ...c, has_unread: true } : c
-        );
-      }
-    });
+    wsClient.on('new_message', onNewMessage);
+  });
+
+  onDestroy(() => {
+    wsClient.off('new_message', onNewMessage);
   });
 
    async function loadChannels(serverId: string) {
@@ -237,7 +242,6 @@
   {#if showServerSettings && activeServer}
     <ServerSettings 
       serverId={activeServer} 
-      serverName={currentServerName}
       on:close={() => showServerSettings = false}
       on:saved={() => { showServerSettings = false; }}
     />

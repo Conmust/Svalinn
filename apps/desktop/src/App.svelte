@@ -88,6 +88,7 @@
       <ChannelList 
         {currentUser}
         activeServer={activeServer}
+        activeChannel={activeChannel}
         on:channelSelected={handleChannelSelected}
         on:createChannel={handleCreateChannel}
         on:logout={handleLogout}

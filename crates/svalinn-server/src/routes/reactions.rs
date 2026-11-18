@@ -84,6 +84,7 @@ pub async fn add_reaction(
     let broadcast_msg = crate::models::message::BroadcastMessage {
         event_type: "reaction_added".to_string(),
         payload: serde_json::to_value(&reaction).map_err(|e| AppError::Database(e.to_string()))?,
+        server_id: None,
     };
     let _ = db.message_tx.send(broadcast_msg);
 
@@ -114,6 +115,7 @@ pub async fn remove_reaction(
             "user_id": user_id,
             "emoji": emoji
         }),
+        server_id: None,
     };
     let _ = db.message_tx.send(broadcast_msg);
 

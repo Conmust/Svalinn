@@ -80,9 +80,33 @@ async fn handle_socket_connection(
     // 4. Subscribe to the global broadcast channel
     let mut broadcast_rx = db.message_tx.subscribe();
 
-    // 5. Spawn a task to forward broadcast messages to the client's mpsc channel
+    // 5. Spawn a task to forward broadcast messages to the client's mpsc channel.
+    //    Events tied to a server are only forwarded to members of that server.
+    let pool = db.pool.clone();
     let broadcast_task = tokio::spawn(async move {
-        while let Ok(broadcast_msg) = broadcast_rx.recv().await {
+        loop {
+            let broadcast_msg = match broadcast_rx.recv().await {
+                Ok(msg) => msg,
+                // Slow client fell behind: skip the missed events, keep going.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            if let Some(server_id) = broadcast_msg.server_id {
+                let is_member: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
+                )
+                .bind(server_id)
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+
+                if !is_member {
+                    continue;
+                }
+            }
+
             if let Ok(json_str) = serde_json::to_string(&broadcast_msg) {
                 // If send fails, the client disconnected, so we break
                 if tx.send(Message::Text(json_str)).is_err() {

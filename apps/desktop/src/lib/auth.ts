@@ -61,6 +61,15 @@ export async function register(username: string, email: string, password: string
   return data.user;
 }
 
+export function setAuth(token: string, user: User): void {
+  localStorage.setItem('token', token);
+  localStorage.setItem('user', JSON.stringify(user));
+}
+
+export function updateUserInStorage(user: User): void {
+  localStorage.setItem('user', JSON.stringify(user));
+}
+
 export function logout(): void {
   localStorage.removeItem('token');
   localStorage.removeItem('user');

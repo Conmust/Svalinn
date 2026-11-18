@@ -1,11 +1,12 @@
 use sqlx::postgres::PgPoolOptions;
+use sqlx::Executor;
 use std::fs;
 use std::path::Path;
-#[allow(dead_code)]
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    
+
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL is required");
 
@@ -17,14 +18,25 @@ async fn main() {
         .expect("Failed to connect to database");
 
     println!("Connected! Running migrations...\n");
-    
+
     let migrations_dir = Path::new("./migrations");
-    
+
     if !migrations_dir.exists() {
         eprintln!("❌ Error: migrations directory not found at {:?}", migrations_dir);
         eprintln!("Make sure you're running this from the workspace root (svalinn/ folder)");
         std::process::exit(1);
     }
+
+    // Track which migrations have already been applied, so files that change
+    // data (seeding, status resets, ...) only run once per database.
+    pool.execute(
+        "CREATE TABLE IF NOT EXISTS _svalinn_migrations (
+            filename TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .await
+    .expect("Failed to create migrations tracking table");
 
     let mut entries = fs::read_dir(migrations_dir)
         .expect("Failed to read migrations directory")
@@ -46,34 +58,47 @@ async fn main() {
 
     for entry in entries {
         let path = entry.path();
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+
+        let already_applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM _svalinn_migrations WHERE filename = $1)",
+        )
+        .bind(&filename)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to read migrations tracking table");
+
+        if already_applied {
+            println!("- {} (already applied)", filename);
+            continue;
+        }
+
         println!("Running migration: {}", filename);
-        
+
         let sql = fs::read_to_string(&path)
-            .expect(&format!("Failed to read migration file: {}", filename));
+            .unwrap_or_else(|e| panic!("Failed to read migration file {}: {}", filename, e));
 
-        // Split by semicolons and execute each statement separately
-        let statements: Vec<&str> = sql
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Run the whole file in one transaction. The file is sent as a single
+        // simple query, so multi-statement files and `DO $$ ... $$` blocks
+        // (which contain semicolons) work. Splitting on ';' broke those.
+        let mut tx = pool.begin().await.expect("Failed to start transaction");
 
-        for (i, statement) in statements.iter().enumerate() {
-            match sqlx::query(statement).execute(&pool).await {
-                Ok(_) => {
-                    if i == statements.len() - 1 {
-                        println!("✓ {}\n", filename);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ Failed to run migration: {}", filename);
-                    eprintln!("Error on statement {}: {}\n", i + 1, e);
-                    std::process::exit(1);
-                }
+        if !sql.trim().is_empty() {
+            if let Err(e) = (&mut *tx).execute(sql.as_str()).await {
+                eprintln!("❌ Failed to run migration: {}", filename);
+                eprintln!("Error: {}\n", e);
+                std::process::exit(1);
             }
         }
+
+        sqlx::query("INSERT INTO _svalinn_migrations (filename) VALUES ($1)")
+            .bind(&filename)
+            .execute(&mut *tx)
+            .await
+            .expect("Failed to record migration");
+
+        tx.commit().await.expect("Failed to commit migration");
+        println!("✓ {}\n", filename);
     }
 
     println!("✅ All migrations completed successfully!");
