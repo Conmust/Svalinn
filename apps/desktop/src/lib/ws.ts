@@ -1,3 +1,4 @@
+import { wsBase } from './api';
 let socket: WebSocket | null = null;
 let intentionalClose = false;
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -19,7 +20,7 @@ export function connectWebSocket(
   currentChannelId = channelId;
 
   const params = new URLSearchParams({ token, channel_id: channelId });
-  const wsUrl = `ws://localhost:3001/api/v1/ws?${params.toString()}`;
+  const wsUrl = `${wsBase()}/api/v1/ws?${params.toString()}`;
   socket = new WebSocket(wsUrl);
 
   socket.onopen = () => {

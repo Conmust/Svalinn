@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { apiFetch, takeLogoutReason } from './lib/api';
+  import { apiFetch, takeLogoutReason, apiBase, setServerUrl } from './lib/api';
   import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
   import { getCurrentUser, login, register, logout } from './lib/auth';
@@ -7,15 +7,37 @@
   import ChannelList from './components/ChannelList.svelte';
   import ChatArea from './components/ChatArea.svelte';
   import Roster from './components/Roster.svelte';
+  import AccountSettings from './components/AccountSettings.svelte';
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
   let activeChannel: string | null = null;
   let showRoster = false;
+  let showAccountSettings = false;
 
   // Stay connected whenever logged in, whatever is on screen, so live
   // updates and a ban or revoked session reach the app straight away.
   $: if (currentUser) wsClient.connect();
+
+  // Short message at the top of the screen, e.g. "You were kicked from X".
+  let notice = '';
+  let noticeTimer: ReturnType<typeof setTimeout>;
+  function showNotice(text: string) {
+    notice = text;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => (notice = ''), 6000);
+  }
+
+  // Kicked, banned or left: close the server if it's open.
+  wsClient.on('removed_from_server', (data: { server_id: string; server_name: string; reason: string }) => {
+    if (activeServer === data.server_id) {
+      activeServer = null;
+      activeChannel = null;
+      showRoster = false;
+    }
+    if (data.reason === 'kicked') showNotice(`You were removed from ${data.server_name}.`);
+    if (data.reason === 'banned') showNotice(`You were banned from ${data.server_name}.`);
+  });
 
   // Auth form state
   let isLoginMode = true;
@@ -25,6 +47,9 @@
   // Shown when the server ended the session, e.g. because of a ban.
   let authError = takeLogoutReason() ?? '';
   let authLoading = false;
+  // Which Svalinn server to use; changeable on the login screen.
+  let serverUrl = apiBase();
+  let editingServer = false;
 
   function handleServerSelected(event: CustomEvent<string | null>) {
     activeServer = event.detail;
@@ -39,7 +64,7 @@
     const name = prompt('Enter channel name:');
     if (!name || !activeServer) return;
 
-    apiFetch(`http://localhost:3001/api/v1/servers/${activeServer}/channels`, {
+    apiFetch(`${apiBase()}/api/v1/servers/${activeServer}/channels`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json', 
@@ -66,6 +91,8 @@
     authLoading = true;
 
     try {
+      serverUrl = setServerUrl(serverUrl);
+      editingServer = false;
       if (isLoginMode) {
         const user = await login(authEmail, authPassword);
         currentUser = user;
@@ -85,12 +112,22 @@
   }
 </script>
 
+{#if notice}
+  <div class="fixed top-3 left-1/2 -translate-x-1/2 z-[200] px-4 py-2 bg-black border-2 border-[#ffaa00] text-[#ffaa00] text-sm shadow-[0_0_20px_rgba(255,170,0,0.4)]" role="status">
+    {'>'} {notice}
+  </div>
+{/if}
+
 {#if currentUser}
   <div class="flex h-screen bg-black text-[#00ff00] overflow-hidden font-mono">
     <!-- 1. Server Rail -->
-    <ServerRail 
-      on:serverSelected={handleServerSelected} 
+    <ServerRail
+      on:serverSelected={handleServerSelected}
+      on:openAccountSettings={() => (showAccountSettings = true)}
     />
+    {#if showAccountSettings}
+      <AccountSettings on:close={() => (showAccountSettings = false)} />
+    {/if}
     
     <!-- 2. Channel List (Only show if a server is selected) -->
     {#if activeServer}
@@ -142,6 +179,23 @@
       </p>
 
       <form on:submit={handleAuthSubmit} class="space-y-4">
+        <div class="text-xs text-[#00aa00]">
+          {#if editingServer}
+            <label for="auth-server" class="block uppercase tracking-wider mb-1">Server</label>
+            <input
+              id="auth-server"
+              bind:value={serverUrl}
+              type="url"
+              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="https://chat.example.com"
+              required
+            />
+          {:else}
+            Server: <span class="text-[#00ff00]">{serverUrl}</span>
+            <button type="button" class="ml-1 underline hover:text-[#00ff00]" on:click={() => (editingServer = true)}>change</button>
+          {/if}
+        </div>
+
         {#if !isLoginMode}
           <div>
             <label for="auth-username" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Username</label>

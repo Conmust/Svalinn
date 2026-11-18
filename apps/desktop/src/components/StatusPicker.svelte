@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-  import { getAuthHeaders, apiFetch } from '../lib/api';
+  import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
 
   export let currentStatus: string = 'offline';
@@ -31,7 +31,7 @@
 
     updating = true;
     try {
-      const response = await apiFetch('http://localhost:3001/api/v1/users/me/status', {
+      const response = await apiFetch(`${apiBase()}/api/v1/users/me/status`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',

@@ -193,3 +193,140 @@ pub async fn get_user_profile(
         None => Err(AppError::NotFound("User not found".into())),
     }
 }
+// ---------- Account settings ----------
+
+use crate::extractors::auth::CurrentSession;
+use crate::rate_limit::REAUTH_FAILURES_PER_USER;
+
+#[derive(Serialize)]
+pub struct Account {
+    pub id: Uuid,
+    pub username: String,
+    pub email: String,
+    pub is_site_owner: bool,
+}
+
+/// GET /api/v1/users/me/account — private details for the account settings screen.
+pub async fn get_account(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+) -> Result<Json<Account>, AppError> {
+    let (username, email, is_site_owner): (String, String, bool) = sqlx::query_as(
+        "SELECT username, email, COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(Json(Account { id: user_id, username, email, is_site_owner }))
+}
+
+/// Checks the user's current password before a sensitive change. Wrong
+/// guesses are rate limited per user.
+async fn verify_current_password(db: &Database, user_id: Uuid, password: &str) -> Result<(), AppError> {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+
+    let key = user_id.to_string();
+    db.limits.check(&REAUTH_FAILURES_PER_USER, &key)?;
+
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let parsed = PasswordHash::new(&hash).map_err(|e| AppError::Internal(format!("Invalid password hash: {e}")))?;
+
+    if Argon2::default().verify_password(password.as_bytes(), &parsed).is_err() {
+        db.limits.record(&REAUTH_FAILURES_PER_USER, &key);
+        return Err(AppError::BadRequest("Your current password is incorrect".into()));
+    }
+    db.limits.reset(&REAUTH_FAILURES_PER_USER, &key);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ChangeEmailRequest {
+    pub email: String,
+    pub current_password: String,
+}
+
+/// PATCH /api/v1/users/me/email
+pub async fn change_email(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<ChangeEmailRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let email = payload.email.trim();
+    let valid = email.len() <= 255
+        && email.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
+        && !email.contains(char::is_whitespace);
+    if !valid {
+        return Err(AppError::BadRequest("Enter a valid email address".into()));
+    }
+
+    verify_current_password(&db, user_id, &payload.current_password).await?;
+
+    sqlx::query("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2")
+        .bind(email)
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => AppError::BadRequest("That email is already in use".into()),
+            e => AppError::Database(e.to_string()),
+        })?;
+
+    Ok(Json(serde_json::json!({ "email": email })))
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// PUT /api/v1/users/me/password — also logs out every other device.
+pub async fn change_password(
+    State(db): State<Database>,
+    CurrentSession { user_id, session_id }: CurrentSession,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+
+    if payload.new_password.len() < 6 {
+        return Err(AppError::BadRequest("New password must be at least 6 characters".into()));
+    }
+    if payload.new_password == payload.current_password {
+        return Err(AppError::BadRequest("Choose a password different from your current one".into()));
+    }
+
+    verify_current_password(&db, user_id, &payload.current_password).await?;
+
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let hash = argon2::Argon2::default()
+        .hash_password(payload.new_password.as_bytes(), &salt)
+        .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?
+        .to_string();
+
+    let mut tx = db.pool.begin().await.map_err(|e| AppError::Database(e.to_string()))?;
+    sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&hash)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    // End every other session; the database tells running servers to close
+    // those connections straight away.
+    let ended = sqlx::query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .rows_affected();
+    tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "other_sessions_ended": ended })))
+}

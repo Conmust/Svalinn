@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders, apiFetch, fileUrl } from '../lib/api';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
+  import { wsClient } from '../lib/websocket';
+  import { getAuthHeaders, apiFetch, fileUrl, apiBase } from '../lib/api';
 
   const dispatch = createEventDispatcher();
 
@@ -16,14 +17,81 @@
   let newServerName = '';
   let createError = '';
 
+  // Create / join dialog
+  let modalMode: 'create' | 'join' = 'create';
+  let inviteInput = '';
+  let invitePreview: { code: string; server_id: string; server_name: string; member_count: number; already_member: boolean } | null = null;
+  let joinError = '';
+  let joinBusy = false;
+
+  function openModal(mode: 'create' | 'join') {
+    modalMode = mode;
+    createError = joinError = '';
+    invitePreview = null;
+    inviteInput = '';
+    showCreateModal = true;
+  }
+
+  async function errorFrom(res: Response, fallback: string): Promise<string> {
+    const err = await res.json().catch(() => ({}));
+    return err.error || fallback;
+  }
+
+  async function handleLookupInvite(e: Event) {
+    e.preventDefault();
+    const code = inviteInput.trim();
+    if (!code) return;
+    joinError = '';
+    invitePreview = null;
+    joinBusy = true;
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/invites/${encodeURIComponent(code)}`);
+      if (res.ok) invitePreview = await res.json();
+      else joinError = await errorFrom(res, 'Invite not found');
+    } catch (err: any) {
+      joinError = err.message || 'Network error';
+    } finally {
+      joinBusy = false;
+    }
+  }
+
+  async function handleJoin() {
+    if (!invitePreview) return;
+    joinError = '';
+    joinBusy = true;
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/invites/${encodeURIComponent(invitePreview.code)}`, { method: 'POST' });
+      if (!res.ok) {
+        joinError = await errorFrom(res, 'Could not join');
+        return;
+      }
+      const server: Server = await res.json();
+      if (!servers.some(s => s.id === server.id)) servers = [...servers, server];
+      showCreateModal = false;
+      dispatch('serverSelected', server.id);
+    } catch (err: any) {
+      joinError = err.message || 'Network error';
+    } finally {
+      joinBusy = false;
+    }
+  }
+
+  // Kicked, banned or left: drop the server from the list.
+  function onRemoved(data: { server_id: string }) {
+    servers = servers.filter(s => s.id !== data.server_id);
+  }
+
   onMount(async () => {
+    wsClient.on('removed_from_server', onRemoved);
     await loadServers();
   });
+
+  onDestroy(() => wsClient.off('removed_from_server', onRemoved));
 
   async function loadServers() {
   loading = true;
   try {
-    const response = await apiFetch('http://localhost:3001/api/v1/servers', {
+    const response = await apiFetch(`${apiBase()}/api/v1/servers`, {
       headers: getAuthHeaders(), // ← This must be here
     });
     if (response.ok) {
@@ -49,7 +117,7 @@
 
     createError = '';
     try {
-      const response = await apiFetch('http://localhost:3001/api/v1/servers', {
+      const response = await apiFetch(`${apiBase()}/api/v1/servers`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ name: newServerName.trim() }),
@@ -108,12 +176,25 @@
     {/each}
   {/if}
 
+  <!-- Account settings (pinned to bottom, above Create) -->
+  <button
+    type="button"
+    class="w-12 h-12 bg-black border-2 border-[#00ff00] rounded-xl flex items-center justify-center hover:bg-[#00ff00] hover:text-black text-[#00ff00] transition-all terminal-glow mt-auto"
+    title="Account settings"
+    aria-label="Account settings"
+    on:click={() => dispatch('openAccountSettings')}
+  >
+    <svg xmlns="http://www.w3.org/2000/svg" style="width: 22px; height: 22px;" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+    </svg>
+  </button>
+
   <!-- Create Server Button (Pinned to bottom) -->
   <button
     type="button"
-    class="w-12 h-12 bg-black border-2 border-dashed border-[#00ff00] rounded-xl flex items-center justify-center hover:bg-[#00ff00] hover:border-solid transition-all terminal-glow group mt-auto mb-2"
-    title="Create a Server"
-    on:click={() => showCreateModal = true}
+    class="w-12 h-12 bg-black border-2 border-dashed border-[#00ff00] rounded-xl flex items-center justify-center hover:bg-[#00ff00] hover:border-solid transition-all terminal-glow group mb-2"
+    title="Create or join a server"
+    on:click={() => openModal('create')}
   >
     <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-[#00ff00] group-hover:text-black transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
@@ -132,7 +213,16 @@
         class="relative w-[400px] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-6" 
         on:click|stopPropagation role="document"
       >
-        <h3 class="text-lg font-bold text-[#00ff00] uppercase tracking-widest mb-4 terminal-glow">{'>'} Create Server</h3>
+        <div class="flex mb-4 border-b border-[#00aa00]/40" role="tablist">
+          <button type="button" role="tab" aria-selected={modalMode === 'create'}
+            class="flex-1 py-2 text-sm font-bold uppercase tracking-widest {modalMode === 'create' ? 'text-[#00ff00] border-b-2 border-[#00ff00]' : 'text-[#00aa00] hover:text-[#00ff00]'}"
+            on:click={() => (modalMode = 'create')}>Create</button>
+          <button type="button" role="tab" aria-selected={modalMode === 'join'}
+            class="flex-1 py-2 text-sm font-bold uppercase tracking-widest {modalMode === 'join' ? 'text-[#00ff00] border-b-2 border-[#00ff00]' : 'text-[#00aa00] hover:text-[#00ff00]'}"
+            on:click={() => (modalMode = 'join')}>Join</button>
+        </div>
+
+        {#if modalMode === 'create'}
         <form on:submit={handleCreateServer} class="space-y-4">
           <div>
             <label for="new-server-name" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Server Name</label>
@@ -150,6 +240,40 @@
             <button type="submit" class="flex-1 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all text-sm terminal-glow">Create</button>
           </div>
         </form>
+        {:else}
+        <form on:submit={handleLookupInvite} class="space-y-4">
+          <div>
+            <label for="invite-code" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Invite code or link</label>
+            <input
+              id="invite-code" bind:value={inviteInput} type="text"
+              class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] font-mono focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="e.g., aB3dEf9hJk" required
+              on:input={() => (invitePreview = null)}
+            />
+          </div>
+          {#if invitePreview}
+            <div class="border border-[#00ff00] bg-[#0a0e0a] p-3 text-sm">
+              <div class="text-[#00ff00] font-bold">{invitePreview.server_name}</div>
+              <div class="text-xs text-[#00aa00]">
+                {invitePreview.member_count} member{invitePreview.member_count === 1 ? '' : 's'}{invitePreview.already_member ? ' · you are already a member' : ''}
+              </div>
+            </div>
+          {/if}
+          {#if joinError}
+            <div class="text-xs text-red-500 terminal-glow">{'>'} {joinError}</div>
+          {/if}
+          <div class="flex gap-2 pt-2">
+            <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] hover:bg-[#00aa00]/10 transition-all text-sm" on:click={() => showCreateModal = false}>Cancel</button>
+            {#if invitePreview}
+              <button type="button" disabled={joinBusy} class="flex-1 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all text-sm terminal-glow disabled:opacity-50" on:click={handleJoin}>
+                {invitePreview.already_member ? 'Open' : 'Join'}
+              </button>
+            {:else}
+              <button type="submit" disabled={joinBusy} class="flex-1 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all text-sm terminal-glow disabled:opacity-50">Look up</button>
+            {/if}
+          </div>
+        </form>
+        {/if}
       </div>
     </div>
   {/if}

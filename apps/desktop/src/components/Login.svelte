@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiBase } from '../lib/api';
   import { createEventDispatcher } from 'svelte';
   import { setAuth } from '../lib/auth';
 
@@ -17,8 +18,8 @@
 
     try {
       const endpoint = mode === 'login' 
-        ? 'http://localhost:3001/api/v1/auth/login'
-        : 'http://localhost:3001/api/v1/auth/register';
+        ? `${apiBase()}/api/v1/auth/login`
+        : `${apiBase()}/api/v1/auth/register`;
 
       const body = mode === 'login'
         ? { email, password }

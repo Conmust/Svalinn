@@ -8,7 +8,44 @@
 // request still comes back 401 it refreshes once and retries. Every
 // authenticated request should go through it.
 
-export const API_BASE = 'http://localhost:3001';
+const SERVER_URL_KEY = 'svalinn_server_url';
+/** Server used unless the user picks another one. Set VITE_API_URL when building. */
+export const DEFAULT_SERVER_URL: string =
+  (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/+$/, '') || 'http://localhost:3001';
+
+/** Address of the Svalinn server, e.g. "https://chat.example.com". */
+export function apiBase(): string {
+  try {
+    return localStorage.getItem(SERVER_URL_KEY) || DEFAULT_SERVER_URL;
+  } catch {
+    return DEFAULT_SERVER_URL;
+  }
+}
+
+/** WebSocket address of the server (ws:// or wss://). */
+export function wsBase(): string {
+  return apiBase().replace(/^http/i, 'ws');
+}
+
+/**
+ * Validates and saves the server address. Returns the normalized URL, or
+ * throws with a message to show. Saving the default clears the override.
+ */
+export function setServerUrl(input: string): string {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    throw new Error('Enter a full address, like https://chat.example.com');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('The server address must start with http:// or https://');
+  }
+  const normalized = url.origin;
+  if (normalized === DEFAULT_SERVER_URL) localStorage.removeItem(SERVER_URL_KEY);
+  else localStorage.setItem(SERVER_URL_KEY, normalized);
+  return normalized;
+}
 
 /**
  * Full URL for a file link from the server. Uploaded files come as signed,
@@ -16,7 +53,7 @@ export const API_BASE = 'http://localhost:3001';
  */
 export function fileUrl(path: string | null | undefined): string {
   if (!path) return '';
-  return /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`;
+  return /^https?:\/\//i.test(path) ? path : `${apiBase()}${path}`;
 }
 
 /** Refresh this long before the access token expires. */
@@ -139,7 +176,7 @@ async function doRefresh(rejectedToken?: string): Promise<string | null> {
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
+    response = await fetch(`${apiBase()}/api/v1/auth/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),

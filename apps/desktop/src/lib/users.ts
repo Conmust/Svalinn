@@ -1,6 +1,5 @@
-import { getAuthHeaders, apiFetch } from './api';
+import { getAuthHeaders, apiFetch, apiBase } from './api';
 
-const API_BASE = 'http://localhost:3001';
 
 export interface UserProfile {
   id: string;
@@ -11,7 +10,7 @@ export interface UserProfile {
 }
 
 export async function fetchUserProfile(userId: string): Promise<UserProfile> {
-  const response = await apiFetch(`${API_BASE}/api/v1/users/${userId}`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/${userId}`, {
     headers: getAuthHeaders(),
   });
 

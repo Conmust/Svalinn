@@ -460,6 +460,23 @@ The server listens on `http://127.0.0.1:3001`.
 
 ---
 
+## Run a Server for Other People
+
+- **Listen address:** set `HOST=0.0.0.0` (and `PORT` if needed) so other machines can connect. Put the server behind a reverse proxy that provides HTTPS, and set `TRUST_PROXY=true` so rate limits see real client addresses.
+- **Desktop app server address:** the app connects to `VITE_API_URL` (set when building; see `apps/desktop/.env.example`) and users can change the server on the login screen.
+- **CORS:** only the desktop app and the dev server may call the API by default. Use `CORS_ALLOWED_ORIGINS` to change the list.
+- **Rate limits:** logins are limited to 20 attempts per IP address per 5 minutes and 5 failed attempts per account per 15 minutes. Registration is limited to 5 new accounts per IP per hour, and invite lookups to 20 per user per 10 minutes. Limits are kept in memory and reset when the server restarts.
+
+## Account Settings
+
+The person icon at the bottom of the server list opens **Account Settings**, where you can change your email or password. Both need your current password. Changing your password logs you out on every other device.
+
+## Invite People
+
+Owners, admins and moderators create invites in **Server Settings → Invites**, optionally expiring and limited to a number of uses, and share the code. Others join from the **+** button in the server list (**Join** tab). Moderators and above can kick or ban members ranked below them from the member list, and lift bans in **Server Settings → Bans**. Anyone but the owner can leave a server from **Server Settings → Overview**.
+
+---
+
 ## Ban Accounts and End Sessions
 
 Run these from the repository root with the same `.env` as the server:
@@ -469,7 +486,12 @@ cargo run -p svalinn-server --bin svalinn-admin -- ban <email-or-username> [reas
 cargo run -p svalinn-server --bin svalinn-admin -- unban <email-or-username>
 cargo run -p svalinn-server --bin svalinn-admin -- revoke-sessions <email-or-username>
 cargo run -p svalinn-server --bin svalinn-admin -- list-banned
+cargo run -p svalinn-server --bin svalinn-admin -- create-user <username> <email> <password> [--site-owner]
+cargo run -p svalinn-server --bin svalinn-admin -- set-site-owner <email-or-username>
+cargo run -p svalinn-server --bin svalinn-admin -- remove-site-owner <email-or-username>
 ```
+
+A **site owner** outranks everyone, including each server's owner, in every server they belong to: they can manage settings, invites, emojis and messages, and kick or ban anyone, and nobody can kick or ban them. They don't get access to servers they haven't joined.
 
 A ban takes effect immediately: the user's sessions are revoked, open connections are closed, the app returns to the login screen showing the reason, and every request and login is refused until the ban is lifted. This also applies if `users.banned_at` is set directly in the database. After an unban, the user logs in again.
 

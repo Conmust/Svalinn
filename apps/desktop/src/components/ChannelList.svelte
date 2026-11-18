@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders, apiFetch } from '../lib/api';
+  import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { logout } from '../lib/auth';
   import { wsClient } from '../lib/websocket';
   import ServerSettings from './ServerSettings.svelte';
@@ -50,7 +50,7 @@
    async function loadChannels(serverId: string) {
     loading = true;
     try {
-      const response = await apiFetch(`http://localhost:3001/api/v1/servers/${serverId}/channels`, {
+      const response = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/channels`, {
         headers: getAuthHeaders(), // <-- THIS LINE IS CRUCIAL
       });
       
@@ -84,7 +84,7 @@
 
     createChannelError = '';
     try {
-      const response = await apiFetch(`http://localhost:3001/api/v1/servers/${activeServer}/channels`, {
+      const response = await apiFetch(`${apiBase()}/api/v1/servers/${activeServer}/channels`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

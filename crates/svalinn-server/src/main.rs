@@ -5,6 +5,7 @@ mod extractors;
 mod files;
 mod models;
 mod presence;
+mod rate_limit;
 mod sessions;
 mod routes;
 
@@ -15,6 +16,9 @@ use axum::{
 };
 
 use crate::access::{upload_body_limit, MAX_ATTACHMENT_BYTES, MAX_EMOJI_BYTES};
+use std::net::SocketAddr;
+
+use axum::http::{header, HeaderValue, Method};
 use tower_http::cors::CorsLayer;
 
 use crate::db::Database;
@@ -68,11 +72,32 @@ async fn main() {
             get(routes::servers::get_server).patch(routes::servers::update_server),
         )
         .route("/api/v1/servers/:server_id/members", get(routes::members::get_server_members))
+        .route("/api/v1/servers/:server_id/members/me", delete(routes::members::leave_server))
+        .route("/api/v1/servers/:server_id/members/:user_id", delete(routes::members::kick_member))
         .route("/api/v1/servers/:server_id/role", get(routes::members::get_user_role_in_server))
+        .route(
+            "/api/v1/servers/:server_id/bans",
+            get(routes::members::list_bans).post(routes::members::ban_member),
+        )
+        .route("/api/v1/servers/:server_id/bans/:user_id", delete(routes::members::unban_member))
+
+        // --- Invite Routes ---
+        .route(
+            "/api/v1/servers/:server_id/invites",
+            get(routes::invites::list_invites).post(routes::invites::create_invite),
+        )
+        .route("/api/v1/servers/:server_id/invites/:code", delete(routes::invites::revoke_invite))
+        .route(
+            "/api/v1/invites/:code",
+            get(routes::invites::preview_invite).post(routes::invites::accept_invite),
+        )
 
         // --- User Routes ---
         .route("/api/v1/users/me", get(routes::users::get_current_user))
         .route("/api/v1/users/me/status", patch(routes::users::update_status))
+        .route("/api/v1/users/me/account", get(routes::users::get_account))
+        .route("/api/v1/users/me/email", patch(routes::users::change_email))
+        .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
         .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))
 
@@ -137,14 +162,50 @@ async fn main() {
         .route("/api/v1/files/:name", get(files::serve_file))
         
         // --- Middleware & State ---
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(db); // Now receives the unwrapped `Database` struct
 
     // 6. Start the server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
+    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3001".into());
+    let address = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&address)
         .await
-        .expect("Failed to bind to port 3001");
-    
-    println!("🚀 Server listening on http://127.0.0.1:3001");
-    axum::serve(listener, app).await.unwrap();
+        .unwrap_or_else(|e| panic!("Failed to bind to {address}: {e}"));
+
+    println!("🚀 Server listening on http://{address}");
+    // Connection info gives handlers the client's IP address (for rate limits).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .unwrap();
+}
+
+/// Origins the desktop app runs from: the Vite dev server, and the Tauri
+/// webview (`tauri://localhost` on macOS/Linux, `https://tauri.localhost` on
+/// Windows).
+const DEFAULT_CORS_ORIGINS: &str =
+    "http://localhost:1420,http://127.0.0.1:1420,tauri://localhost,https://tauri.localhost,http://tauri.localhost";
+
+/// Only these origins may call the API from a browser or webview. Set
+/// CORS_ALLOWED_ORIGINS (comma-separated) to replace the defaults.
+fn cors_layer() -> CorsLayer {
+    let configured = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| DEFAULT_CORS_ORIGINS.into());
+    let origins: Vec<HeaderValue> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .filter_map(|o| match HeaderValue::from_str(o) {
+            Ok(v) if o != "*" => Some(v),
+            _ => {
+                eprintln!("⚠️  Ignoring invalid CORS origin {o:?} (wildcards aren't allowed)");
+                None
+            }
+        })
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(600))
 }

@@ -1,4 +1,4 @@
-import { API_BASE, storeTokens, clearSession } from './api';
+import { apiBase, storeTokens, clearSession } from './api';
 
 export interface User {
   id: string;
@@ -20,7 +20,7 @@ export function getCurrentUser(): User | null {
 }
 
 export async function login(email: string, password: string): Promise<User> {
-  const response = await fetch(`${API_BASE}/api/v1/auth/login`, {
+  const response = await fetch(`${apiBase()}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password }),
@@ -41,7 +41,7 @@ export async function login(email: string, password: string): Promise<User> {
 }
 
 export async function register(username: string, email: string, password: string): Promise<User> {
-  const response = await fetch(`${API_BASE}/api/v1/auth/register`, {
+  const response = await fetch(`${apiBase()}/api/v1/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, email, password }),
@@ -74,7 +74,7 @@ export function logout(): void {
   // End the session on the server too, so the refresh token can't be reused.
   const refreshToken = localStorage.getItem('refresh_token');
   if (refreshToken) {
-    fetch(`${API_BASE}/api/v1/auth/logout`, {
+    fetch(`${apiBase()}/api/v1/auth/logout`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),

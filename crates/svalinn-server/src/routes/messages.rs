@@ -120,11 +120,7 @@ fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
 
 fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid) {
     // Ignore the error: it only means nobody is connected.
-    let _ = db.message_tx.send(BroadcastMessage {
-        event_type: event_type.to_string(),
-        payload,
-        server_id: Some(server_id),
-    });
+    let _ = db.message_tx.send(BroadcastMessage::to_server(event_type, payload, server_id));
 }
 
 /// GET /api/v1/channels/:channel_id/messages

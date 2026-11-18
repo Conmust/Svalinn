@@ -84,11 +84,11 @@ pub async fn broadcast_status(db: &Database, user_id: Uuid, status: &str) {
         .unwrap_or_default();
 
     for server_id in server_ids {
-        let _ = db.message_tx.send(BroadcastMessage {
-            event_type: "presence_updated".to_string(),
-            payload: serde_json::json!({ "user_id": user_id, "status": status }),
-            server_id: Some(server_id),
-        });
+        let _ = db.message_tx.send(BroadcastMessage::to_server(
+            "presence_updated",
+            serde_json::json!({ "user_id": user_id, "status": status }),
+            server_id,
+        ));
     }
 }
 

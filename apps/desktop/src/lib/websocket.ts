@@ -1,4 +1,4 @@
-import { getValidAccessToken, endSession } from './api';
+import { getValidAccessToken, endSession, wsBase } from './api';
 
 // Close codes the server uses when access is revoked.
 const CLOSE_SESSION_ENDED = 4001;
@@ -28,7 +28,7 @@ export class WSClient {
     }
     if (!token) return; // logged out
 
-    this.ws = new WebSocket(`ws://localhost:3001/api/v1/ws?token=${encodeURIComponent(token)}`);
+    this.ws = new WebSocket(`${wsBase()}/api/v1/ws?token=${encodeURIComponent(token)}`);
 
     this.ws.onopen = () => {
       console.log('WebSocket connected');
@@ -85,6 +85,11 @@ export class WSClient {
         this.listeners.delete(event);
       }
     }
+  }
+
+  /** Delivers an event to local listeners, as if it came from the server. */
+  emit(type: string, payload: any) {
+    this.listeners.get(type)?.forEach(handler => handler(payload));
   }
 
   send(type: string, payload: any) {

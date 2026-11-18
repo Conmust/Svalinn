@@ -87,7 +87,11 @@ async fn handle_socket_connection(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
 
-            if let Some(server_id) = broadcast_msg.server_id {
+            if let Some(target) = broadcast_msg.to_user {
+                if target != user_id {
+                    continue;
+                }
+            } else if let Some(server_id) = broadcast_msg.server_id {
                 let is_member: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
                 )

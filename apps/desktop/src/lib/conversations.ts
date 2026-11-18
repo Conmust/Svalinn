@@ -1,7 +1,6 @@
-import { getAuthHeaders, apiFetch } from './api';
+import { getAuthHeaders, apiFetch, apiBase } from './api';
 import { type Message, type UploadedFile } from './messages';
 
-const API_BASE = 'http://localhost:3001';
 
 export interface Conversation {
   id: string;
@@ -12,7 +11,7 @@ export interface Conversation {
 }
 
 export async function fetchUserConversations(): Promise<Conversation[]> {
-  const response = await apiFetch(`${API_BASE}/api/v1/conversations`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/conversations`, {
     headers: getAuthHeaders(),
   });
 
@@ -24,7 +23,7 @@ export async function fetchUserConversations(): Promise<Conversation[]> {
 }
 
 export async function createConversation(participantId: string): Promise<Conversation> {
-  const response = await apiFetch(`${API_BASE}/api/v1/conversations`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/conversations`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -41,7 +40,7 @@ export async function createConversation(participantId: string): Promise<Convers
 }
 
 export async function fetchConversationMessages(conversationId: string): Promise<any[]> {
-  const response = await apiFetch(`${API_BASE}/api/v1/conversations/${conversationId}/messages`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
     headers: getAuthHeaders(),
   });
 
@@ -57,7 +56,7 @@ export async function sendDirectMessage(
   content: string,
   attachment?: UploadedFile | null
 ): Promise<Message> {
-  const response = await apiFetch(`${API_BASE}/api/v1/conversations/${conversationId}/messages`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({

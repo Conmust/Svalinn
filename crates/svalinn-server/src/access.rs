@@ -5,10 +5,15 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::errors::AppError;
 
-/// Returns the user's role in the server, or `Forbidden` if they are not a member.
+/// Returns the user's role in the server, or `Forbidden` if they are not a
+/// member. A site owner's role is always "owner".
 pub async fn require_member(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<String, AppError> {
     let role: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
+        r#"
+        SELECT CASE WHEN u.site_role = 'owner' THEN 'owner' ELSE sm.role END
+        FROM server_members sm JOIN users u ON u.id = sm.user_id
+        WHERE sm.server_id = $1 AND sm.user_id = $2
+        "#,
     )
     .bind(server_id)
     .bind(user_id)
@@ -39,6 +44,50 @@ pub fn is_admin(role: &str) -> bool {
 /// Owners, admins and moderators can pin, lock and delete others' messages.
 pub fn is_moderator(role: &str) -> bool {
     matches!(role, "owner" | "admin" | "moderator")
+}
+
+/// Rank of a site owner: above everyone, including each server's owner.
+pub const SITE_OWNER_RANK: u8 = 5;
+
+/// Rank used to decide who can kick or ban whom:
+/// site owner > owner > admin > moderator > member.
+/// You can only act on members ranked below you.
+pub fn role_rank(role: &str, is_owner: bool) -> u8 {
+    if is_owner {
+        return 4;
+    }
+    match role {
+        "owner" => 4,
+        "admin" => 3,
+        "moderator" => 2,
+        _ => 1,
+    }
+}
+
+/// The user's rank in the server, or `None` if they aren't a member.
+pub async fn member_rank(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<Option<u8>, AppError> {
+    let row: Option<(Option<String>, bool, bool)> = sqlx::query_as(
+        r#"
+        SELECT sm.role, s.owner_id = sm.user_id, COALESCE(u.site_role = 'owner', false)
+        FROM server_members sm
+        JOIN servers s ON s.id = sm.server_id
+        JOIN users u ON u.id = sm.user_id
+        WHERE sm.server_id = $1 AND sm.user_id = $2
+        "#,
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|(role, is_owner, site_owner)| {
+        if site_owner {
+            SITE_OWNER_RANK
+        } else {
+            role_rank(role.as_deref().unwrap_or("member"), is_owner)
+        }
+    }))
 }
 
 /// Returns the server a channel belongs to, or `NotFound`.

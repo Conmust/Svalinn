@@ -12,3 +12,4 @@ pub mod ws;
 pub mod uploads;
 pub mod emojis;
 pub mod channels;
+pub mod invites;

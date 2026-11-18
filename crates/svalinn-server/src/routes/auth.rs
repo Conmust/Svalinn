@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::jwt_secret;
+use crate::rate_limit::{ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_PER_IP, REGISTER_PER_IP};
 use crate::sessions::AccessDenied;
 use crate::models::user::{
     AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, User,
@@ -37,8 +38,12 @@ const REUSE_GRACE_SECONDS: i64 = 30;
 
 pub async fn register(
     State(db): State<Database>,
+    ClientIp(ip): ClientIp,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    let ip = ip.to_string();
+    db.limits.check(&REGISTER_PER_IP, &ip)?;
+
     // Validate input
     if payload.username.len() < 3 || payload.username.len() > 50 {
         return Err(AppError::BadRequest("Username must be 3-50 characters".into()));
@@ -84,19 +89,37 @@ pub async fn register(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Only accounts actually created count towards the limit.
+    db.limits.record(&REGISTER_PER_IP, &ip);
     start_session(&db, user).await
 }
 
 pub async fn login(
     State(db): State<Database>,
+    ClientIp(ip): ClientIp,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
+    // Limit password guessing: every attempt counts per IP address, and failed
+    // attempts count per account (whichever addresses they come from).
+    let ip = ip.to_string();
+    let account = payload.email.trim().to_string();
+    db.limits.check(&LOGIN_PER_IP, &ip)?;
+    db.limits.check(&LOGIN_FAILURES_PER_ACCOUNT, &account)?;
+    db.limits.record(&LOGIN_PER_IP, &ip);
+
+    let invalid = || {
+        db.limits.record(&LOGIN_FAILURES_PER_ACCOUNT, &account);
+        AppError::BadRequest("Invalid email or password".into())
+    };
+
+    let Some(user): Option<User> = sqlx::query_as("SELECT * FROM users WHERE email = $1")
         .bind(&payload.email)
         .fetch_optional(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::BadRequest("Invalid email or password".into()))?;
+    else {
+        return Err(invalid());
+    };
 
     let parsed_hash = PasswordHash::new(&user.password_hash)
         .map_err(|e| AppError::Internal(format!("Invalid password hash: {}", e)))?;
@@ -105,8 +128,9 @@ pub async fn login(
         .verify_password(payload.password.as_bytes(), &parsed_hash)
         .is_err()
     {
-        return Err(AppError::BadRequest("Invalid email or password".into()));
+        return Err(invalid());
     }
+    db.limits.reset(&LOGIN_FAILURES_PER_ACCOUNT, &account);
 
     // Only reveal a ban to someone who knows the password.
     let ban: Option<(Option<chrono::DateTime<Utc>>, Option<String>)> =

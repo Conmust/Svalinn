@@ -26,6 +26,9 @@ pub enum AppError {
     #[error("Too large: {0}")]
     PayloadTooLarge(String),
 
+    #[error("Rate limited: {message}")]
+    TooManyRequests { message: String, retry_after_secs: u64 },
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -37,6 +40,16 @@ struct ErrorResponse {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::TooManyRequests { message, retry_after_secs } = &self {
+            let body = Json(ErrorResponse { error: message.clone() });
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())],
+                body,
+            )
+                .into_response();
+        }
+
         let (status, error_message) = match &self {
             AppError::Database(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Auth(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
@@ -44,6 +57,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
+            AppError::TooManyRequests { message, .. } => (StatusCode::TOO_MANY_REQUESTS, message.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 

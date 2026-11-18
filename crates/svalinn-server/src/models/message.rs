@@ -12,6 +12,23 @@ pub struct BroadcastMessage {
     /// Not sent to clients.
     #[serde(skip)]
     pub server_id: Option<Uuid>,
+    /// If set, only this user receives the event (whether or not they're a
+    /// member of `server_id`), e.g. to tell someone they were kicked.
+    /// Not sent to clients.
+    #[serde(skip)]
+    pub to_user: Option<Uuid>,
+}
+
+impl BroadcastMessage {
+    /// An event for every member of a server.
+    pub fn to_server(event_type: &str, payload: serde_json::Value, server_id: Uuid) -> Self {
+        Self { event_type: event_type.to_string(), payload, server_id: Some(server_id), to_user: None }
+    }
+
+    /// An event for one user only.
+    pub fn to_user(event_type: &str, payload: serde_json::Value, user_id: Uuid) -> Self {
+        Self { event_type: event_type.to_string(), payload, server_id: None, to_user: Some(user_id) }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
