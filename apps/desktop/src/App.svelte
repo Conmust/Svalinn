@@ -8,10 +8,14 @@
   import ChatArea from './components/ChatArea.svelte';
   import Roster from './components/Roster.svelte';
   import AccountSettings from './components/AccountSettings.svelte';
+  import DMList from './components/DMList.svelte';
+  import DMChatArea from './components/DMChatArea.svelte';
+  import type { Conversation } from './lib/conversations';
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
   let activeChannel: string | null = null;
+  let activeConversation: Conversation | null = null;
   let showRoster = false;
   let showAccountSettings = false;
 
@@ -55,10 +59,15 @@
   function handleServerSelected(event: CustomEvent<string | null>) {
     activeServer = event.detail;
     activeChannel = null;
+    activeConversation = null;
   }
 
   function handleChannelSelected(event: CustomEvent<string>) {
     activeChannel = event.detail;
+  }
+
+  function handleConversationSelected(event: CustomEvent<Conversation>) {
+    activeConversation = event.detail;
   }
 
   function handleCreateChannel() {
@@ -84,6 +93,7 @@
     currentUser = null;
     activeServer = null;
     activeChannel = null;
+    activeConversation = null;
   }
 
   async function handleAuthSubmit(e: Event) {
@@ -162,11 +172,23 @@
         <div class="text-xl font-bold">{'>'} Select a channel to start chatting</div>
       </div>
     {:else}
-      <!-- Empty state when no server is selected (DM view placeholder) -->
-      <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
-        <div class="text-4xl mb-4">✉</div>
-        <div class="text-xl font-bold">{'>'} Direct Messages (Coming Soon)</div>
-      </div>
+      <!-- No server selected: Direct Messages view -->
+      <DMList
+        activeConversation={activeConversation?.id ?? null}
+        on:conversationSelected={handleConversationSelected}
+      />
+      {#if activeConversation}
+        <DMChatArea
+          conversationId={activeConversation.id}
+          participantUsername={activeConversation.participant_username}
+          {currentUser}
+        />
+      {:else}
+        <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
+          <div class="text-4xl mb-4">✉</div>
+          <div class="text-xl font-bold">{'>'} Select a conversation to start chatting</div>
+        </div>
+      {/if}
     {/if}
   </div>
 {:else}
