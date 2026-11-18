@@ -1,4 +1,4 @@
-import { getAuthHeaders } from './api';
+import { getAuthHeaders, apiFetch } from './api';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -20,7 +20,7 @@ export interface Channel {
 
 // Fetch all servers the current user is a member of
 export async function fetchUserServers(): Promise<Server[]> {
-  const response = await fetch(`${API_BASE}/api/v1/servers`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/servers`, {
     headers: getAuthHeaders(),
   });
 
@@ -41,7 +41,7 @@ export async function fetchUserServers(): Promise<Server[]> {
 
 // Fetch all channels for a specific server
 export async function fetchServerChannels(serverId: string): Promise<Channel[]> {
-  const response = await fetch(`${API_BASE}/api/v1/servers/${serverId}/channels`);
+  const response = await apiFetch(`${API_BASE}/api/v1/servers/${serverId}/channels`);
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Failed to fetch channels' }));
@@ -53,7 +53,7 @@ export async function fetchServerChannels(serverId: string): Promise<Channel[]> 
 
 // Create a new server
 export async function createServer(name: string, icon?: string): Promise<Server> {
-  const response = await fetch(`${API_BASE}/api/v1/servers`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/servers`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -83,7 +83,7 @@ export async function createChannel(
   name: string,
   channelType: string = 'text'
 ): Promise<Channel> {
-  const response = await fetch(`${API_BASE}/api/v1/servers/${serverId}/channels`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/servers/${serverId}/channels`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

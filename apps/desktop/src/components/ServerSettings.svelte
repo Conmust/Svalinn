@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
-  import { getAuthHeaders } from '../lib/api';
+  import { getAuthHeaders, apiFetch } from '../lib/api';
   import { fetchServerEmojis, uploadEmoji, deleteEmoji, type CustomEmoji } from '../lib/emojis';
 
   export let serverId: string;
@@ -23,7 +23,7 @@
     // Load the current values first. Saving the form sends every field, so
     // saving with unloaded defaults would wipe the server's real name/icon.
     try {
-      const res = await fetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
+      const res = await apiFetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
         headers: getAuthHeaders(),
       });
       if (res.ok) {
@@ -54,7 +54,7 @@
   async function handleSaveOverview(e: Event) {
     e.preventDefault();
     if (!loaded) return;
-    const res = await fetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
+    const res = await apiFetch(`http://localhost:3001/api/v1/servers/${serverId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({

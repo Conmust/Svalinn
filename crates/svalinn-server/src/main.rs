@@ -53,6 +53,8 @@ async fn main() {
         // --- Auth Routes ---
         .route("/api/v1/auth/register", post(routes::auth::register))
         .route("/api/v1/auth/login", post(routes::auth::login))
+        .route("/api/v1/auth/refresh", post(routes::auth::refresh))
+        .route("/api/v1/auth/logout", post(routes::auth::logout))
         
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))

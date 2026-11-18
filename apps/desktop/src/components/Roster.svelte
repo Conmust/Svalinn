@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { getAuthHeaders } from '../lib/api';
+  import { getAuthHeaders, apiFetch } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import PatronBadge from './PatronBadge.svelte';
 
@@ -59,7 +59,7 @@
   async function loadMembers(id: string) {
     loading = true;
     try {
-      const response = await fetch(`http://localhost:3001/api/v1/servers/${id}/members`, {
+      const response = await apiFetch(`http://localhost:3001/api/v1/servers/${id}/members`, {
         headers: getAuthHeaders(),
       });
       if (response.ok) {

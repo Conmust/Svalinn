@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders } from '../lib/api';
+  import { getAuthHeaders, apiFetch } from '../lib/api';
 
   const dispatch = createEventDispatcher();
 
@@ -23,7 +23,7 @@
   async function loadServers() {
   loading = true;
   try {
-    const response = await fetch('http://localhost:3001/api/v1/servers', {
+    const response = await apiFetch('http://localhost:3001/api/v1/servers', {
       headers: getAuthHeaders(), // ← This must be here
     });
     if (response.ok) {
@@ -49,7 +49,7 @@
 
     createError = '';
     try {
-      const response = await fetch('http://localhost:3001/api/v1/servers', {
+      const response = await apiFetch('http://localhost:3001/api/v1/servers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ name: newServerName.trim() }),

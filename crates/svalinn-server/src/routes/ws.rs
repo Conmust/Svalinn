@@ -4,13 +4,11 @@ use axum::{
     http::StatusCode,
 };
 use futures_util::{SinkExt, StreamExt};
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::models::user::Claims; 
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -25,15 +23,8 @@ pub async fn websocket_handler(
     // 1. Extract and validate the token from the query string
     let user_id = match query.token {
         Some(token) => {
-            match decode::<Claims>(
-                &token,
-                &DecodingKey::from_secret(crate::extractors::auth::jwt_secret()),
-                &Validation::new(Algorithm::HS256),
-            ) {
-                Ok(token_data) => {
-                    println!("✅ WebSocket JWT validated for user: {}", token_data.claims.sub);
-                    token_data.claims.sub
-                },
+            match crate::extractors::auth::decode_access_token(&token) {
+                Ok(claims) => claims.sub,
                 Err(e) => {
                     eprintln!("❌ WebSocket JWT decode error: {:?}", e);
                     return StatusCode::UNAUTHORIZED.into_response();

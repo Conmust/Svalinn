@@ -1,4 +1,4 @@
-import { getAuthHeaders } from './api';
+import { getAuthHeaders, apiFetch } from './api';
 const API_BASE = 'http://localhost:3001';
 
 export interface CustomEmoji {
@@ -11,7 +11,7 @@ export interface CustomEmoji {
 }
 
 export async function fetchServerEmojis(serverId: string): Promise<CustomEmoji[]> {
-  const res = await fetch(`${API_BASE}/api/v1/servers/${serverId}/emojis`, { headers: getAuthHeaders() });
+  const res = await apiFetch(`${API_BASE}/api/v1/servers/${serverId}/emojis`, { headers: getAuthHeaders() });
   if (!res.ok) throw new Error('Failed to fetch emojis');
   return res.json();
 }
@@ -21,7 +21,7 @@ export async function uploadEmoji(serverId: string, name: string, file: File): P
   formData.append('name', name);
   formData.append('file', file);
 
-  const res = await fetch(`${API_BASE}/api/v1/servers/${serverId}/emojis`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/servers/${serverId}/emojis`, {
     method: 'POST',
     headers: { 'Authorization': getAuthHeaders()['Authorization'] }, // Don't set Content-Type, browser does it for FormData
     body: formData,
@@ -31,7 +31,7 @@ export async function uploadEmoji(serverId: string, name: string, file: File): P
 }
 
 export async function deleteEmoji(serverId: string, emojiId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/v1/servers/${serverId}/emojis/${emojiId}`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/servers/${serverId}/emojis/${emojiId}`, {
     method: 'DELETE',
     headers: getAuthHeaders(),
   });

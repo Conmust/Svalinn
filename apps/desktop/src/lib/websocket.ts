@@ -1,3 +1,5 @@
+import { getValidAccessToken } from './api';
+
 type EventHandler = (data: any) => void;
 
 export class WSClient {
@@ -6,15 +8,23 @@ export class WSClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
 
-  connect() {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+  private connecting = false;
 
-    const token = localStorage.getItem('token');
-    const wsUrl = token 
-      ? `ws://localhost:3001/api/v1/ws?token=${token}` 
-      : `ws://localhost:3001/api/v1/ws`;
+  async connect() {
+    if (this.connecting) return;
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
 
-    this.ws = new WebSocket(wsUrl);
+    this.connecting = true;
+    let token: string | null;
+    try {
+      // Access tokens only last 5 minutes, so get a fresh one for every attempt.
+      token = await getValidAccessToken();
+    } finally {
+      this.connecting = false;
+    }
+    if (!token) return; // logged out
+
+    this.ws = new WebSocket(`ws://localhost:3001/api/v1/ws?token=${encodeURIComponent(token)}`);
 
     this.ws.onopen = () => {
       console.log('WebSocket connected');

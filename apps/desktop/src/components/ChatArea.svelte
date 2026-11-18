@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher, tick } from 'svelte';
-  import { getAuthHeaders } from '../lib/api';
+  import { getAuthHeaders, apiFetch } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import MessageItem from './MessageItem.svelte';
   import InlineEmojiPicker from './InlineEmojiPicker.svelte';
@@ -39,7 +39,7 @@
 
   async function loadRole(id: string) {
     try {
-      const res = await fetch(`http://localhost:3001/api/v1/servers/${id}/role`, { headers: getAuthHeaders() });
+      const res = await apiFetch(`http://localhost:3001/api/v1/servers/${id}/role`, { headers: getAuthHeaders() });
       if (res.ok) myRole = (await res.json()).role;
     } catch (e) {
       console.error('Failed to load role:', e);
@@ -156,7 +156,7 @@
   async function loadMessages() {
     loading = true;
     try {
-      const response = await fetch(`http://localhost:3001/api/v1/channels/${channelId}/messages`, {
+      const response = await apiFetch(`http://localhost:3001/api/v1/channels/${channelId}/messages`, {
         headers: getAuthHeaders(),
       });
       if (response.ok) {
@@ -206,7 +206,7 @@
         formData.append('file', attachmentFile);
       }
 
-      const response = await fetch(`http://localhost:3001/api/v1/channels/${channelId}/messages`, {
+      const response = await apiFetch(`http://localhost:3001/api/v1/channels/${channelId}/messages`, {
         method: 'POST',
         headers: getAuthHeaders(),
         body: formData,

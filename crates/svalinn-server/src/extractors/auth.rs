@@ -47,6 +47,15 @@ pub fn init_jwt_secret() -> Result<Option<String>, String> {
     Ok(warning)
 }
 
+/// Verifies an access token's signature and expiry.
+pub fn decode_access_token(token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    // The library allows tokens 60s past expiry by default. Access tokens only
+    // live 5 minutes, so keep just a few seconds for clock differences.
+    validation.leeway = 5;
+    decode::<Claims>(token, &DecodingKey::from_secret(jwt_secret()), &validation).map(|data| data.claims)
+}
+
 pub fn jwt_secret() -> &'static [u8] {
     JWT_SECRET
         .get()
@@ -76,14 +85,10 @@ impl FromRequestParts<Database> for CurrentUser {
             .ok_or_else(|| unauthorized("Invalid Authorization header format"))?;
 
         // 3. Decode and validate the token
-        let token_data = decode::<Claims>(
-            token,
-            &DecodingKey::from_secret(jwt_secret()),
-            &Validation::new(Algorithm::HS256),
-        )
-        .map_err(|_| unauthorized("Invalid or expired token"))?;
+        let claims = decode_access_token(token)
+            .map_err(|_| unauthorized("Invalid or expired token"))?;
 
-        let user_id = token_data.claims.sub;
+        let user_id = claims.sub;
 
         // 4. Check if user exists in the database to prevent FK errors on deleted accounts
         let exists: bool = sqlx::query_scalar(

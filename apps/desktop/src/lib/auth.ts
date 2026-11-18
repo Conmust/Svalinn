@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:3001';
+import { API_BASE, storeTokens, clearSession } from './api';
 
 export interface User {
   id: string;
@@ -33,8 +33,8 @@ export async function login(email: string, password: string): Promise<User> {
 
   const data = await response.json();
   
-  // Store token and user
-  localStorage.setItem('token', data.token);
+  // Store the tokens and user
+  storeTokens(data.token, data.refresh_token);
   localStorage.setItem('user', JSON.stringify(data.user));
   
   return data.user;
@@ -54,15 +54,15 @@ export async function register(username: string, email: string, password: string
 
   const data = await response.json();
   
-  // Store token and user
-  localStorage.setItem('token', data.token);
+  // Store the tokens and user
+  storeTokens(data.token, data.refresh_token);
   localStorage.setItem('user', JSON.stringify(data.user));
   
   return data.user;
 }
 
-export function setAuth(token: string, user: User): void {
-  localStorage.setItem('token', token);
+export function setAuth(token: string, user: User, refreshToken?: string): void {
+  storeTokens(token, refreshToken);
   localStorage.setItem('user', JSON.stringify(user));
 }
 
@@ -71,8 +71,17 @@ export function updateUserInStorage(user: User): void {
 }
 
 export function logout(): void {
-  localStorage.removeItem('token');
-  localStorage.removeItem('user');
+  // End the session on the server too, so the refresh token can't be reused.
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (refreshToken) {
+    fetch(`${API_BASE}/api/v1/auth/logout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      keepalive: true,
+    }).catch(() => {});
+  }
+  clearSession();
 }
 
 export function getToken(): string | null {

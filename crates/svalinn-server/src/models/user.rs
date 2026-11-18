@@ -55,8 +55,25 @@ pub struct LoginRequest {
 
 #[derive(Debug, Serialize)]
 pub struct AuthResponse {
+    /// Short-lived access token (JWT). Send as `Authorization: Bearer ...`.
     pub token: String,
+    /// Seconds until `token` expires.
+    pub expires_in: i64,
+    /// Long-lived token for `POST /api/v1/auth/refresh`.
+    pub refresh_token: String,
     pub user: PublicUser,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenResponse {
+    pub token: String,
+    pub expires_in: i64,
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

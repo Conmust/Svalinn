@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders } from '../lib/api';
+  import { getAuthHeaders, apiFetch } from '../lib/api';
   import { getCurrentUser } from '../lib/auth';
   import PatronBadge from './PatronBadge.svelte';
 
@@ -45,7 +45,7 @@
   async function loadConversations() {
     loading = true;
     try {
-      const response = await fetch('http://localhost:3001/api/v1/conversations', {
+      const response = await apiFetch('http://localhost:3001/api/v1/conversations', {
         headers: getAuthHeaders(),
       });
       if (response.ok) {

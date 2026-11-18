@@ -1,4 +1,4 @@
-import { getAuthHeaders } from './api';
+import { getAuthHeaders, apiFetch } from './api';
 
 const API_BASE = 'http://localhost:3001';
 
@@ -39,7 +39,7 @@ export interface UploadedFile {
 
 /** Sends a request and returns the JSON body, throwing the server's error message on failure. */
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await apiFetch(`${API_BASE}${path}`, {
     method,
     headers: body === undefined
       ? getAuthHeaders()
@@ -63,7 +63,7 @@ export async function fetchMessages(channelId: string, options: GetMessagesOptio
   if (options.limit) params.append('limit', options.limit.toString());
   if (options.before) params.append('before', options.before);
 
-  const response = await fetch(`${API_BASE}/api/v1/messages/${channelId}?${params}`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/${channelId}?${params}`, {
     headers: getAuthHeaders(),
   });
 
@@ -76,7 +76,7 @@ export async function sendMessage(
   content: string,
   attachment?: UploadedFile | null
 ): Promise<Message> {
-  const response = await fetch(`${API_BASE}/api/v1/messages`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({
@@ -94,7 +94,7 @@ export async function sendMessage(
 }
 
 export async function editMessage(messageId: string, content: string): Promise<Message> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/${messageId}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ content }),
@@ -133,7 +133,7 @@ export async function unpinMessage(messageId: string): Promise<void> {
 }
 
 export async function fetchPinnedMessages(channelId: string): Promise<Message[]> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${channelId}/pinned`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/${channelId}/pinned`, {
     headers: getAuthHeaders(),
   });
 
@@ -147,7 +147,7 @@ export async function bulkDeleteMessages(messageIds: string[]): Promise<{
   deleted_ids: string[];
   skipped_ids: string[];
 }> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/bulk-delete`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/bulk-delete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ message_ids: messageIds }),
@@ -162,7 +162,7 @@ export async function bulkDeleteMessages(messageIds: string[]): Promise<{
 }
 
 export async function fetchReactions(messageId: string): Promise<Reaction[]> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/reactions`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/${messageId}/reactions`, {
     headers: getAuthHeaders(),
   });
 
@@ -197,7 +197,7 @@ export async function searchMessages(options: {
   if (options.conversationId) params.append('conversation_id', options.conversationId);
   if (options.limit) params.append('limit', options.limit.toString());
 
-  const response = await fetch(`${API_BASE}/api/v1/search?${params}`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/search?${params}`, {
     headers: getAuthHeaders(),
   });
 
@@ -210,7 +210,7 @@ export async function searchMessages(options: {
 }
 
 export async function banUser(userId: string, reason?: string): Promise<{ success: boolean; messages_deleted: number }> {
-  const response = await fetch(`${API_BASE}/api/v1/moderation/ban/${userId}`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/moderation/ban/${userId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ reason }),
@@ -228,7 +228,7 @@ export async function uploadFile(file: File): Promise<UploadedFile> {
   const formData = new FormData();
   formData.append('file', file);
 
-  const response = await fetch(`${API_BASE}/api/v1/upload`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/upload`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: formData,
@@ -243,7 +243,7 @@ export async function uploadFile(file: File): Promise<UploadedFile> {
 }
 
 export async function markChannelRead(channelId: string, messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${channelId}/read`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/${channelId}/read`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ message_id: messageId }),
@@ -253,7 +253,7 @@ export async function markChannelRead(channelId: string, messageId: string): Pro
 }
 
 export async function markConversationRead(conversationId: string, messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/conversations/${conversationId}/read`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/conversations/${conversationId}/read`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ message_id: messageId }),
@@ -263,7 +263,7 @@ export async function markConversationRead(conversationId: string, messageId: st
 }
 
 export async function fetchHiddenMessages(): Promise<Message[]> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/hidden`, {
+  const response = await apiFetch(`${API_BASE}/api/v1/messages/hidden`, {
     method: 'GET',
     headers: getAuthHeaders(), // This must return { 'Authorization': 'Bearer <token>' }
   });

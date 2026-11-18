@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { apiFetch } from './lib/api';
   import { onMount } from 'svelte';
   import { getCurrentUser, login, register, logout } from './lib/auth';
   import ServerRail from './components/ServerRail.svelte';
@@ -32,7 +33,7 @@
     const name = prompt('Enter channel name:');
     if (!name || !activeServer) return;
 
-    fetch(`http://localhost:3001/api/v1/servers/${activeServer}/channels`, {
+    apiFetch(`http://localhost:3001/api/v1/servers/${activeServer}/channels`, {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json', 

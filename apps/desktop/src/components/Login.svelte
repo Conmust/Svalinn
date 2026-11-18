@@ -37,7 +37,7 @@
 
       const data = await response.json();
       
-      setAuth(data.token, data.user);
+      setAuth(data.token, data.user, data.refresh_token);
       dispatch('success', { user: data.user });
     } catch (e: any) {
       error = e.message || 'An unexpected error occurred';
