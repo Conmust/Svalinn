@@ -1,0 +1,182 @@
+// Helpers for talking to the server under test.
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import pg from 'pg';
+import { API_URL, DATABASE_URL, JWT_SECRET, ROOT, exe } from './config';
+
+export const API = `${API_URL}/api/v1`;
+
+let counter = 0;
+/** A short name that's unique across test runs and parallel workers. */
+export function uniq(prefix: string): string {
+  counter += 1;
+  return `${prefix}${process.pid % 1000}${Date.now() % 1_000_000}${counter}`;
+}
+
+/** A made-up client address, so per-IP rate limits apply per test user. */
+export function randomIp(): string {
+  const b = crypto.randomBytes(3);
+  return `10.${b[0]}.${b[1]}.${b[2] || 1}`;
+}
+
+export interface User {
+  token: string;
+  refresh_token: string;
+  user: { id: string; username: string };
+  email: string;
+  password: string;
+  ip: string;
+}
+
+export interface Res<T = any> {
+  status: number;
+  body: T;
+  headers: Headers;
+}
+
+async function send<T>(method: string, path: string, opts: { token?: string; body?: unknown; form?: FormData; ip?: string; headers?: Record<string, string> } = {}): Promise<Res<T>> {
+  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  if (opts.ip) headers['X-Forwarded-For'] = opts.ip;
+  let body: BodyInit | undefined;
+  if (opts.form) body = opts.form;
+  else if (opts.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(opts.body);
+  }
+  const res = await fetch(path.startsWith('http') ? path : API + path, { method, headers, body });
+  const text = await res.text();
+  let parsed: any = text;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    // not JSON
+  }
+  return { status: res.status, body: parsed, headers: res.headers };
+}
+
+/** Calls the API as `user` (or anonymously). */
+export function call<T = any>(user: User | null, method: string, path: string, body?: unknown): Promise<Res<T>> {
+  return send<T>(method, path, { token: user?.token, body, ip: user?.ip });
+}
+
+export function callForm<T = any>(user: User, method: string, path: string, form: FormData): Promise<Res<T>> {
+  return send<T>(method, path, { token: user.token, form, ip: user.ip });
+}
+
+export function post<T = any>(path: string, body: unknown, ip = randomIp()): Promise<Res<T>> {
+  return send<T>('POST', path, { body, ip });
+}
+
+export async function register(prefix = 'user', password = 'secret123'): Promise<User> {
+  const username = uniq(prefix);
+  const email = `${username}@example.test`;
+  const ip = randomIp();
+  const res = await send<any>('POST', '/auth/register', { body: { username, email, password }, ip });
+  if (res.status !== 200) throw new Error(`register failed: ${res.status} ${JSON.stringify(res.body)}`);
+  return { ...res.body, email, password, ip };
+}
+
+export async function login(email: string, password: string, ip = randomIp()): Promise<Res> {
+  return send('POST', '/auth/login', { body: { email, password }, ip });
+}
+
+/** A server with one channel "general", owned by `owner`. */
+export async function createServer(owner: User, name = uniq('srv')) {
+  const server = (await call(owner, 'POST', '/servers', { name })).body;
+  const channel = (await call(owner, 'POST', `/servers/${server.id}/channels`, { name: 'general' })).body;
+  return { server, channel };
+}
+
+/** Invites `users` into the server via a fresh invite. */
+export async function join(owner: User, serverId: string, ...users: User[]) {
+  const invite = (await call(owner, 'POST', `/servers/${serverId}/invites`, {})).body;
+  for (const u of users) {
+    const res = await call(u, 'POST', `/invites/${invite.code}`);
+    if (res.status !== 200) throw new Error(`join failed: ${res.status} ${JSON.stringify(res.body)}`);
+  }
+}
+
+export async function postMessage(user: User, channelId: string, content: string, file?: { name: string; type: string; data: Uint8Array | string }) {
+  const form = new FormData();
+  form.append('content', content);
+  if (file) form.append('file', new Blob([file.data], { type: file.type }), file.name);
+  return callForm(user, 'POST', `/channels/${channelId}/messages`, form);
+}
+
+/** An open WebSocket that records events and how it closed. */
+export interface Socket {
+  events: any[];
+  closed: { code: number; reason: string } | null;
+  close(): void;
+  waitFor(pred: (e: any) => boolean, timeoutMs?: number): Promise<any>;
+  waitClosed(timeoutMs?: number): Promise<{ code: number; reason: string }>;
+}
+
+export async function openSocket(user: User): Promise<Socket> {
+  const ws = new WebSocket(`${API_URL.replace(/^http/, 'ws')}/api/v1/ws?token=${encodeURIComponent(user.token)}`);
+  const socket: Socket = {
+    events: [],
+    closed: null,
+    close: () => ws.close(),
+    waitFor: (pred, timeoutMs = 5000) => poll(() => socket.events.find(pred), timeoutMs, 'WebSocket event'),
+    waitClosed: (timeoutMs = 5000) => poll(() => socket.closed, timeoutMs, 'WebSocket close'),
+  };
+  ws.onmessage = (e) => socket.events.push(JSON.parse(String(e.data)));
+  ws.onclose = (e) => (socket.closed = { code: e.code, reason: e.reason });
+  await new Promise<void>((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = () => reject(new Error('WebSocket failed to open'));
+  });
+  // Let the server register the connection before the test acts.
+  await sleep(150);
+  return socket;
+}
+
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function poll<T>(get: () => T | null | undefined, timeoutMs: number, what: string): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    const value = get();
+    if (value) return value;
+    if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${what}`);
+    await sleep(25);
+  }
+}
+
+/** Runs the svalinn-admin tool against the test database. */
+export function admin(...args: string[]): string {
+  try {
+    return execFileSync(exe('svalinn-admin'), args, { cwd: ROOT, env: { ...process.env, DATABASE_URL }, encoding: 'utf8' }).trim();
+  } catch (e: any) {
+    return `${e.stdout ?? ''}${e.stderr ?? ''}`.trim();
+  }
+}
+
+let pool: pg.Pool | null = null;
+/** Direct database access, only for setup the API can't do (e.g. ageing a token). */
+export async function sql<T = any>(query: string, params: unknown[] = []): Promise<T[]> {
+  pool ??= new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
+  return (await pool.query(query, params)).rows as T[];
+}
+
+/** Decodes a JWT's payload (no verification). */
+export function jwtPayload(token: string): any {
+  return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+}
+
+/** Signs a JWT with the test secret, to build expired or tampered tokens. */
+export function signJwt(payload: object): string {
+  const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const unsigned = `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(payload)}`;
+  return `${unsigned}.${crypto.createHmac('sha256', JWT_SECRET).update(unsigned).digest('base64url')}`;
+}
+
+/** Builds a signed file link the way the server does. */
+export function signFileLink(name: string, userId: string, sessionId: string, expires: number): string {
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(`file\0${name}\0${userId}\0${sessionId}\0${expires}`).digest('hex');
+  return `/api/v1/files/${name}?u=${userId}&s=${sessionId}&e=${expires}&sig=${sig}`;
+}
+
+export const nowSeconds = () => Math.floor(Date.now() / 1000);
