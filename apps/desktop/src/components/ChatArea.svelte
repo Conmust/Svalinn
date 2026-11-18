@@ -173,9 +173,19 @@
     }
   }
 
+  // Keep in sync with MAX_ATTACHMENT_BYTES on the server.
+  const MAX_ATTACHMENT_MB = 100;
+
   function handleFileSelect(event: Event) {
     const target = event.target as HTMLInputElement;
-    attachmentFile = target.files?.[0] || null;
+    const file = target.files?.[0] || null;
+    if (file && file.size > MAX_ATTACHMENT_MB * 1024 * 1024) {
+      alert(`That file is too large. The limit is ${MAX_ATTACHMENT_MB} MB.`);
+      target.value = '';
+      attachmentFile = null;
+      return;
+    }
+    attachmentFile = file;
   }
 
   function clearAttachment() {

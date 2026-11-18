@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { getAuthHeaders } from '../lib/api';
+  import { wsClient } from '../lib/websocket';
   import PatronBadge from './PatronBadge.svelte';
 
   export let serverId: string | null = null;
@@ -32,6 +33,22 @@
   $: if (serverId) {
     loadMembers(serverId);
   }
+
+  // Someone came online, went offline or changed status.
+  function onPresence(data: { user_id: string; status: string }) {
+    members = members.map(m =>
+      m.id === data.user_id ? { ...m, status: data.status, is_online: data.status !== 'offline' } : m
+    );
+  }
+
+  onMount(() => {
+    wsClient.connect();
+    wsClient.on('presence_updated', onPresence);
+  });
+
+  onDestroy(() => {
+    wsClient.off('presence_updated', onPresence);
+  });
 
   $: groupedMembers = statusOrder.map(status => ({
     status,

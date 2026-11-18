@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::access::{channel_server_id, is_moderator, require_member, safe_extension};
+use crate::access::{
+    channel_server_id, is_moderator, multipart_error, require_member, safe_extension, MAX_ATTACHMENT_BYTES,
+};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -191,7 +193,7 @@ pub async fn create_message(
     let mut attachment_size: Option<i64> = None;
 
     // Parse multipart form data
-    while let Some(field) = multipart.next_field().await.map_err(|e| AppError::BadRequest(e.to_string()))? {
+    while let Some(field) = multipart.next_field().await.map_err(|e| multipart_error(e, MAX_ATTACHMENT_BYTES))? {
         let name = field.name().unwrap_or("").to_string();
 
         if name == "content" {
@@ -199,7 +201,7 @@ pub async fn create_message(
         } else if name == "file" {
             let filename = field.file_name().unwrap_or("file").to_string();
             let mime_type = field.content_type().unwrap_or("application/octet-stream").to_string();
-            let bytes = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?.to_vec();
+            let bytes = field.bytes().await.map_err(|e| multipart_error(e, MAX_ATTACHMENT_BYTES))?.to_vec();
             let size = bytes.len() as i64;
 
             // Save file locally

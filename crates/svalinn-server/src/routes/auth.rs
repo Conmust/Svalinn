@@ -6,12 +6,8 @@ use chrono::{Utc, Duration};
 
 use crate::db::Database;
 use crate::errors::AppError;
+use crate::extractors::auth::jwt_secret;
 use crate::models::user::{User, RegisterRequest, LoginRequest, AuthResponse, Claims};
-
-fn get_jwt_secret() -> String {
-    std::env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "dev-secret-change-me-in-production".into())
-}
 
 pub async fn register(
     State(db): State<Database>,
@@ -114,7 +110,7 @@ fn generate_jwt(user: &User) -> Result<String, AppError> {
     encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(get_jwt_secret().as_bytes()),
+        &EncodingKey::from_secret(jwt_secret()),
     )
     .map_err(|e| AppError::Internal(format!("JWT generation failed: {}", e)))
 }

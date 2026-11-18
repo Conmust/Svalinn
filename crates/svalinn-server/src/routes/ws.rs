@@ -25,12 +25,9 @@ pub async fn websocket_handler(
     // 1. Extract and validate the token from the query string
     let user_id = match query.token {
         Some(token) => {
-            let secret = std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "dev-secret-change-me-in-production".into());
-            
             match decode::<Claims>(
                 &token,
-                &DecodingKey::from_secret(secret.as_bytes()),
+                &DecodingKey::from_secret(crate::extractors::auth::jwt_secret()),
                 &Validation::new(Algorithm::HS256),
             ) {
                 Ok(token_data) => {
@@ -61,6 +58,7 @@ async fn handle_socket_connection(
     db: Database,
 ) {
     println!("🔌 User {} connected to WebSocket", user_id);
+    crate::presence::connected(&db, user_id).await;
 
     // 1. Split the socket into a sender and receiver
     let (mut sender, mut receiver) = socket.split();
@@ -133,5 +131,6 @@ async fn handle_socket_connection(
     // 7. Clean up tasks when the client disconnects
     send_task.abort();
     broadcast_task.abort();
+    crate::presence::disconnected(&db, user_id).await;
     println!("🔌 User {} disconnected from WebSocket", user_id);
 }

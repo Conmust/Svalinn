@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -40,6 +43,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
 

@@ -5,6 +5,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::access::require_member;
+use crate::presence::VISIBLE_STATUS_SQL;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -26,31 +27,31 @@ pub async fn get_server_members(
 ) -> Result<Json<Vec<ServerMember>>, AppError> {
     require_member(&db, server_id, user_id).await?;
 
-    let members: Vec<ServerMember> = sqlx::query_as(
+    let members: Vec<ServerMember> = sqlx::query_as(&format!(
         r#"
-        SELECT 
-            u.id,
-            u.username,
-            COALESCE(u.is_online, false) AS is_online,
-            COALESCE(u.status, 'offline') AS status,
-            COALESCE(sm.role, 'member') AS role,
-            COALESCE(u.patron_tier, 'free') AS patron_tier
-        FROM server_members sm
-        JOIN users u ON sm.user_id = u.id
-        WHERE sm.server_id = $1
-        ORDER BY 
-            CASE u.status
+        SELECT * FROM (
+            SELECT
+                u.id,
+                u.username,
+                COALESCE(u.is_online, false) AS is_online,
+                {VISIBLE_STATUS_SQL} AS status,
+                COALESCE(sm.role, 'member') AS role,
+                COALESCE(u.patron_tier, 'free') AS patron_tier
+            FROM server_members sm
+            JOIN users u ON sm.user_id = u.id
+            WHERE sm.server_id = $1
+        ) members
+        ORDER BY
+            CASE status
                 WHEN 'online' THEN 1
                 WHEN 'idle' THEN 2
                 WHEN 'busy' THEN 3
                 WHEN 'away' THEN 4
-                WHEN 'invisible' THEN 5
-                WHEN 'offline' THEN 6
-                ELSE 7
+                ELSE 5
             END,
-            u.username ASC
-        "#,
-    )
+            username ASC
+        "#
+    ))
     .bind(server_id)
     .fetch_all(&db.pool)
     .await

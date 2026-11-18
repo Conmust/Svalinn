@@ -3,12 +3,16 @@ mod db;
 mod errors;
 mod extractors;
 mod models;
+mod presence;
 mod routes;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
     Router,
 };
+
+use crate::access::{upload_body_limit, MAX_ATTACHMENT_BYTES, MAX_EMOJI_BYTES};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -19,16 +23,30 @@ async fn main() {
     // 1. Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    // 2. Get the database URL from the environment
+    // 2. Refuse to start without a proper secret for signing login tokens
+    match crate::extractors::auth::init_jwt_secret() {
+        Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
+        Ok(None) => {}
+        Err(problem) => {
+            eprintln!("❌ {problem}");
+            std::process::exit(1);
+        }
+    }
+
+    // 3. Get the database URL from the environment
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set in .env");
 
-    // 3. Initialize the database connection pool
+    // 4. Initialize the database connection pool
     let db = Database::new(&database_url)
         .await
         .expect("Failed to connect to database");
 
-    // 4. Build the application router
+    presence::reset(&db)
+        .await
+        .expect("Failed to reset online status");
+
+    // 5. Build the application router
     let app = Router::new()
         .route("/health", get(routes::health::health_check))
 
@@ -63,7 +81,8 @@ async fn main() {
         )
         .route(
             "/api/v1/channels/:channel_id/messages",
-            post(routes::messages::create_message),
+            post(routes::messages::create_message)
+                .layer(DefaultBodyLimit::max(upload_body_limit(MAX_ATTACHMENT_BYTES))),
         )
         .route(
             "/api/v1/messages/:message_id",
@@ -97,7 +116,8 @@ async fn main() {
         )
         .route(
             "/api/v1/servers/:server_id/emojis",
-            post(routes::emojis::upload_emoji),
+            post(routes::emojis::upload_emoji)
+                .layer(DefaultBodyLimit::max(upload_body_limit(MAX_EMOJI_BYTES))),
         )
         .route(
             "/api/v1/servers/:server_id/emojis/:emoji_id",
@@ -114,7 +134,7 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(db); // Now receives the unwrapped `Database` struct
 
-    // 5. Start the server
+    // 6. Start the server
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
         .await
         .expect("Failed to bind to port 3001");

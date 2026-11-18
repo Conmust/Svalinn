@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 
@@ -5,6 +7,7 @@ use tokio::sync::broadcast;
 pub struct Database {
     pub pool: PgPool,
     pub message_tx: broadcast::Sender<crate::models::message::BroadcastMessage>,
+    pub presence: Arc<crate::presence::Presence>,
 }
 
 impl Database {
@@ -14,6 +17,6 @@ impl Database {
         // Create a broadcast channel with a capacity of 1000 messages
         let (message_tx, _) = broadcast::channel(1000);
         
-        Ok(Self { pool, message_tx })
+        Ok(Self { pool, message_tx, presence: Arc::default() })
     }
 }

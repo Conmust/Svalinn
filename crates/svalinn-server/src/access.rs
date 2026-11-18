@@ -55,6 +55,28 @@ pub async fn channel_server_id(db: &Database, channel_id: Uuid) -> Result<Uuid, 
         .ok_or_else(|| AppError::NotFound("Channel not found".into()))
 }
 
+/// Largest message attachment accepted, in bytes.
+pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
+/// Largest custom emoji image accepted, in bytes.
+pub const MAX_EMOJI_BYTES: usize = 2 * 1024 * 1024;
+/// Request body limit for an upload of `max_file` bytes: the file plus room
+/// for the other form fields and multipart framing.
+pub const fn upload_body_limit(max_file: usize) -> usize {
+    max_file + 1024 * 1024
+}
+
+/// Turns a multipart error into a clear message, especially for oversized files.
+pub fn multipart_error(e: axum::extract::multipart::MultipartError, max_file: usize) -> AppError {
+    if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge(format!(
+            "File is too large. The limit is {} MB.",
+            max_file / (1024 * 1024)
+        ))
+    } else {
+        AppError::BadRequest(e.body_text())
+    }
+}
+
 /// Extension to use for a stored upload. Only ASCII letters and digits are
 /// kept, so a crafted filename like `x./../../evil` can't escape `uploads/`.
 pub fn safe_extension(filename: &str, default: &str) -> String {

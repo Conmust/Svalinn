@@ -146,6 +146,9 @@ pub async fn update_status(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let visible = if is_online { payload.status.as_str() } else { "offline" };
+    crate::presence::broadcast_status(&db, user_id, visible).await;
+
     Ok(Json(PublicUser::from(user)))
 }
 

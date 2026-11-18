@@ -428,7 +428,13 @@ Create a `.env` file from the example:
 cp .env.example .env
 ```
 
-The defaults in `.env.example` match the database in `docker-compose.yml`. Set `JWT_SECRET` to a long random value for anything other than local development.
+The defaults in `.env.example` match the database in `docker-compose.yml`.
+
+`JWT_SECRET` signs login tokens, and the server won't start without it. A short value is accepted only when `APP_ENV=development`; anywhere else, use at least 32 random characters, for example the output of:
+
+```bash
+openssl rand -base64 48
+```
 
 ---
 

@@ -6,7 +6,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::access::{require_admin, require_member, safe_extension};
+use crate::access::{multipart_error, require_admin, require_member, safe_extension, MAX_EMOJI_BYTES};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -52,14 +52,14 @@ pub async fn upload_emoji(
     let mut name = String::new();
     let mut url = String::new();
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| AppError::BadRequest(e.to_string()))? {
+    while let Some(field) = multipart.next_field().await.map_err(|e| multipart_error(e, MAX_EMOJI_BYTES))? {
         let field_name = field.name().unwrap_or("").to_string();
         
         if field_name == "name" {
             name = field.text().await.unwrap_or_default();
         } else if field_name == "file" {
             let filename = field.file_name().unwrap_or("emoji.png").to_string();
-            let bytes = field.bytes().await.map_err(|e| AppError::BadRequest(e.to_string()))?.to_vec();
+            let bytes = field.bytes().await.map_err(|e| multipart_error(e, MAX_EMOJI_BYTES))?.to_vec();
 
             let file_ext = safe_extension(&filename, "png");
             let new_filename = format!("emoji_{}_{}.{}", Uuid::new_v4(), server_id, file_ext);
