@@ -102,6 +102,10 @@ async fn handle_socket_connection(
                 }
             }
 
+            // File links in events are signed for this recipient's session.
+            let mut broadcast_msg = broadcast_msg;
+            crate::files::sign_json(&mut broadcast_msg.payload, user_id, session_id);
+
             if let Ok(json_str) = serde_json::to_string(&broadcast_msg) {
                 if broadcast_tx.send(Message::Text(json_str)).is_err() {
                     break;

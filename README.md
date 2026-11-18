@@ -473,6 +473,8 @@ cargo run -p svalinn-server --bin svalinn-admin -- list-banned
 
 A ban takes effect immediately: the user's sessions are revoked, open connections are closed, the app returns to the login screen showing the reason, and every request and login is refused until the ban is lifted. This also applies if `users.banned_at` is set directly in the database. After an unban, the user logs in again.
 
+Uploaded files (attachments, emojis, server icons) are never served publicly. The API hands out signed links tied to the viewer's login session, and every download re-checks that the account isn't banned, the session is active and the viewer belongs to the file's server. Saved links therefore stop working as soon as access is revoked. Links expire after 6 hours; the app gets fresh ones whenever it loads messages.
+
 ---
 
 ## Run the Desktop App

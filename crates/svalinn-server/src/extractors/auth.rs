@@ -67,9 +67,28 @@ pub fn jwt_secret() -> &'static [u8] {
 /// Use it in route handlers like: `CurrentUser(user_id): CurrentUser`
 pub struct CurrentUser(pub Uuid);
 
+/// Like `CurrentUser`, but also gives the login session id. Needed to sign
+/// file links, which are tied to the session.
+pub struct CurrentSession {
+    pub user_id: Uuid,
+    pub session_id: Uuid,
+}
+
+type Rejection = (StatusCode, Json<serde_json::Value>);
+
 #[axum::async_trait]
 impl FromRequestParts<Database> for CurrentUser {
-    type Rejection = (StatusCode, Json<serde_json::Value>);
+    type Rejection = Rejection;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Database) -> Result<Self, Self::Rejection> {
+        let session = CurrentSession::from_request_parts(parts, state).await?;
+        Ok(CurrentUser(session.user_id))
+    }
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Database> for CurrentSession {
+    type Rejection = Rejection;
 
     async fn from_request_parts(parts: &mut Parts, state: &Database) -> Result<Self, Self::Rejection> {
         // 1. Get the Authorization header
@@ -98,7 +117,7 @@ impl FromRequestParts<Database> for CurrentUser {
             .await
             .map_err(|denied| unauthorized(&denied.message()))?;
 
-        Ok(CurrentUser(claims.sub))
+        Ok(CurrentSession { user_id: claims.sub, session_id })
     }
 }
 

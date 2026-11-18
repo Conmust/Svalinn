@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { fileUrl } from '../lib/api';
   import { createEventDispatcher } from 'svelte';
   import ReactionPicker from './ReactionPicker.svelte';
   import type { Message } from '../lib/messages';
@@ -116,21 +117,21 @@
           {#if message.attachment_mime_type && message.attachment_mime_type.startsWith('image/')}
             <!-- Display Images -->
             <img 
-              src="http://localhost:3001{message.attachment_url}" 
+              src={fileUrl(message.attachment_url)} 
               alt={message.attachment_filename || 'Image attachment'}
               class="max-w-sm max-h-80 rounded border border-[#00ff00] cursor-pointer hover:opacity-80 transition-opacity"
-              on:click={() => window.open(`http://localhost:3001${message.attachment_url}`, '_blank')}
+              on:click={() => window.open(fileUrl(message.attachment_url), '_blank')}
             />
           {:else if message.attachment_mime_type && message.attachment_mime_type.startsWith('video/')}
             <!-- Display Videos -->
             <video controls class="max-w-sm max-h-80 rounded border border-[#00ff00]">
-              <source src="http://localhost:3001{message.attachment_url}" type={message.attachment_mime_type} />
+              <source src={fileUrl(message.attachment_url)} type={message.attachment_mime_type} />
               Your browser does not support the video tag.
             </video>
           {:else}
             <!-- Display Other Files as Download Links -->
             <a 
-              href="http://localhost:3001{message.attachment_url}" 
+              href={fileUrl(message.attachment_url)} 
               target="_blank"
               class="inline-flex items-center gap-2 px-3 py-2 bg-[#0a0e0a] border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow rounded"
             >

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
-  import { getAuthHeaders, apiFetch } from '../lib/api';
+  import { getAuthHeaders, apiFetch, fileUrl } from '../lib/api';
   import { fetchServerEmojis, uploadEmoji, deleteEmoji, type CustomEmoji } from '../lib/emojis';
 
   export let serverId: string;
@@ -170,7 +170,7 @@
           </div>
           <div>
             <label for="server-icon" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Icon URL</label>
-            <input id="server-icon" bind:value={serverIconUrl} type="text" class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" placeholder="http://localhost:3001/uploads/..." />
+            <input id="server-icon" bind:value={serverIconUrl} type="text" class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" placeholder="https://example.com/icon.png" />
           </div>
           <button type="submit" class="w-full py-2 bg-black border-2 border-[#00ff00] text-[#00ff00] font-semibold uppercase tracking-wider hover:bg-[#00ff00] hover:text-black transition-all terminal-glow">Save Changes</button>
         </form>
@@ -213,7 +213,7 @@
           <div class="grid grid-cols-4 gap-4">
             {#each emojis as emoji}
               <div class="relative group bg-[#0a0e0a] border border-[#00aa00]/30 p-2 flex flex-col items-center">
-                <img src="http://localhost:3001{emoji.url}" alt={emoji.name} class="w-12 h-12 object-contain mb-2" />
+                <img src={fileUrl(emoji.url)} alt={emoji.name} class="w-12 h-12 object-contain mb-2" />
                 <span class="text-[10px] text-[#00aa00] text-center truncate w-full">:{emoji.name}:</span>
                 <button 
                   class="absolute top-1 right-1 text-red-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity" 

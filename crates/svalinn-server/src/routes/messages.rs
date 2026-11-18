@@ -11,7 +11,8 @@ use crate::access::{
 };
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::{CurrentSession, CurrentUser};
+use crate::files::sign_opt;
 use crate::models::message::BroadcastMessage;
 
 /// One emoji's reactions on a message.
@@ -132,7 +133,7 @@ fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server
 /// read for the current user.
 pub async fn get_channel_messages(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(channel_id): Path<Uuid>,
 ) -> Result<Json<Vec<Message>>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
@@ -173,13 +174,17 @@ pub async fn get_channel_messages(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut messages = messages;
+    for m in &mut messages {
+        sign_opt(&mut m.attachment_url, user_id, session_id);
+    }
     Ok(Json(messages))
 }
 
 /// POST /api/v1/channels/:channel_id/messages
 pub async fn create_message(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(channel_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<Json<Message>, AppError> {
@@ -238,11 +243,13 @@ pub async fn create_message(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let message = fetch_message(&db, msg_id, user_id).await?;
+    let mut message = fetch_message(&db, msg_id, user_id).await?;
 
+    // Broadcast the stored path; each recipient's connection signs it for them.
     let payload = serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?;
     broadcast(&db, "new_message", payload, server_id);
 
+    sign_opt(&mut message.attachment_url, user_id, session_id);
     Ok(Json(message))
 }
 

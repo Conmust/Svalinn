@@ -10,6 +10,15 @@
 
 export const API_BASE = 'http://localhost:3001';
 
+/**
+ * Full URL for a file link from the server. Uploaded files come as signed,
+ * session-bound paths ("/api/v1/files/..."); external links are kept as they are.
+ */
+export function fileUrl(path: string | null | undefined): string {
+  if (!path) return '';
+  return /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`;
+}
+
 /** Refresh this long before the access token expires. */
 const REFRESH_MARGIN_MS = 30_000;
 

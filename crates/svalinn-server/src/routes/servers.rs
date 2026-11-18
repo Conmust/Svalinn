@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::access::{require_admin, require_member};
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::CurrentSession;
+use crate::files::{sign_opt, stored_path};
 
 // ---------- REQUEST STRUCTS ----------
 
@@ -41,7 +42,7 @@ pub struct Server {
 
 pub async fn get_user_servers(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
 ) -> Result<Json<Vec<Server>>, AppError> {
     let servers: Vec<Server> = sqlx::query_as(
         r#"
@@ -57,6 +58,10 @@ pub async fn get_user_servers(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut servers = servers;
+    for server in &mut servers {
+        sign_opt(&mut server.icon_url, user_id, session_id);
+    }
     Ok(Json(servers))
 }
 
@@ -64,7 +69,7 @@ pub async fn get_user_servers(
 
 pub async fn create_server(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Json(payload): Json<CreateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
     if payload.name.trim().is_empty() {
@@ -104,6 +109,8 @@ pub async fn create_server(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut server = server;
+    sign_opt(&mut server.icon_url, user_id, session_id);
     Ok(Json(server))
 }
 
@@ -111,7 +118,7 @@ pub async fn create_server(
 
 pub async fn get_server(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Server>, AppError> {
     require_member(&db, server_id, user_id).await?;
@@ -124,6 +131,8 @@ pub async fn get_server(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut server = server;
+    sign_opt(&mut server.icon_url, user_id, session_id);
     Ok(Json(server))
 }
 
@@ -131,7 +140,7 @@ pub async fn get_server(
 
 pub async fn update_server(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(server_id): Path<Uuid>,
     Json(payload): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
@@ -149,7 +158,7 @@ pub async fn update_server(
     )
     .bind(payload.name.as_deref().map(str::trim))
     .bind(&payload.description)
-    .bind(&payload.icon_url)
+    .bind(payload.icon_url.as_deref().map(stored_path))
     .bind(server_id)
     .execute(&db.pool)
     .await
@@ -164,5 +173,7 @@ pub async fn update_server(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut server = server;
+    sign_opt(&mut server.icon_url, user_id, session_id);
     Ok(Json(server))
 }

@@ -2,6 +2,7 @@ mod access;
 mod db;
 mod errors;
 mod extractors;
+mod files;
 mod models;
 mod presence;
 mod sessions;
@@ -15,7 +16,6 @@ use axum::{
 
 use crate::access::{upload_body_limit, MAX_ATTACHMENT_BYTES, MAX_EMOJI_BYTES};
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
 
 use crate::db::Database;
 
@@ -133,8 +133,8 @@ async fn main() {
         // --- WebSocket Route ---
         .route("/api/v1/ws", get(routes::ws::websocket_handler))
         
-        // --- Static File Serving for Uploads ---
-        .nest_service("/uploads", ServeDir::new("uploads"))
+        // --- Uploaded files: signed, access-checked links only ---
+        .route("/api/v1/files/:name", get(files::serve_file))
         
         // --- Middleware & State ---
         .layer(CorsLayer::permissive())

@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::access::{multipart_error, require_admin, require_member, safe_extension, MAX_EMOJI_BYTES};
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::{CurrentSession, CurrentUser};
+use crate::files::sign_path;
 
 #[derive(Serialize, FromRow)]
 pub struct Emoji {
@@ -24,7 +25,7 @@ pub struct Emoji {
 /// GET /api/v1/servers/:server_id/emojis
 pub async fn get_server_emojis(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<Emoji>>, AppError> {
     require_member(&db, server_id, user_id).await?;
@@ -37,13 +38,17 @@ pub async fn get_server_emojis(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut emojis = emojis;
+    for e in &mut emojis {
+        e.url = sign_path(&e.url, user_id, session_id);
+    }
     Ok(Json(emojis))
 }
 
 /// POST /api/v1/servers/:server_id/emojis
 pub async fn upload_emoji(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(server_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<Json<Emoji>, AppError> {
@@ -100,6 +105,8 @@ pub async fn upload_emoji(
         }
     })?;
 
+    let mut emoji = emoji;
+    emoji.url = sign_path(&emoji.url, user_id, session_id);
     Ok(Json(emoji))
 }
 

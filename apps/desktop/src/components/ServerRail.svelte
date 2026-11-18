@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders, apiFetch } from '../lib/api';
+  import { getAuthHeaders, apiFetch, fileUrl } from '../lib/api';
 
   const dispatch = createEventDispatcher();
 
@@ -98,7 +98,7 @@
         on:click={() => dispatch('serverSelected', server.id)}
       >
         {#if server.icon_url}
-          <img src="http://localhost:3001{server.icon_url}" alt={server.name} class="w-full h-full object-cover" />
+          <img src={fileUrl(server.icon_url)} alt={server.name} class="w-full h-full object-cover" />
         {:else}
           <span class="text-[#00ff00] font-bold text-lg group-hover:text-black transition-colors">
             {server.name[0].toUpperCase()}
