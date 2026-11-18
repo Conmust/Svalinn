@@ -1,0 +1,19 @@
+use sqlx::PgPool;
+use tokio::sync::broadcast;
+
+#[derive(Clone)]
+pub struct Database {
+    pub pool: PgPool,
+    pub message_tx: broadcast::Sender<crate::models::message::BroadcastMessage>,
+}
+
+impl Database {
+    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+        let pool = PgPool::connect(database_url).await?;
+        
+        // Create a broadcast channel with a capacity of 1000 messages
+        let (message_tx, _) = broadcast::channel(1000);
+        
+        Ok(Self { pool, message_tx })
+    }
+}

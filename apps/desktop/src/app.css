@@ -1,0 +1,144 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Terminal Color Palette */
+  --terminal-bg: #0a0e0a;
+  --terminal-surface: #000000;
+  --terminal-border: #00ff00;
+  --terminal-text: #00ff00;
+  --terminal-text-dim: #00aa00;
+  --terminal-accent: #00ff00;
+  --terminal-glow: 0 0 10px #00ff00;
+}
+
+* {
+  font-family: 'Courier New', 'Consolas', 'Monaco', monospace;
+}
+
+body {
+  background-color: var(--terminal-bg);
+  color: var(--terminal-text);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 255, 0, 0.05);
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 0, 0.3);
+  border-radius: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 0, 0.5);
+}
+
+/* Terminal CRT Scan-line Effect (applied globally) */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 255, 0, 0.03) from 0px,
+    rgba(0, 255, 0, 0.03) from 1px,
+    transparent from 1px,
+    transparent from 2px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Terminal Glow Effects */
+.terminal-glow {
+  text-shadow: var(--terminal-glow);
+}
+
+.terminal-box-glow {
+  box-shadow: 0 0 15px rgba(0, 255, 0, 0.3);
+}
+
+/* Override Tailwind colors for terminal theme */
+.bg-obsidian {
+  background-color: var(--terminal-bg);
+}
+
+.bg-frost-blue {
+  background-color: var(--terminal-accent);
+}
+
+.text-tungsten {
+  color: var(--terminal-text);
+}
+
+.text-frost-blue {
+  color: var(--terminal-accent);
+}
+
+.border-frost-blue {
+  border-color: var(--terminal-border);
+}
+
+.border-gray-800 {
+  border-color: var(--terminal-border);
+}
+
+.hover\:bg-frost-blue\/80:hover {
+  background-color: var(--terminal-accent);
+  color: var(--terminal-bg);
+}
+
+/* Message hover effects */
+.group:hover {
+  background: rgba(0, 255, 0, 0.03);
+}
+
+/* Button terminal style */
+button {
+  transition: all 0.2s;
+}
+
+button:hover {
+  text-shadow: var(--terminal-glow);
+}
+
+/* Input terminal style */
+input, textarea {
+  background: var(--terminal-bg);
+  border: 1px solid var(--terminal-border);
+  color: var(--terminal-text);
+  font-family: 'Courier New', monospace;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--terminal-text-dim);
+}
+
+input:focus, textarea:focus {
+  outline: none;
+  box-shadow: 0 0 10px rgba(0, 255, 0, 0.3);
+}
+
+/* Animations */
+@keyframes terminal-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.terminal-cursor::after {
+  content: '_';
+  animation: terminal-blink 1s infinite;
+}
