@@ -84,7 +84,7 @@
 
         <!-- Members in this status -->
         {#each group.members as member}
-          <div class="group flex items-center gap-3 px-2 py-2 rounded hover:bg-[rgba(0,255,0,0.05)] transition-colors cursor-pointer">
+          <div class="group flex items-center gap-3 px-2 py-2 rounded hover:bg-[rgba(0,255,0,0.05)] transition-colors ">
             <div class="relative">
               <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
                 {member.username[0].toUpperCase()}
@@ -111,21 +111,6 @@
                 {member.role}
               </div>
               
-              <!-- Ban Button (hidden by default, shows on hover, never shows for yourself) -->
-              {#if currentUser && member.id !== currentUser.id}
-                <button
-                  type="button"
-                  class="text-[10px] text-red-500 hover:text-red-400 terminal-glow px-2 py-1 border border-red-500/50 hover:bg-red-500/10 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                  on:click={(e) => {
-                    e.stopPropagation();
-                    // Note: We dispatch this to App.svelte which handles the modal
-                    // If you removed the dispatcher, you can bind this directly or pass a function from App.svelte
-                  }}
-                  title="Ban User"
-                >
-                  [ BAN ]
-                </button>
-              {/if}
             </div>
           </div>
         {/each}

@@ -3,6 +3,8 @@
 
   const dispatch = createEventDispatcher();
   let isOpen = false;
+  let openUp = true;
+  let container: HTMLDivElement;
 
   // Expanded emoji list for better variety
   const emojis = [
@@ -16,7 +18,14 @@
     '🛡️', '⚔️', '🏹', '🧪', '🔮', '🧩', '🎯', '🎲'
   ];
 
+  $: dispatch('openchange', isOpen);
+
   function togglePicker() {
+    // Open downward when there isn't room above (e.g. the first messages in
+    // the list), so the popup isn't cut off by the scroll area.
+    if (!isOpen && container) {
+      openUp = container.getBoundingClientRect().top > 400;
+    }
     isOpen = !isOpen;
   }
 
@@ -41,7 +50,7 @@
   });
 </script>
 
-<div class="reaction-picker relative inline-block">
+<div class="reaction-picker relative inline-block" bind:this={container}>
   <button
     type="button"
     class="p-1.5 text-[#00aa00] hover:text-[#00ff00] hover:bg-[rgba(0,255,0,0.1)] rounded terminal-glow"
@@ -54,7 +63,7 @@
   </button>
 
   {#if isOpen}
-    <div class="absolute bottom-full right-0 mb-2 w-80 bg-black border-2 border-[#00ff00] shadow-[0_0_20px_rgba(0,255,0,0.4)] z-50 flex flex-col animate-pulse-once">
+    <div class="absolute {openUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-80 bg-black border-2 border-[#00ff00] shadow-[0_0_20px_rgba(0,255,0,0.4)] z-50 flex flex-col animate-pulse-once">
       <!-- Header -->
       <div class="px-3 py-2 border-b border-[#00ff00] bg-[#0a0e0a] flex items-center gap-2">
         <div class="w-2 h-2 bg-[#00ff00] rounded-full animate-pulse"></div>

@@ -4,26 +4,19 @@
   import { wsClient } from '../lib/websocket';
   import MessageItem from './MessageItem.svelte';
   import InlineEmojiPicker from './InlineEmojiPicker.svelte';
+  import ConfirmModal from './ConfirmModal.svelte';
+  import {
+    type Message,
+    deleteMessage, hideMessage, unhideMessage, lockMessage, unlockMessage,
+    pinMessage, unpinMessage, addReaction, removeReaction,
+  } from '../lib/messages';
 
   export let channelId: string;
+  export let serverId: string;
+  export let currentUser: { id: string } | null = null;
+  export let showRoster = false;
 
   const dispatch = createEventDispatcher();
-
-  interface Message {
-    id: string;
-    channel_id: string;
-    user_id: string;
-    username: string;
-    content: string;
-    attachment_url?: string;
-    attachment_filename?: string;
-    attachment_mime_type?: string;
-    attachment_size?: number;
-    is_edited: boolean;
-    is_locked: boolean;
-    is_pinned: boolean;
-    created_at: string;
-  }
 
   let messages: Message[] = [];
   let loading = true;
@@ -34,6 +27,79 @@
   let selectedMessages: string[] = [];
   let highlightedMessageId: string | null = null;
   let messageInput: HTMLInputElement;
+  let myRole = 'member';
+  let showPinnedOnly = false;
+  let pendingDelete: Message | null = null;
+
+  $: canModerate = ['owner', 'admin', 'moderator'].includes(myRole);
+  $: pinnedCount = messages.filter(m => m.is_pinned).length;
+  $: if (pinnedCount === 0) showPinnedOnly = false;
+  $: visibleMessages = showPinnedOnly ? messages.filter(m => m.is_pinned) : messages;
+  $: if (serverId) loadRole(serverId);
+
+  async function loadRole(id: string) {
+    try {
+      const res = await fetch(`http://localhost:3001/api/v1/servers/${id}/role`, { headers: getAuthHeaders() });
+      if (res.ok) myRole = (await res.json()).role;
+    } catch (e) {
+      console.error('Failed to load role:', e);
+    }
+  }
+
+  function patchMessage(id: string, changes: Partial<Message>) {
+    messages = messages.map(m => (m.id === id ? { ...m, ...changes } : m));
+  }
+
+  // Runs a message action and shows the server's error if it fails.
+  async function run(action: () => Promise<void>) {
+    try {
+      await action();
+    } catch (e: any) {
+      alert(e.message || 'Something went wrong');
+    }
+  }
+
+  function handleToggleReaction(e: CustomEvent<{ messageId: string; emoji: string }>) {
+    const { messageId, emoji } = e.detail;
+    const message = messages.find(m => m.id === messageId);
+    const mine = message?.reactions?.find(r => r.emoji === emoji)?.user_ids.includes(currentUser?.id ?? '');
+    run(async () => {
+      const reactions = mine ? await removeReaction(messageId, emoji) : await addReaction(messageId, emoji);
+      patchMessage(messageId, { reactions });
+    });
+  }
+
+  const handlePin = (e: CustomEvent<Message>) => run(async () => {
+    const m = e.detail;
+    await (m.is_pinned ? unpinMessage(m.id) : pinMessage(m.id));
+    patchMessage(m.id, { is_pinned: !m.is_pinned });
+  });
+
+  const handleLock = (e: CustomEvent<Message>) => run(async () => {
+    const m = e.detail;
+    await (m.is_locked ? unlockMessage(m.id) : lockMessage(m.id));
+    patchMessage(m.id, { is_locked: !m.is_locked });
+  });
+
+  const handleHide = (e: CustomEvent<Message>) => run(async () => {
+    await hideMessage(e.detail.id);
+    patchMessage(e.detail.id, { is_hidden: true });
+  });
+
+  const handleUnhide = (e: CustomEvent<Message>) => run(async () => {
+    await unhideMessage(e.detail.id);
+    patchMessage(e.detail.id, { is_hidden: false });
+  });
+
+  async function confirmDelete() {
+    const m = pendingDelete;
+    pendingDelete = null;
+    if (!m) return;
+    await run(async () => {
+      await deleteMessage(m.id);
+      messages = messages.filter(x => x.id !== m.id);
+    });
+  }
 
   // Insert the picked emoji where the cursor is, then put the cursor after it.
   async function insertEmoji(event: CustomEvent<string>) {
@@ -180,20 +246,21 @@
     if (selectedMessages.length === 0) return;
     if (!confirm(`Delete ${selectedMessages.length} message(s)?`)) return;
 
+    const failures: string[] = [];
     for (const messageId of selectedMessages) {
       try {
-        await fetch(`http://localhost:3001/api/v1/messages/${messageId}`, {
-          method: 'DELETE',
-          headers: getAuthHeaders(),
-        });
-      } catch (e) {
-        console.error('Failed to delete message:', e);
+        await deleteMessage(messageId);
+      } catch (e: any) {
+        failures.push(e.message);
       }
     }
 
     selectedMessages = [];
     selectionMode = false;
     await loadMessages();
+    if (failures.length > 0) {
+      alert(`${failures.length} message(s) couldn't be deleted: ${[...new Set(failures)].join('; ')}`);
+    }
   }
 
   function handleUserClick(userId: string) {
@@ -219,6 +286,17 @@
       </h3>
     </div>
 
+    {#if pinnedCount > 0}
+      <button
+        type="button"
+        class="px-3 py-1 border border-[#00ff00] text-xs transition-all terminal-glow {showPinnedOnly ? 'bg-[#00ff00] text-black' : 'text-[#00ff00] hover:bg-[#00ff00] hover:text-black'}"
+        title={showPinnedOnly ? 'Show all messages' : 'Show only pinned messages'}
+        on:click={() => (showPinnedOnly = !showPinnedOnly)}
+      >
+        📌 Pinned ({pinnedCount})
+      </button>
+    {/if}
+
     <button
       type="button"
       class="px-3 py-1 border border-[#00ff00] text-[#00ff00] text-xs hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
@@ -236,6 +314,15 @@
         Delete ({selectedMessages.length})
       </button>
     {/if}
+
+    <button
+      type="button"
+      class="px-3 py-1 border border-[#00ff00] text-xs transition-all terminal-glow {showRoster ? 'bg-[#00ff00] text-black' : 'text-[#00ff00] hover:bg-[#00ff00] hover:text-black'}"
+      title={showRoster ? 'Hide member list' : 'Show member list'}
+      on:click={() => dispatch('toggleRoster')}
+    >
+      Members
+    </button>
   </div>
 
   <!-- Messages -->
@@ -251,20 +338,25 @@
       </div>
     {:else}
       <div class="space-y-1">
-        {#each messages as message, i}
-          {@const showHeader = i === 0 || messages[i - 1].user_id !== message.user_id}
+        {#each visibleMessages as message, i (message.id)}
+          {@const prev = visibleMessages[i - 1]}
+          {@const showHeader = i === 0 || prev.user_id !== message.user_id || !!prev.is_hidden}
           <MessageItem
             {message}
-            isOwnMessage={false}
+            currentUserId={currentUser?.id ?? ''}
+            {canModerate}
             {showHeader}
             {selectionMode}
             isSelected={selectedMessages.includes(message.id)}
             isHighlighted={highlightedMessageId === message.id}
-            isPinned={message.is_pinned || false}
-            on:messageDeleted={loadMessages}
-            on:messageUpdated={loadMessages}
             on:select={handleSelectMessage}
             on:userClicked={(e) => handleUserClick(e.detail)}
+            on:toggleReaction={handleToggleReaction}
+            on:pin={handlePin}
+            on:lock={handleLock}
+            on:hide={handleHide}
+            on:unhide={handleUnhide}
+            on:delete={(e) => (pendingDelete = e.detail)}
           />
         {/each}
       </div>
@@ -313,6 +405,16 @@
     </form>
   </div>
 </div>
+
+{#if pendingDelete}
+  <ConfirmModal
+    title="Delete message"
+    message="Delete this message? This can't be undone."
+    confirmText="Delete"
+    on:confirm={confirmDelete}
+    on:cancel={() => (pendingDelete = null)}
+  />
+{/if}
 
 <style>
   .custom-scrollbar::-webkit-scrollbar { width: 6px; }

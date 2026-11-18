@@ -2,14 +2,23 @@ use axum::{
     extract::{Multipart, Path, State},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::access::{channel_server_id, require_member, safe_extension};
+use crate::access::{channel_server_id, is_moderator, require_member, safe_extension};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
+use crate::models::message::BroadcastMessage;
+
+/// One emoji's reactions on a message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: i64,
+    pub user_ids: Vec<Uuid>,
+}
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Message {
@@ -26,6 +35,93 @@ pub struct Message {
     pub is_locked: bool,
     pub is_pinned: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the *requesting* user has hidden this message.
+    pub is_hidden: bool,
+    pub reactions: sqlx::types::Json<Vec<ReactionSummary>>,
+}
+
+/// Columns for `Message`. `$1` must be the requesting user's id.
+const MESSAGE_COLUMNS: &str = r#"
+    m.id, m.channel_id, m.user_id, u.username, m.content,
+    m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
+    COALESCE(m.is_edited, false) AS is_edited,
+    COALESCE(m.is_locked, false) AS is_locked,
+    COALESCE(m.is_pinned, false) AS is_pinned,
+    m.created_at,
+    EXISTS(
+        SELECT 1 FROM hidden_messages h WHERE h.message_id = m.id AND h.user_id = $1
+    ) AS is_hidden,
+    COALESCE((
+        SELECT json_agg(json_build_object('emoji', r.emoji, 'count', r.cnt, 'user_ids', r.user_ids)
+                        ORDER BY r.first_at)
+        FROM (
+            SELECT emoji, COUNT(*) AS cnt,
+                   array_agg(user_id ORDER BY created_at) AS user_ids,
+                   MIN(created_at) AS first_at
+            FROM message_reactions
+            WHERE message_id = m.id
+            GROUP BY emoji
+        ) r
+    ), '[]'::json) AS reactions
+"#;
+
+async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Result<Message, AppError> {
+    sqlx::query_as(&format!(
+        "SELECT {MESSAGE_COLUMNS} FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $2"
+    ))
+    .bind(viewer_id)
+    .bind(message_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Message not found".into()))
+}
+
+/// Author, server, lock state and the current user's role for a channel message.
+/// Fails with NotFound if the message doesn't exist, Forbidden if the user isn't
+/// in the message's server.
+struct MessageContext {
+    author_id: Uuid,
+    server_id: Uuid,
+    is_locked: bool,
+    role: String,
+}
+
+async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
+    let row: Option<(Uuid, Uuid, bool)> = sqlx::query_as(
+        r#"
+        SELECT m.user_id, c.server_id, COALESCE(m.is_locked, false)
+        FROM messages m JOIN channels c ON m.channel_id = c.id
+        WHERE m.id = $1 AND c.server_id IS NOT NULL
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let (author_id, server_id, is_locked) =
+        row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
+    let role = require_member(db, server_id, user_id).await?;
+
+    Ok(MessageContext { author_id, server_id, is_locked, role })
+}
+
+fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
+    if is_moderator(&ctx.role) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("Only moderators can do this".into()))
+    }
+}
+
+fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid) {
+    // Ignore the error: it only means nobody is connected.
+    let _ = db.message_tx.send(BroadcastMessage {
+        event_type: event_type.to_string(),
+        payload,
+        server_id: Some(server_id),
+    });
 }
 
 /// GET /api/v1/channels/:channel_id/messages
@@ -40,25 +136,20 @@ pub async fn get_channel_messages(
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
 
-    let messages: Vec<Message> = sqlx::query_as(
+    let messages: Vec<Message> = sqlx::query_as(&format!(
         r#"
         SELECT * FROM (
-            SELECT 
-                m.id, m.channel_id, m.user_id, u.username, m.content,
-                m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
-                COALESCE(m.is_edited, false) AS is_edited,
-                COALESCE(m.is_locked, false) AS is_locked,
-                COALESCE(m.is_pinned, false) AS is_pinned,
-                m.created_at
+            SELECT {MESSAGE_COLUMNS}
             FROM messages m
             JOIN users u ON m.user_id = u.id
-            WHERE m.channel_id = $1
+            WHERE m.channel_id = $2
             ORDER BY m.created_at DESC
             LIMIT 100
         ) latest
         ORDER BY created_at ASC
-        "#,
-    )
+        "#
+    ))
+    .bind(user_id)
     .bind(channel_id)
     .fetch_all(&db.pool)
     .await
@@ -102,7 +193,7 @@ pub async fn create_message(
     // Parse multipart form data
     while let Some(field) = multipart.next_field().await.map_err(|e| AppError::BadRequest(e.to_string()))? {
         let name = field.name().unwrap_or("").to_string();
-        
+
         if name == "content" {
             content = field.text().await.unwrap_or_default();
         } else if name == "file" {
@@ -115,7 +206,7 @@ pub async fn create_message(
             let file_ext = safe_extension(&filename, "bin");
             let new_filename = format!("msg_{}_{}.{}", Uuid::new_v4(), user_id, file_ext);
             let file_path = format!("uploads/{}", new_filename);
-            
+
             tokio::fs::create_dir_all("uploads").await.map_err(|e| AppError::Internal(e.to_string()))?;
             tokio::fs::write(&file_path, bytes).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -130,9 +221,8 @@ pub async fn create_message(
         return Err(AppError::BadRequest("Message cannot be empty".into()));
     }
 
-    // 1. Insert message into database
     let msg_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size) 
+        "INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
     )
     .bind(channel_id)
@@ -146,91 +236,164 @@ pub async fn create_message(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // 2. Fetch the full message object with the username joined
-    let message: Message = sqlx::query_as(
-        "SELECT m.id, m.channel_id, m.user_id, u.username, m.content, m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size, COALESCE(m.is_edited, false) AS is_edited, COALESCE(m.is_locked, false) AS is_locked, COALESCE(m.is_pinned, false) AS is_pinned, m.created_at 
-         FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $1"
-    )
-    .bind(msg_id)
-    .fetch_one(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let message = fetch_message(&db, msg_id, user_id).await?;
 
-    // 3. Broadcast the new message to all connected WebSocket clients!
-    let broadcast_msg = crate::models::message::BroadcastMessage {
-        event_type: "new_message".to_string(),
-        payload: serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?,
-        server_id: Some(server_id),
-    };
-    
-    // Send to broadcast channel (ignore error if no receivers)
-    let _ = db.message_tx.send(broadcast_msg);
+    let payload = serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?;
+    broadcast(&db, "new_message", payload, server_id);
 
     Ok(Json(message))
 }
 
 /// DELETE /api/v1/messages/:message_id
+///
+/// The author or a moderator can delete a message, unless it is locked.
 pub async fn delete_message(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<()>, AppError> {
-    // 1. Get message owner and server_id to check permissions
-    let msg_data: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT m.user_id, c.server_id FROM messages m JOIN channels c ON m.channel_id = c.id WHERE m.id = $1"
+    let ctx = message_context(&db, message_id, user_id).await?;
+
+    if ctx.author_id != user_id && !is_moderator(&ctx.role) {
+        return Err(AppError::Forbidden("You do not have permission to delete this message".into()));
+    }
+    if ctx.is_locked {
+        return Err(AppError::Forbidden("This message is locked. Unlock it before deleting.".into()));
+    }
+
+    let attachment_url: Option<String> = sqlx::query_scalar(
+        "DELETE FROM messages WHERE id = $1 RETURNING attachment_url",
     )
     .bind(message_id)
-    .fetch_optional(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (msg_user_id, server_id) = match msg_data {
-        Some(data) => data,
-        None => return Err(AppError::NotFound("Message not found".into())),
-    };
-
-    // 2. Check permissions (Owner of message OR Admin/Mod of server)
-    if msg_user_id != user_id {
-        let role: Option<String> = sqlx::query_scalar(
-            "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2"
-        )
-        .bind(server_id)
-        .bind(user_id)
-        .fetch_optional(&db.pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        if !matches!(role.as_deref(), Some("admin" | "owner" | "moderator")) {
-            return Err(AppError::Forbidden("You do not have permission to delete this message".into()));
-        }
-    }
-
-    // 3. Delete attachment file if it exists
-    let attachment_url: Option<String> = sqlx::query_scalar("SELECT attachment_url FROM messages WHERE id = $1")
-        .bind(message_id)
-        .fetch_optional(&db.pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
     if let Some(url) = attachment_url {
-        let file_path = url.trim_start_matches('/');
-        let _ = std::fs::remove_file(file_path); // Ignore error if file already gone
+        let _ = tokio::fs::remove_file(url.trim_start_matches('/')).await; // already gone is fine
     }
 
-    // 4. Delete from database
-    sqlx::query("DELETE FROM messages WHERE id = $1")
+    broadcast(&db, "message_deleted", serde_json::json!({ "message_id": message_id }), ctx.server_id);
+
+    Ok(Json(()))
+}
+
+/// POST/DELETE /api/v1/messages/:message_id/lock
+///
+/// Locked messages can't be deleted by anyone until a moderator unlocks them.
+pub async fn lock_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_locked(db, user_id, message_id, true).await
+}
+
+pub async fn unlock_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_locked(db, user_id, message_id, false).await
+}
+
+async fn set_locked(db: Database, user_id: Uuid, message_id: Uuid, locked: bool) -> Result<Json<serde_json::Value>, AppError> {
+    let ctx = message_context(&db, message_id, user_id).await?;
+    require_moderator(&ctx)?;
+
+    sqlx::query("UPDATE messages SET is_locked = $1, locked_by = $2 WHERE id = $3")
+        .bind(locked)
+        .bind(if locked { Some(user_id) } else { None })
         .bind(message_id)
         .execute(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // 5. Broadcast the deletion to WebSocket clients
-    let broadcast_msg = crate::models::message::BroadcastMessage {
-        event_type: "message_deleted".to_string(),
-        payload: serde_json::json!({ "message_id": message_id }),
-        server_id: Some(server_id),
-    };
-    let _ = db.message_tx.send(broadcast_msg);
+    let payload = serde_json::json!({ "id": message_id, "is_locked": locked });
+    broadcast(&db, "message_updated", payload.clone(), ctx.server_id);
+    Ok(Json(payload))
+}
 
-    Ok(Json(()))
+/// POST/DELETE /api/v1/messages/:message_id/pin
+pub async fn pin_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_pinned(db, user_id, message_id, true).await
+}
+
+pub async fn unpin_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_pinned(db, user_id, message_id, false).await
+}
+
+async fn set_pinned(db: Database, user_id: Uuid, message_id: Uuid, pinned: bool) -> Result<Json<serde_json::Value>, AppError> {
+    let ctx = message_context(&db, message_id, user_id).await?;
+    require_moderator(&ctx)?;
+
+    sqlx::query("UPDATE messages SET is_pinned = $1, pinned_by = $2 WHERE id = $3")
+        .bind(pinned)
+        .bind(if pinned { Some(user_id) } else { None })
+        .bind(message_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let payload = serde_json::json!({ "id": message_id, "is_pinned": pinned });
+    broadcast(&db, "message_updated", payload.clone(), ctx.server_id);
+    Ok(Json(payload))
+}
+
+/// POST/DELETE /api/v1/messages/:message_id/hide
+///
+/// Hiding only affects the current user's view, so nothing is broadcast.
+pub async fn hide_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    message_context(&db, message_id, user_id).await?;
+
+    sqlx::query(
+        "INSERT INTO hidden_messages (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(message_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "id": message_id, "is_hidden": true })))
+}
+
+pub async fn unhide_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    sqlx::query("DELETE FROM hidden_messages WHERE user_id = $1 AND message_id = $2")
+        .bind(user_id)
+        .bind(message_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "id": message_id, "is_hidden": false })))
+}
+
+/// Current reactions on a message, broadcast after every change.
+pub(crate) async fn broadcast_reactions(db: &Database, message_id: Uuid, user_id: Uuid, server_id: Uuid) -> Result<serde_json::Value, AppError> {
+    let message = fetch_message(db, message_id, user_id).await?;
+    let payload = serde_json::json!({ "id": message_id, "reactions": message.reactions });
+    broadcast(db, "message_updated", payload.clone(), server_id);
+    Ok(payload)
+}
+
+/// Exposed for the reactions routes.
+pub(crate) async fn reaction_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<Uuid, AppError> {
+    Ok(message_context(db, message_id, user_id).await?.server_id)
 }

@@ -20,13 +20,14 @@ export interface Message {
   attachment_filename?: string | null;
   attachment_size?: number | null;
   attachment_mime_type?: string | null;
+  is_hidden?: boolean;
+  reactions?: Reaction[];
 }
 
 export interface Reaction {
   emoji: string;
   count: number;
   user_ids: string[];
-  current_user_reacted: boolean;
 }
 
 export interface UploadedFile {
@@ -34,6 +35,22 @@ export interface UploadedFile {
   filename: string;
   size: number;
   mime_type: string;
+}
+
+/** Sends a request and returns the JSON body, throwing the server's error message on failure. */
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: body === undefined
+      ? getAuthHeaders()
+      : { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `Request failed (${response.status})`);
+  }
+  return response.json();
 }
 
 export interface GetMessagesOptions {
@@ -88,66 +105,31 @@ export async function editMessage(messageId: string, content: string): Promise<M
 }
 
 export async function deleteMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to delete message');
+  await request('DELETE', `/api/v1/messages/${messageId}`);
 }
 
 export async function hideMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/hide`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to hide message');
+  await request('POST', `/api/v1/messages/${messageId}/hide`);
 }
 
 export async function unhideMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/hide`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to unhide message');
+  await request('DELETE', `/api/v1/messages/${messageId}/hide`);
 }
 
 export async function lockMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/lock`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to lock message');
+  await request('POST', `/api/v1/messages/${messageId}/lock`);
 }
 
 export async function unlockMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/lock`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to unlock message');
+  await request('DELETE', `/api/v1/messages/${messageId}/lock`);
 }
 
 export async function pinMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/pin`, {
-    method: 'POST',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to pin message');
+  await request('POST', `/api/v1/messages/${messageId}/pin`);
 }
 
 export async function unpinMessage(messageId: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/pin`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to unpin message');
+  await request('DELETE', `/api/v1/messages/${messageId}/pin`);
 }
 
 export async function fetchPinnedMessages(channelId: string): Promise<Message[]> {
@@ -188,23 +170,19 @@ export async function fetchReactions(messageId: string): Promise<Reaction[]> {
   return response.json();
 }
 
-export async function addReaction(messageId: string, emoji: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/reactions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ emoji }),
-  });
-
-  if (!response.ok) throw new Error('Failed to add reaction');
+/** Returns the message's full, updated reaction list. */
+export async function addReaction(messageId: string, emoji: string): Promise<Reaction[]> {
+  const res = await request<{ reactions: Reaction[] }>('POST', `/api/v1/messages/${messageId}/reactions`, { emoji });
+  return res.reactions;
 }
 
-export async function removeReaction(messageId: string, emoji: string): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/v1/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to remove reaction');
+/** Returns the message's full, updated reaction list. */
+export async function removeReaction(messageId: string, emoji: string): Promise<Reaction[]> {
+  const res = await request<{ reactions: Reaction[] }>(
+    'DELETE',
+    `/api/v1/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`,
+  );
+  return res.reactions;
 }
 
 export async function searchMessages(options: {

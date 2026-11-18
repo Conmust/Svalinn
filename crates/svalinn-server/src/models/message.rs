@@ -30,21 +30,3 @@ pub struct NewMessagePayload {
     pub is_pinned: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
-
-// UPDATED REACTION STRUCT WITH AGGREGATED FIELDS
-#[derive(Debug, Clone, Serialize)]
-pub struct Reaction {
-    pub id: Uuid,
-    pub message_id: Uuid,
-    pub user_id: Uuid,
-    pub emoji: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    
-    // Aggregated fields (computed in Rust, not stored directly in the DB row)
-    #[serde(default)]
-    pub count: i64,
-    #[serde(default)]
-    pub user_ids: Vec<Uuid>,
-    #[serde(default)]
-    pub current_user_reacted: bool,
-}

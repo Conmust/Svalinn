@@ -69,6 +69,26 @@ async fn main() {
             "/api/v1/messages/:message_id",
             delete(routes::messages::delete_message),
         )
+        .route(
+            "/api/v1/messages/:message_id/pin",
+            post(routes::messages::pin_message).delete(routes::messages::unpin_message),
+        )
+        .route(
+            "/api/v1/messages/:message_id/lock",
+            post(routes::messages::lock_message).delete(routes::messages::unlock_message),
+        )
+        .route(
+            "/api/v1/messages/:message_id/hide",
+            post(routes::messages::hide_message).delete(routes::messages::unhide_message),
+        )
+        .route(
+            "/api/v1/messages/:message_id/reactions",
+            post(routes::reactions::add_reaction),
+        )
+        .route(
+            "/api/v1/messages/:message_id/reactions/:emoji",
+            delete(routes::reactions::remove_reaction),
+        )
         
         // --- Emoji Routes ---
         .route(

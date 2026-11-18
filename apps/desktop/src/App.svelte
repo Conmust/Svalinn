@@ -4,10 +4,12 @@
   import ServerRail from './components/ServerRail.svelte';
   import ChannelList from './components/ChannelList.svelte';
   import ChatArea from './components/ChatArea.svelte';
+  import Roster from './components/Roster.svelte';
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
   let activeChannel: string | null = null;
+  let showRoster = false;
 
   // Auth form state
   let isLoginMode = true;
@@ -97,10 +99,16 @@
 
     <!-- 3. Chat Area (Only show if a channel is selected) -->
     {#if activeChannel && activeServer}
-      <ChatArea 
+      <ChatArea
         channelId={activeChannel}
-        
+        serverId={activeServer}
+        {currentUser}
+        {showRoster}
+        on:toggleRoster={() => (showRoster = !showRoster)}
       />
+      {#if showRoster}
+        <Roster serverId={activeServer} {currentUser} />
+      {/if}
     {:else if activeServer}
       <!-- Empty state when server is selected but no channel -->
       <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">

@@ -36,6 +36,11 @@ pub fn is_admin(role: &str) -> bool {
     matches!(role, "owner" | "admin")
 }
 
+/// Owners, admins and moderators can pin, lock and delete others' messages.
+pub fn is_moderator(role: &str) -> bool {
+    matches!(role, "owner" | "admin" | "moderator")
+}
+
 /// Returns the server a channel belongs to, or `NotFound`.
 pub async fn channel_server_id(db: &Database, channel_id: Uuid) -> Result<Uuid, AppError> {
     let server_id: Option<Option<Uuid>> =
