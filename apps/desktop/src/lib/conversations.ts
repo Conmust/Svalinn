@@ -8,6 +8,9 @@ export interface Conversation {
   participant_id: string;
   participant_username: string;
   participant_is_online: boolean;
+  participant_status: string;
+  participant_patron_tier: string;
+  has_unread: boolean;
 }
 
 export async function fetchUserConversations(): Promise<Conversation[]> {

@@ -13,22 +13,33 @@ use crate::models::conversation::ConversationWithParticipant;
 use crate::models::message::BroadcastMessage;
 
 /// Columns for `ConversationWithParticipant`: the conversation plus the
-/// *other* participant's identity and online status. `$1` must be the
-/// requesting user's id.
+/// *other* participant's identity, online status, presence, patron tier, and
+/// whether the requesting user has unread messages in it. `$1` must be the
+/// requesting user's id (see `CONVERSATION_JOIN`).
 const CONVERSATION_COLUMNS: &str = r#"
     c.id, c.created_at,
     other.user_id AS participant_id,
     u.username AS participant_username,
-    COALESCE(u.is_online, false) AS participant_is_online
+    COALESCE(u.is_online, false) AS participant_is_online,
+    u.status AS participant_status,
+    COALESCE(u.patron_tier, 'free') AS participant_patron_tier,
+    EXISTS(
+        SELECT 1 FROM messages m
+        WHERE m.conversation_id = c.id
+          AND m.user_id != $1
+          AND m.created_at > COALESCE(cr.last_read_at, '-infinity'::timestamptz)
+    ) AS has_unread
 "#;
 
-/// Joins a conversation to its other participant (and that user's row), for
-/// the requesting user `$1`. Callers add their own WHERE/ORDER BY.
+/// Joins a conversation to its other participant (and that user's row), and
+/// to the requesting user's `channel_reads` row (for `has_unread`), for the
+/// requesting user `$1`. Callers add their own WHERE/ORDER BY.
 const CONVERSATION_JOIN: &str = r#"
     FROM conversations c
     JOIN conversation_participants me ON me.conversation_id = c.id AND me.user_id = $1
     JOIN conversation_participants other ON other.conversation_id = c.id AND other.user_id != $1
     JOIN users u ON u.id = other.user_id
+    LEFT JOIN channel_reads cr ON cr.conversation_id = c.id AND cr.user_id = $1
 "#;
 
 async fn fetch_conversation(db: &Database, conversation_id: Uuid, user_id: Uuid) -> Result<ConversationWithParticipant, AppError> {
@@ -284,6 +295,31 @@ pub async fn get_conversation_messages(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
     };
+
+    // Opening a conversation (loading its latest page) marks it as read, so
+    // `has_unread` clears. Paging into older history doesn't touch the read
+    // cursor.
+    if query.before.is_none() {
+        // Use the latest fetched message's own timestamp as the read cutoff
+        // rather than NOW(), so a message that arrives after the SELECT above
+        // but before this INSERT isn't incorrectly marked as read.
+        let last_read_at = messages.last().map(|m| m.created_at).unwrap_or_else(chrono::Utc::now);
+        sqlx::query(
+            r#"
+            INSERT INTO channel_reads (user_id, conversation_id, last_read_message_id, last_read_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, conversation_id)
+            DO UPDATE SET last_read_message_id = EXCLUDED.last_read_message_id, last_read_at = EXCLUDED.last_read_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(messages.last().map(|m| m.id))
+        .bind(last_read_at)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
 
     Ok(Json(messages))
 }

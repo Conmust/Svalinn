@@ -21,3 +21,25 @@ export async function fetchUserProfile(userId: string): Promise<UserProfile> {
 
   return response.json();
 }
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  is_online: boolean;
+  status: string;
+  patron_tier: string;
+  bio?: string | null;
+}
+
+/** All non-banned users, for pickers like "start a new DM". */
+export async function fetchAllUsers(): Promise<PublicUser[]> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to fetch users');
+  }
+
+  return response.json();
+}

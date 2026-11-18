@@ -1,24 +1,13 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser } from '../lib/auth';
+  import { fetchUserConversations, createConversation, type Conversation } from '../lib/conversations';
+  import { fetchAllUsers, type PublicUser } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
 
   export let activeConversation: string | null = null;
 
   const dispatch = createEventDispatcher();
-
-  interface Conversation {
-    id: string;
-    created_at: string;
-    has_unread: boolean;
-    participant?: {
-      id: string;
-      username: string;
-      patron_tier?: string;
-      status: string;
-    };
-  }
 
   let conversations: Conversation[] = [];
   let loading = true;
@@ -42,15 +31,10 @@
     loadConversations();
   });
 
-  async function loadConversations() {
+  export async function loadConversations() {
     loading = true;
     try {
-      const response = await apiFetch(`${apiBase()}/api/v1/conversations`, {
-        headers: getAuthHeaders(),
-      });
-      if (response.ok) {
-        conversations = await response.json();
-      }
+      conversations = await fetchUserConversations();
     } catch (e) {
       console.error('Failed to load conversations:', e);
     } finally {
@@ -58,17 +42,63 @@
     }
   }
 
-  function handleConversationClick(conversationId: string) {
-    dispatch('conversationSelected', conversationId);
+  function handleConversationClick(conversation: Conversation) {
+    dispatch('conversationSelected', conversation);
+  }
+
+  // "+ New Message" picker: pick a user from everyone registered, create
+  // (or re-use) a conversation with them, then open it.
+  let showPicker = false;
+  let pickerUsers: PublicUser[] = [];
+  let pickerLoading = false;
+  let pickerError = '';
+  let pickerQuery = '';
+
+  $: filteredPickerUsers = pickerUsers.filter(
+    u => u.id !== currentUser?.id && u.username.toLowerCase().includes(pickerQuery.trim().toLowerCase())
+  );
+
+  async function openPicker() {
+    showPicker = true;
+    pickerError = '';
+    pickerQuery = '';
+    pickerLoading = true;
+    try {
+      pickerUsers = await fetchAllUsers();
+    } catch (e: any) {
+      pickerError = e.message || 'Failed to load users';
+    } finally {
+      pickerLoading = false;
+    }
+  }
+
+  async function pickUser(user: PublicUser) {
+    pickerError = '';
+    try {
+      const conversation = await createConversation(user.id);
+      showPicker = false;
+      await loadConversations();
+      dispatch('conversationSelected', conversation);
+    } catch (e: any) {
+      pickerError = e.message || 'Failed to start conversation';
+    }
   }
 </script>
 
 <aside class="w-60 bg-[#0a0e0a] border-r-2 border-[#00ff00] flex flex-col h-full">
   <!-- Header -->
-  <div class="p-4 border-b-2 border-[#00ff00]">
+  <div class="p-4 border-b-2 border-[#00ff00] flex items-center justify-between gap-2">
     <h3 class="text-xs font-semibold text-[#00aa00] uppercase tracking-widest terminal-glow">
       {'>'} Direct Messages
     </h3>
+    <button
+      type="button"
+      class="px-2 py-1 border border-[#00ff00] text-[#00ff00] text-xs hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+      title="New Message"
+      on:click={openPicker}
+    >
+      + New
+    </button>
   </div>
 
   <!-- Conversation List -->
@@ -86,16 +116,16 @@
         <button
           type="button"
           class="w-full text-left px-3 py-2 mb-1 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2 group {conversation.id === activeConversation ? 'bg-[rgba(0,255,0,0.15)] border-l-2 border-[#00ff00]' : (conversation.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')}"
-          on:click={() => handleConversationClick(conversation.id)}
+          on:click={() => handleConversationClick(conversation)}
         >
           <!-- Avatar with Status -->
           <div class="relative flex-shrink-0">
             <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
-              {conversation.participant?.username[0].toUpperCase() || '?'}
+              {conversation.participant_username?.[0]?.toUpperCase() || '?'}
             </div>
             <div
               class="absolute bottom-0 right-0 w-3 h-3 border-2 border-[#0a0e0a] rounded-full"
-              style={getStatusStyle(conversation.participant?.status)}
+              style={getStatusStyle(conversation.participant_status)}
             ></div>
           </div>
 
@@ -109,10 +139,10 @@
           <!-- Username -->
           <div class="flex-1 min-w-0 flex items-center gap-1">
             <div class="text-sm terminal-glow truncate {conversation.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
-              {conversation.participant?.username || 'Unknown User'}
+              {conversation.participant_username || 'Unknown User'}
             </div>
-            {#if conversation.participant?.patron_tier && conversation.participant.patron_tier !== 'free'}
-              <PatronBadge tier={conversation.participant.patron_tier} size="small" />
+            {#if conversation.participant_patron_tier && conversation.participant_patron_tier !== 'free'}
+              <PatronBadge tier={conversation.participant_patron_tier} size="small" />
             {/if}
           </div>
         </button>
@@ -121,10 +151,70 @@
   </div>
 </aside>
 
+{#if showPicker}
+  <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="new-dm-title">
+    <div class="w-[360px] max-w-[92vw] bg-black border-2 border-[#00ff00] p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 id="new-dm-title" class="font-bold uppercase tracking-widest text-sm text-[#00ff00] terminal-glow">{'>'} New Message</h3>
+        <button type="button" class="text-[#00aa00] hover:text-[#00ff00]" aria-label="Close" on:click={() => (showPicker = false)}>✕</button>
+      </div>
+
+      <input
+        bind:value={pickerQuery}
+        type="text"
+        class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none"
+        placeholder="Search users..."
+        autofocus
+      />
+
+      {#if pickerError}
+        <div class="text-xs text-red-500">{'>'} {pickerError}</div>
+      {/if}
+
+      <div class="max-h-60 overflow-y-auto custom-scrollbar space-y-1">
+        {#if pickerLoading}
+          <div class="flex items-center justify-center py-6">
+            <div class="animate-pulse border-2 border-[#00ff00] w-6 h-6"></div>
+          </div>
+        {:else if filteredPickerUsers.length === 0}
+          <div class="text-center text-[#00aa00] text-sm py-6 terminal-glow">{'>'} No users found</div>
+        {:else}
+          {#each filteredPickerUsers as user}
+            <button
+              type="button"
+              class="w-full text-left px-3 py-2 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2"
+              on:click={() => pickUser(user)}
+            >
+              <div class="relative flex-shrink-0">
+                <div class="w-7 h-7 border-2 border-[#00ff00] flex items-center justify-center font-bold text-xs terminal-glow">
+                  {user.username[0].toUpperCase()}
+                </div>
+                <div
+                  class="absolute bottom-0 right-0 w-2.5 h-2.5 border-2 border-black rounded-full"
+                  style={getStatusStyle(user.status)}
+                ></div>
+              </div>
+              <div class="flex-1 min-w-0 flex items-center gap-1">
+                <div class="text-sm text-[#00ff00] truncate terminal-glow">{user.username}</div>
+                {#if user.patron_tier && user.patron_tier !== 'free'}
+                  <PatronBadge tier={user.patron_tier} size="small" />
+                {/if}
+              </div>
+            </button>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .custom-scrollbar::-webkit-scrollbar { width: 6px; }
   .custom-scrollbar::-webkit-scrollbar-track { background: #0a0e0a; border-radius: 3px; }
   .custom-scrollbar::-webkit-scrollbar-thumb { background: #00ff00; border-radius: 3px; }
   .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #00aa00; }
   .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #00ff00 #0a0e0a; }
+  .terminal-glow {
+    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
+  }
 </style>

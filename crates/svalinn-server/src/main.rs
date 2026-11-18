@@ -104,6 +104,7 @@ async fn main() {
         )
 
         // --- User Routes ---
+        .route("/api/v1/users", get(routes::users::get_all_users))
         .route("/api/v1/users/me", get(routes::users::get_current_user))
         .route("/api/v1/users/me/status", patch(routes::users::update_status))
         .route("/api/v1/users/me/account", get(routes::users::get_account))

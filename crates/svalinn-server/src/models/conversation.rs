@@ -18,4 +18,7 @@ pub struct ConversationWithParticipant {
     pub participant_id: Uuid,
     pub participant_username: String,
     pub participant_is_online: bool,
+    pub participant_status: String,
+    pub participant_patron_tier: String,
+    pub has_unread: bool,
 }
