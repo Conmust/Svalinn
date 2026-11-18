@@ -81,4 +81,8 @@ pub struct Claims {
     pub sub: Uuid,
     pub username: String,
     pub exp: usize,
+    /// Login session (refresh-token family). Revoking it ends access at once.
+    /// Tokens issued before sessions existed lack it and are rejected.
+    #[serde(default)]
+    pub sid: Option<Uuid>,
 }

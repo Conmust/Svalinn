@@ -88,22 +88,17 @@ impl FromRequestParts<Database> for CurrentUser {
         let claims = decode_access_token(token)
             .map_err(|_| unauthorized("Invalid or expired token"))?;
 
-        let user_id = claims.sub;
+        // 4. The account must exist and not be banned, and the login session
+        //    must not be revoked. Checked on every request so bans and
+        //    revocations take effect immediately.
+        let session_id = claims
+            .sid
+            .ok_or_else(|| unauthorized("Your session has ended. Please log in again."))?;
+        crate::sessions::check_access(state, claims.sub, session_id)
+            .await
+            .map_err(|denied| unauthorized(&denied.message()))?;
 
-        // 4. Check if user exists in the database to prevent FK errors on deleted accounts
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)"
-        )
-        .bind(user_id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| unauthorized("Internal server error"))?;
-
-        if !exists {
-            return Err(unauthorized("Account no longer exists"));
-        }
-
-        Ok(CurrentUser(user_id))
+        Ok(CurrentUser(claims.sub))
     }
 }
 

@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::jwt_secret;
+use crate::sessions::AccessDenied;
 use crate::models::user::{
     AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, User,
 };
@@ -107,6 +108,17 @@ pub async fn login(
         return Err(AppError::BadRequest("Invalid email or password".into()));
     }
 
+    // Only reveal a ban to someone who knows the password.
+    let ban: Option<(Option<chrono::DateTime<Utc>>, Option<String>)> =
+        sqlx::query_as("SELECT banned_at, ban_reason FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if let Some((Some(_), reason)) = ban {
+        return Err(AppError::Forbidden(AccessDenied::Banned(reason).message()));
+    }
+
     start_session(&db, user).await
 }
 
@@ -151,6 +163,10 @@ pub async fn refresh(
             tx.commit().await.map_err(db_err)?;
             eprintln!("⚠️  Refresh token reused for user {user_id}; session {family_id} revoked");
         }
+        // A ban revokes every session; say so rather than "session ended".
+        if let Some(reason) = ban_reason_if_banned(&db, user_id).await? {
+            return Err(session_ended(&AccessDenied::Banned(reason).message()));
+        }
         return Err(session_ended("This session has ended. Please log in again."));
     }
 
@@ -158,21 +174,21 @@ pub async fn refresh(
         return Err(session_ended("Your session has expired. Please log in again."));
     }
 
-    let user: Option<(String, bool)> = sqlx::query_as(
-        "SELECT username, banned_at IS NOT NULL FROM users WHERE id = $1",
+    let user: Option<(String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT username, banned_at IS NOT NULL, ban_reason FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
 
-    let Some((username, banned)) = user else {
+    let Some((username, banned, ban_reason)) = user else {
         return Err(session_ended("Account no longer exists."));
     };
     if banned {
         revoke_family(&mut tx, family_id).await?;
         tx.commit().await.map_err(db_err)?;
-        return Err(session_ended("This account has been banned."));
+        return Err(session_ended(&AccessDenied::Banned(ban_reason).message()));
     }
 
     // Rotate: retire the presented token and issue its replacement.
@@ -187,7 +203,7 @@ pub async fn refresh(
     tx.commit().await.map_err(db_err)?;
 
     Ok(Json(TokenResponse {
-        token: generate_jwt(user_id, &username)?,
+        token: generate_jwt(user_id, &username, family_id)?,
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         refresh_token,
     }))
@@ -232,11 +248,12 @@ async fn start_session(db: &Database, user: User) -> Result<Json<AuthResponse>, 
         .await
         .map_err(db_err)?;
 
-    let refresh_token = insert_refresh_token(&mut tx, user.id, Uuid::new_v4()).await?;
+    let session_id = Uuid::new_v4();
+    let refresh_token = insert_refresh_token(&mut tx, user.id, session_id).await?;
     tx.commit().await.map_err(db_err)?;
 
     Ok(Json(AuthResponse {
-        token: generate_jwt(user.id, &user.username)?,
+        token: generate_jwt(user.id, &user.username, session_id)?,
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         refresh_token,
         user: user.into(),
@@ -277,6 +294,17 @@ async fn revoke_family(
     Ok(())
 }
 
+/// `Some(reason)` if the user is banned (the reason itself may be empty).
+async fn ban_reason_if_banned(db: &Database, user_id: Uuid) -> Result<Option<Option<String>>, AppError> {
+    let row: Option<(bool, Option<String>)> =
+        sqlx::query_as("SELECT banned_at IS NOT NULL, ban_reason FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(row.and_then(|(banned, reason)| banned.then_some(reason)))
+}
+
 fn session_ended(message: &str) -> AppError {
     AppError::Auth(message.into())
 }
@@ -298,13 +326,14 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn generate_jwt(user_id: Uuid, username: &str) -> Result<String, AppError> {
+fn generate_jwt(user_id: Uuid, username: &str, session_id: Uuid) -> Result<String, AppError> {
     let expiration = (Utc::now() + Duration::seconds(ACCESS_TOKEN_TTL_SECONDS)).timestamp();
 
     let claims = Claims {
         sub: user_id,
         username: username.to_string(),
         exp: expiration as usize,
+        sid: Some(session_id),
     };
 
     encode(

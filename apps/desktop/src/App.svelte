@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { apiFetch } from './lib/api';
+  import { apiFetch, takeLogoutReason } from './lib/api';
+  import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
   import { getCurrentUser, login, register, logout } from './lib/auth';
   import ServerRail from './components/ServerRail.svelte';
@@ -12,12 +13,17 @@
   let activeChannel: string | null = null;
   let showRoster = false;
 
+  // Stay connected whenever logged in, whatever is on screen, so live
+  // updates and a ban or revoked session reach the app straight away.
+  $: if (currentUser) wsClient.connect();
+
   // Auth form state
   let isLoginMode = true;
   let authUsername = '';
   let authEmail = '';
   let authPassword = '';
-  let authError = '';
+  // Shown when the server ended the session, e.g. because of a ban.
+  let authError = takeLogoutReason() ?? '';
   let authLoading = false;
 
   function handleServerSelected(event: CustomEvent<string | null>) {

@@ -4,6 +4,7 @@ mod errors;
 mod extractors;
 mod models;
 mod presence;
+mod sessions;
 mod routes;
 
 use axum::{
@@ -45,6 +46,9 @@ async fn main() {
     presence::reset(&db)
         .await
         .expect("Failed to reset online status");
+
+    // Close live connections as soon as a user is banned or a session revoked.
+    sessions::spawn_watchers(db.clone());
 
     // 5. Build the application router
     let app = Router::new()

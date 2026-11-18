@@ -1,4 +1,8 @@
-import { getValidAccessToken } from './api';
+import { getValidAccessToken, endSession } from './api';
+
+// Close codes the server uses when access is revoked.
+const CLOSE_SESSION_ENDED = 4001;
+const CLOSE_BANNED = 4003;
 
 type EventHandler = (data: any) => void;
 
@@ -46,7 +50,13 @@ export class WSClient {
       }
     };
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
+      if (event.code === CLOSE_BANNED || event.code === CLOSE_SESSION_ENDED) {
+        // Access was revoked: don't reconnect, go back to the login screen.
+        this.ws = null;
+        endSession(event.reason || 'Your session has ended. Please log in again.');
+        return;
+      }
       console.log('WebSocket disconnected');
       this.attemptReconnect();
     };

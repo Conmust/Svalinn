@@ -460,6 +460,21 @@ The server listens on `http://127.0.0.1:3001`.
 
 ---
 
+## Ban Accounts and End Sessions
+
+Run these from the repository root with the same `.env` as the server:
+
+```bash
+cargo run -p svalinn-server --bin svalinn-admin -- ban <email-or-username> [reason]
+cargo run -p svalinn-server --bin svalinn-admin -- unban <email-or-username>
+cargo run -p svalinn-server --bin svalinn-admin -- revoke-sessions <email-or-username>
+cargo run -p svalinn-server --bin svalinn-admin -- list-banned
+```
+
+A ban takes effect immediately: the user's sessions are revoked, open connections are closed, the app returns to the login screen showing the reason, and every request and login is refused until the ban is lifted. This also applies if `users.banned_at` is set directly in the database. After an unban, the user logs in again.
+
+---
+
 ## Run the Desktop App
 
 ```bash

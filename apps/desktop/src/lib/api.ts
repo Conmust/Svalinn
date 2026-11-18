@@ -45,6 +45,30 @@ export function clearSession(): void {
   localStorage.removeItem('user');
 }
 
+const LOGOUT_REASON_KEY = 'svalinn_logout_reason';
+
+/** Signs out locally and returns to the login screen, which shows `reason`. */
+export function endSession(reason?: string): void {
+  clearSession();
+  try {
+    if (reason) sessionStorage.setItem(LOGOUT_REASON_KEY, reason);
+  } catch {
+    // storage unavailable: the login screen just won't show a reason
+  }
+  location.reload();
+}
+
+/** Why the last session ended, if it was ended by the server. Read once. */
+export function takeLogoutReason(): string | null {
+  try {
+    const reason = sessionStorage.getItem(LOGOUT_REASON_KEY);
+    sessionStorage.removeItem(LOGOUT_REASON_KEY);
+    return reason;
+  } catch {
+    return null;
+  }
+}
+
 /** Expiry of a JWT in milliseconds since the epoch, or null if unreadable. */
 function tokenExpiry(token: string): number | null {
   try {
@@ -126,9 +150,9 @@ async function doRefresh(rejectedToken?: string): Promise<string | null> {
     if (localStorage.getItem('refresh_token') !== refreshToken) {
       return localStorage.getItem('token');
     }
-    // The session is over (expired, logged out or revoked): back to login.
-    clearSession();
-    location.reload();
+    // The session is over (expired, revoked or banned): back to login.
+    const err = await response.json().catch(() => ({}));
+    endSession(err.error);
   }
   return null;
 }

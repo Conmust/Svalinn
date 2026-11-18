@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "run-migrations"
 path = "src/db/migrations.rs"
 
+[[bin]]
+name = "svalinn-admin"
+path = "src/admin.rs"
+
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
