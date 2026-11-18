@@ -42,6 +42,35 @@
   let tabError = '';
   let copiedCode = '';
   let confirmLeave = false;
+  let showDelete = false;
+  let deleteConfirmName = '';
+  let deletePassword = '';
+  let deleteError = '';
+  let deleteBusy = false;
+  $: canDeleteServer = isServerOwner || myRank >= 5;
+
+  async function deleteServer(e: Event) {
+    e.preventDefault();
+    deleteError = '';
+    deleteBusy = true;
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_password: deletePassword }),
+      });
+      if (res.ok) {
+        wsClient.emit('removed_from_server', { server_id: serverId, server_name: serverName, reason: 'deleted' });
+        dispatch('close');
+      } else {
+        deleteError = await errorFrom(res, 'Could not delete server');
+      }
+    } catch (err: any) {
+      deleteError = err.message || 'Network error';
+    } finally {
+      deleteBusy = false;
+    }
+  }
 
   async function errorFrom(res: Response, fallback: string): Promise<string> {
     const err = await res.json().catch(() => ({}));
@@ -340,6 +369,30 @@
               </div>
             {:else}
               <button type="button" class="w-full py-2 border border-red-500 text-red-500 text-sm uppercase tracking-wider hover:bg-red-500 hover:text-black transition-all" on:click={() => (confirmLeave = true)}>Leave server</button>
+            {/if}
+          </div>
+        {/if}
+        {#if loaded && canDeleteServer}
+          <div class="mt-8 pt-4 border-t border-red-500/40">
+            {#if showDelete}
+              <form on:submit={deleteServer} class="space-y-3">
+                <p class="text-xs text-red-400">{'>'} This deletes {serverName} for everyone: all channels, messages, files, emojis and invites. It can't be undone.</p>
+                <div>
+                  <label for="delete-confirm-name" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Type the server name to confirm</label>
+                  <input id="delete-confirm-name" bind:value={deleteConfirmName} autocomplete="off" class="w-full bg-[#0a0e0a] border border-red-500 px-3 py-2 text-[#00ff00] text-sm focus:outline-none" placeholder={serverName} />
+                </div>
+                <div>
+                  <label for="delete-password" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Your password</label>
+                  <input id="delete-password" type="password" bind:value={deletePassword} autocomplete="current-password" class="w-full bg-[#0a0e0a] border border-red-500 px-3 py-2 text-[#00ff00] text-sm focus:outline-none" />
+                </div>
+                {#if deleteError}<div class="text-xs text-red-500">{'>'} {deleteError}</div>{/if}
+                <div class="flex gap-2">
+                  <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={() => { showDelete = false; deleteConfirmName = deletePassword = ''; }}>Cancel</button>
+                  <button type="submit" disabled={deleteBusy || deleteConfirmName !== serverName || !deletePassword} class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black disabled:opacity-40">Delete server</button>
+                </div>
+              </form>
+            {:else}
+              <button type="button" class="w-full py-2 border border-red-500 text-red-500 text-sm uppercase tracking-wider hover:bg-red-500 hover:text-black transition-all" on:click={() => (showDelete = true)}>Delete server</button>
             {/if}
           </div>
         {/if}

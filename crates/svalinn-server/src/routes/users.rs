@@ -223,7 +223,7 @@ pub async fn get_account(
 
 /// Checks the user's current password before a sensitive change. Wrong
 /// guesses are rate limited per user.
-async fn verify_current_password(db: &Database, user_id: Uuid, password: &str) -> Result<(), AppError> {
+pub(crate) async fn verify_current_password(db: &Database, user_id: Uuid, password: &str) -> Result<(), AppError> {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
     let key = user_id.to_string();

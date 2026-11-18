@@ -130,6 +130,16 @@ pub fn stored_path(url: &str) -> String {
     }
 }
 
+/// Deletes uploaded files given their stored `/uploads/...` paths. Missing
+/// files and anything that isn't an upload path are skipped.
+pub async fn remove_stored_files(paths: &[String]) {
+    for path in paths {
+        if let Some(name) = path.strip_prefix(STORED_PREFIX).filter(|n| valid_name(n)) {
+            let _ = tokio::fs::remove_file(std::path::Path::new(UPLOAD_DIR).join(name)).await;
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct FileQuery {
     u: Uuid,

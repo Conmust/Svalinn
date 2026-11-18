@@ -34,36 +34,42 @@
   }
   $: canActOn = (m: Member) => myRank >= 2 && m.id !== currentUser?.id && rankOf(m) < myRank;
 
-  // Kick / ban dialog
-  let pending: { member: Member; action: 'kick' | 'ban' } | null = null;
+  // Manage-member dialog: role, kick, ban, transfer ownership.
+  let isServerOwner = false;
+  let managing: Member | null = null;
+  let mode: 'menu' | 'kick' | 'ban' | 'transfer' = 'menu';
+  let newRole = 'member';
   let banReason = '';
+  let transferPassword = '';
   let actionError = '';
   let actionBusy = false;
 
-  function startAction(member: Member, action: 'kick' | 'ban') {
-    pending = { member, action };
-    banReason = '';
-    actionError = '';
+  // Roles you can give: strictly below your own rank.
+  $: assignableRoles = [
+    { value: 'member', label: 'Member', rank: 1 },
+    { value: 'moderator', label: 'Moderator', rank: 2 },
+    { value: 'admin', label: 'Admin', rank: 3 },
+  ].filter(r => r.rank < myRank);
+  $: canChangeRoles = myRank >= 3;
+  $: canTransfer = isServerOwner || myRank >= 5;
+
+  function openManage(member: Member) {
+    managing = member;
+    mode = 'menu';
+    newRole = member.role === 'owner' ? 'admin' : member.role;
+    banReason = transferPassword = actionError = '';
   }
 
-  async function confirmAction() {
-    if (!pending || !serverId) return;
-    const { member, action } = pending;
+  async function act(request: () => Promise<Response>, onSuccess: () => void) {
     actionBusy = true;
     actionError = '';
     try {
-      const res = action === 'kick'
-        ? await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/members/${member.id}`, { method: 'DELETE' })
-        : await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/bans`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ user_id: member.id, reason: banReason.trim() || null }),
-          });
+      const res = await request();
       if (res.ok) {
-        members = members.filter(m => m.id !== member.id);
-        pending = null;
+        onSuccess();
+        managing = null;
       } else {
-        actionError = (await res.json().catch(() => ({}))).error || `Failed to ${action}`;
+        actionError = (await res.json().catch(() => ({}))).error || 'Something went wrong';
       }
     } catch (e: any) {
       actionError = e.message || 'Network error';
@@ -72,10 +78,38 @@
     }
   }
 
+  const base = () => `${apiBase()}/api/v1/servers/${serverId}`;
+  const json = (method: string, body: unknown) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  function saveRole() {
+    const m = managing!;
+    act(() => apiFetch(`${base()}/members/${m.id}/role`, json('PATCH', { role: newRole })),
+      () => (members = members.map(x => (x.id === m.id ? { ...x, role: newRole } : x))));
+  }
+  function kick() {
+    const m = managing!;
+    act(() => apiFetch(`${base()}/members/${m.id}`, { method: 'DELETE' }),
+      () => (members = members.filter(x => x.id !== m.id)));
+  }
+  function ban() {
+    const m = managing!;
+    act(() => apiFetch(`${base()}/bans`, json('POST', { user_id: m.id, reason: banReason.trim() || null })),
+      () => (members = members.filter(x => x.id !== m.id)));
+  }
+  function transfer() {
+    const m = managing!;
+    act(() => apiFetch(`${base()}/transfer`, json('POST', { user_id: m.id, current_password: transferPassword })),
+      () => { if (serverId) { loadMembers(serverId); loadMyRank(serverId); } });
+  }
+
   async function loadMyRank(id: string) {
     try {
       const res = await apiFetch(`${apiBase()}/api/v1/servers/${id}/role`);
-      if (res.ok) myRank = (await res.json()).rank ?? 1;
+      if (res.ok) {
+        const role = await res.json();
+        myRank = role.rank ?? 1;
+        isServerOwner = !!role.is_owner;
+      }
     } catch {
       myRank = 1;
     }
@@ -97,9 +131,11 @@
     loadMyRank(serverId);
   }
 
-  // Someone joined, left, was kicked or banned.
-  function onMembershipChange(data: { server_id: string }) {
-    if (serverId && data.server_id === serverId) loadMembers(serverId);
+  // Someone joined, left, was kicked, banned or had their role changed.
+  function onMembershipChange(data: { server_id: string; user_id?: string }) {
+    if (!serverId || data.server_id !== serverId) return;
+    loadMembers(serverId);
+    if (data.user_id === currentUser?.id) loadMyRank(serverId);
   }
 
   // Someone came online, went offline or changed status.
@@ -114,12 +150,14 @@
     wsClient.on('presence_updated', onPresence);
     wsClient.on('member_joined', onMembershipChange);
     wsClient.on('member_left', onMembershipChange);
+    wsClient.on('member_updated', onMembershipChange);
   });
 
   onDestroy(() => {
     wsClient.off('presence_updated', onPresence);
     wsClient.off('member_joined', onMembershipChange);
     wsClient.off('member_left', onMembershipChange);
+    wsClient.off('member_updated', onMembershipChange);
   });
 
   $: groupedMembers = statusOrder.map(status => ({
@@ -200,10 +238,7 @@
                 {roleLabel(member)}
               </div>
               {#if canActOn(member)}
-                <div class="hidden group-hover:flex gap-1">
-                  <button type="button" class="text-[10px] px-1.5 py-0.5 border border-[#ffaa00] text-[#ffaa00] hover:bg-[#ffaa00] hover:text-black" title="Remove from server (they can rejoin with an invite)" on:click={() => startAction(member, 'kick')}>Kick</button>
-                  <button type="button" class="text-[10px] px-1.5 py-0.5 border border-red-500 text-red-500 hover:bg-red-500 hover:text-black" title="Remove and stop them rejoining" on:click={() => startAction(member, 'ban')}>Ban</button>
-                </div>
+                <button type="button" class="hidden group-hover:block group-focus-within:block text-[10px] px-1.5 py-0.5 border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black" aria-label="Manage {member.username}" on:click={() => openManage(member)}>Manage</button>
               {:else}
                 <div class="hidden group-hover:block text-xs text-[#00aa00] capitalize terminal-glow">{roleLabel(member)}</div>
               {/if}
@@ -214,31 +249,63 @@
     {/if}
   </div>
 
-  {#if pending}
-    <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="member-action-title">
-      <div class="w-96 max-w-[90vw] bg-black border-2 {pending.action === 'ban' ? 'border-red-500' : 'border-[#ffaa00]'} p-6">
-        <h3 id="member-action-title" class="font-bold uppercase tracking-widest text-sm mb-3 {pending.action === 'ban' ? 'text-red-500' : 'text-[#ffaa00]'}">
-          {'>'} {pending.action === 'ban' ? 'Ban' : 'Kick'} {pending.member.username}
-        </h3>
-        <p class="text-xs text-[#00aa00] mb-4">
-          {pending.action === 'ban'
-            ? "They'll be removed and can't rejoin until the ban is lifted in Server Settings."
-            : 'They will be removed from the server. They can rejoin with an invite.'}
-        </p>
-        {#if pending.action === 'ban'}
-          <label for="ban-reason" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Reason (optional)</label>
-          <input id="ban-reason" bind:value={banReason} maxlength="500" class="w-full mb-4 bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none" />
+  {#if managing}
+    {@const m = managing}
+    <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="manage-title">
+      <div class="w-[420px] max-w-[92vw] bg-black border-2 {mode === 'ban' || mode === 'transfer' ? 'border-red-500' : mode === 'kick' ? 'border-[#ffaa00]' : 'border-[#00ff00]'} p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 id="manage-title" class="font-bold uppercase tracking-widest text-sm text-[#00ff00]">{'>'} {m.username}</h3>
+          <span class="text-xs text-[#00aa00] capitalize">{roleLabel(m)}</span>
+        </div>
+
+        {#if mode === 'menu'}
+          {#if canChangeRoles && assignableRoles.length > 0}
+            <div class="flex items-end gap-2">
+              <div class="flex-1">
+                <label for="member-role" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Role</label>
+                <select id="member-role" bind:value={newRole} class="w-full bg-[#0a0e0a] border border-[#00ff00] px-2 py-1.5 text-[#00ff00] text-sm">
+                  {#each assignableRoles as r}<option value={r.value}>{r.label}</option>{/each}
+                </select>
+              </div>
+              <button type="button" disabled={actionBusy || newRole === m.role} class="px-3 py-1.5 bg-[#00ff00] text-black text-sm font-bold disabled:opacity-40" on:click={saveRole}>Save role</button>
+            </div>
+          {/if}
+          <div class="grid grid-cols-2 gap-2">
+            <button type="button" class="py-2 border border-[#ffaa00] text-[#ffaa00] text-sm hover:bg-[#ffaa00] hover:text-black" on:click={() => (mode = 'kick')}>Kick</button>
+            <button type="button" class="py-2 border border-red-500 text-red-500 text-sm hover:bg-red-500 hover:text-black" on:click={() => (mode = 'ban')}>Ban</button>
+          </div>
+          {#if canTransfer && !m.is_owner}
+            <button type="button" class="w-full py-2 border border-red-500/60 text-red-400 text-xs uppercase tracking-wider hover:bg-red-500 hover:text-black" on:click={() => (mode = 'transfer')}>Transfer ownership to {m.username}</button>
+          {/if}
+        {:else if mode === 'kick'}
+          <p class="text-xs text-[#00aa00]">{m.username} will be removed from the server. They can rejoin with an invite.</p>
+        {:else if mode === 'ban'}
+          <p class="text-xs text-[#00aa00]">{m.username} will be removed and can't rejoin until the ban is lifted in Server Settings.</p>
+          <div>
+            <label for="ban-reason" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Reason (optional)</label>
+            <input id="ban-reason" bind:value={banReason} maxlength="500" class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none" />
+          </div>
+        {:else if mode === 'transfer'}
+          <p class="text-xs text-[#00aa00]">{m.username} will become the owner of this server. You'll stay on as an admin and can't undo this yourself.</p>
+          <div>
+            <label for="transfer-password" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Your password</label>
+            <input id="transfer-password" type="password" bind:value={transferPassword} autocomplete="current-password" class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none" />
+          </div>
         {/if}
-        {#if actionError}
-          <div class="mb-3 text-xs text-red-500">{'>'} {actionError}</div>
-        {/if}
+
+        {#if actionError}<div class="text-xs text-red-500">{'>'} {actionError}</div>{/if}
+
         <div class="flex gap-2">
-          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm hover:bg-[#00aa00]/10" on:click={() => (pending = null)}>Cancel</button>
-          <button type="button" disabled={actionBusy}
-            class="flex-1 py-2 border-2 text-sm font-bold disabled:opacity-50 {pending.action === 'ban' ? 'border-red-500 text-red-500 hover:bg-red-500' : 'border-[#ffaa00] text-[#ffaa00] hover:bg-[#ffaa00]'} hover:text-black"
-            on:click={confirmAction}>
-            {pending.action === 'ban' ? 'Ban' : 'Kick'}
+          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm hover:bg-[#00aa00]/10" on:click={() => (mode === 'menu' ? (managing = null) : (mode = 'menu'))}>
+            {mode === 'menu' ? 'Close' : 'Back'}
           </button>
+          {#if mode === 'kick'}
+            <button type="button" disabled={actionBusy} class="flex-1 py-2 border-2 border-[#ffaa00] text-[#ffaa00] font-bold text-sm hover:bg-[#ffaa00] hover:text-black disabled:opacity-50" on:click={kick}>Kick</button>
+          {:else if mode === 'ban'}
+            <button type="button" disabled={actionBusy} class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black disabled:opacity-50" on:click={ban}>Ban</button>
+          {:else if mode === 'transfer'}
+            <button type="button" disabled={actionBusy || !transferPassword} class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black disabled:opacity-50" on:click={transfer}>Transfer</button>
+          {/if}
         </div>
       </div>
     </div>

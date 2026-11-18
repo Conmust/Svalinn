@@ -69,7 +69,18 @@ async fn main() {
         .route("/api/v1/servers", post(routes::servers::create_server))
         .route(
             "/api/v1/servers/:server_id",
-            get(routes::servers::get_server).patch(routes::servers::update_server),
+            get(routes::servers::get_server)
+                .patch(routes::servers::update_server)
+                .delete(routes::servers::delete_server),
+        )
+        .route("/api/v1/servers/:server_id/transfer", post(routes::members::transfer_ownership))
+        .route(
+            "/api/v1/servers/:server_id/members/:user_id/role",
+            patch(routes::members::set_member_role),
+        )
+        .route(
+            "/api/v1/channels/:channel_id",
+            patch(routes::channels::rename_channel).delete(routes::channels::delete_channel),
         )
         .route("/api/v1/servers/:server_id/members", get(routes::members::get_server_members))
         .route("/api/v1/servers/:server_id/members/me", delete(routes::members::leave_server))
@@ -117,7 +128,7 @@ async fn main() {
         )
         .route(
             "/api/v1/messages/:message_id",
-            delete(routes::messages::delete_message),
+            delete(routes::messages::delete_message).patch(routes::messages::edit_message),
         )
         .route(
             "/api/v1/messages/:message_id/pin",

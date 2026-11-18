@@ -6,7 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access::{member_rank, require_member};
+use crate::access::{member_rank, require_member, role_rank, SITE_OWNER_RANK};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
@@ -285,4 +285,121 @@ pub async fn unban_member(
         return Err(AppError::NotFound("That user isn't banned from this server".into()));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct SetRoleRequest {
+    pub role: String,
+}
+
+/// PATCH /api/v1/servers/:server_id/members/:user_id/role  `{ "role": "moderator" }`
+///
+/// Admins and above can change the role of members ranked below them, to a
+/// role below their own: admins make moderators; owners make admins.
+pub async fn set_member_role(
+    State(db): State<Database>,
+    CurrentUser(actor): CurrentUser,
+    Path((server_id, target)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<SetRoleRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let role = payload.role.as_str();
+    if !matches!(role, "member" | "moderator" | "admin") {
+        return Err(AppError::BadRequest("Role must be member, moderator or admin".into()));
+    }
+    if actor == target {
+        return Err(AppError::BadRequest("You can't change your own role".into()));
+    }
+
+    let actor_rank = member_rank(&db, server_id, actor)
+        .await?
+        .ok_or_else(|| AppError::Forbidden("You are not a member of this server".into()))?;
+    if actor_rank < 3 {
+        return Err(AppError::Forbidden("Only admins and above can change roles".into()));
+    }
+    let target_rank = member_rank(&db, server_id, target)
+        .await?
+        .ok_or_else(|| AppError::NotFound("That user isn't a member of this server".into()))?;
+    if target_rank >= actor_rank {
+        return Err(AppError::Forbidden("You can only change the role of members ranked below you".into()));
+    }
+    if role_rank(role, false) >= actor_rank {
+        return Err(AppError::Forbidden("You can only give roles below your own".into()));
+    }
+
+    sqlx::query("UPDATE server_members SET role = $1 WHERE server_id = $2 AND user_id = $3")
+        .bind(role)
+        .bind(server_id)
+        .bind(target)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let payload = serde_json::json!({ "server_id": server_id, "user_id": target, "role": role });
+    let _ = db.message_tx.send(BroadcastMessage::to_server("member_updated", payload.clone(), server_id));
+    Ok(Json(payload))
+}
+
+#[derive(Deserialize)]
+pub struct TransferRequest {
+    pub user_id: Uuid,
+    pub current_password: String,
+}
+
+/// POST /api/v1/servers/:server_id/transfer  `{ "user_id": "...", "current_password": "..." }`
+///
+/// The owner (or a site owner) hands the server to another member. The old
+/// owner stays on as an admin.
+pub async fn transfer_ownership(
+    State(db): State<Database>,
+    CurrentUser(actor): CurrentUser,
+    Path(server_id): Path<Uuid>,
+    Json(payload): Json<TransferRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let actor_rank = member_rank(&db, server_id, actor)
+        .await?
+        .ok_or_else(|| AppError::Forbidden("You are not a member of this server".into()))?;
+    let current_owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if current_owner != actor && actor_rank < SITE_OWNER_RANK {
+        return Err(AppError::Forbidden("Only the owner can transfer the server".into()));
+    }
+    let new_owner = payload.user_id;
+    if new_owner == current_owner {
+        return Err(AppError::BadRequest("They already own this server".into()));
+    }
+    if member_rank(&db, server_id, new_owner).await?.is_none() {
+        return Err(AppError::NotFound("The new owner must be a member of this server".into()));
+    }
+
+    crate::routes::users::verify_current_password(&db, actor, &payload.current_password).await?;
+
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let mut tx = db.pool.begin().await.map_err(db_err)?;
+    sqlx::query("UPDATE servers SET owner_id = $1 WHERE id = $2")
+        .bind(new_owner)
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    // Both end up as admins; ownership itself comes from servers.owner_id.
+    sqlx::query("UPDATE server_members SET role = 'admin' WHERE server_id = $1 AND user_id IN ($2, $3)")
+        .bind(server_id)
+        .bind(current_owner)
+        .bind(new_owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    for user_id in [current_owner, new_owner] {
+        let _ = db.message_tx.send(BroadcastMessage::to_server(
+            "member_updated",
+            serde_json::json!({ "server_id": server_id, "user_id": user_id, "role": "admin" }),
+            server_id,
+        ));
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

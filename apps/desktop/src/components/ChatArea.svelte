@@ -113,6 +113,12 @@
     messageInput?.setSelectionRange(pos, pos);
   }
 
+  // History is loaded a page at a time; scrolling to the top loads more.
+  const PAGE_SIZE = 50;
+  let container: HTMLDivElement;
+  let hasMore = false;
+  let loadingOlder = false;
+
   $: if (channelId) {
     loadMessages();
   }
@@ -140,28 +146,85 @@
     messages = [...messages, message];
   }
 
+  // My role changed (promoted, demoted, ownership transferred): refresh what I can do.
+  function onMemberUpdated(data: { server_id: string; user_id: string }) {
+    if (data.server_id === serverId && data.user_id === currentUser?.id) loadRole(serverId);
+  }
+
   onMount(() => {
     wsClient.connect();
     wsClient.on('new_message', onNewMessage);
     wsClient.on('message_deleted', onMessageDeleted);
     wsClient.on('message_updated', onMessageUpdated);
+    wsClient.on('member_updated', onMemberUpdated);
   });
 
   onDestroy(() => {
     wsClient.off('new_message', onNewMessage);
     wsClient.off('message_deleted', onMessageDeleted);
     wsClient.off('message_updated', onMessageUpdated);
+    wsClient.off('member_updated', onMemberUpdated);
   });
 
-  async function loadMessages() {
-    loading = true;
+  const handleEdit = (e: CustomEvent<{ message: Message; content: string }>) => run(async () => {
+    const { message, content } = e.detail;
+    const res = await apiFetch(`${apiBase()}/api/v1/messages/${message.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Could not edit message');
+    patchMessage(message.id, { content, is_edited: true });
+  });
+
+  /** Loads the page of messages before the oldest one shown, keeping the view in place. */
+  async function loadOlder() {
+    if (loadingOlder || !hasMore || messages.length === 0) return;
+    const forChannel = channelId;
+    loadingOlder = true;
     try {
-      const response = await apiFetch(`${apiBase()}/api/v1/channels/${channelId}/messages`, {
+      const res = await apiFetch(
+        `${apiBase()}/api/v1/channels/${forChannel}/messages?before=${messages[0].id}&limit=${PAGE_SIZE}`,
+      );
+      if (!res.ok || forChannel !== channelId) return;
+      const older: Message[] = await res.json();
+      hasMore = older.length === PAGE_SIZE;
+      const fresh = older.filter(o => !messages.some(m => m.id === o.id));
+      if (fresh.length === 0) return;
+
+      const heightBefore = container?.scrollHeight ?? 0;
+      const topBefore = container?.scrollTop ?? 0;
+      messages = [...fresh, ...messages];
+      await tick();
+      if (container) container.scrollTop = topBefore + (container.scrollHeight - heightBefore);
+    } catch (e) {
+      console.error('Failed to load older messages:', e);
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
+  function onScroll() {
+    // Ignore scrolling while a channel is still loading or being positioned.
+    if (loading || !container || showPinnedOnly) return;
+    if (container.scrollTop < 120) loadOlder();
+  }
+
+  async function loadMessages() {
+    const forChannel = channelId;
+    loading = true;
+    hasMore = false;
+    try {
+      const response = await apiFetch(`${apiBase()}/api/v1/channels/${forChannel}/messages?limit=${PAGE_SIZE}`, {
         headers: getAuthHeaders(),
       });
+      // Ignore the answer if the user has switched channels meanwhile.
+      if (forChannel !== channelId) return;
       if (response.ok) {
         messages = await response.json();
-        scrollToBottom();
+        hasMore = messages.length === PAGE_SIZE;
+        loading = false;
+        await scrollToBottom();
       } else if (response.status === 401) {
         localStorage.clear();
         location.reload();
@@ -277,13 +340,14 @@
     dispatch('userClicked', userId);
   }
 
-  function scrollToBottom() {
+  // Jump to the newest message once it's rendered, and again shortly after in
+  // case images or other content change the height while loading.
+  async function scrollToBottom() {
+    await tick();
+    if (container) container.scrollTop = container.scrollHeight;
     setTimeout(() => {
-      const container = document.querySelector('.messages-container');
-      if (container) {
-        container.scrollTop = container.scrollHeight;
-      }
-    }, 100);
+      if (container) container.scrollTop = container.scrollHeight;
+    }, 150);
   }
 </script>
 
@@ -336,7 +400,7 @@
   </div>
 
   <!-- Messages -->
-  <div class="flex-1 overflow-y-auto p-4 custom-scrollbar messages-container">
+  <div class="flex-1 overflow-y-auto p-4 custom-scrollbar messages-container" bind:this={container} on:scroll={onScroll}>
     {#if loading}
       <div class="flex items-center justify-center h-full">
         <div class="text-[#00aa00] animate-pulse terminal-glow">{'>'} Loading messages...</div>
@@ -347,6 +411,17 @@
         <div class="text-sm">{'>'} No messages yet. Start the conversation!</div>
       </div>
     {:else}
+      {#if !showPinnedOnly}
+        <div class="text-center text-xs text-[#00aa00] py-2">
+          {#if loadingOlder}
+            <span class="animate-pulse">{'>'} Loading older messages...</span>
+          {:else if hasMore}
+            <button type="button" class="underline hover:text-[#00ff00]" on:click={loadOlder}>Load older messages</button>
+          {:else}
+            {'>'} This is the beginning of the channel.
+          {/if}
+        </div>
+      {/if}
       <div class="space-y-1">
         {#each visibleMessages as message, i (message.id)}
           {@const prev = visibleMessages[i - 1]}
@@ -367,6 +442,7 @@
             on:hide={handleHide}
             on:unhide={handleUnhide}
             on:delete={(e) => (pendingDelete = e.detail)}
+            on:edit={handleEdit}
           />
         {/each}
       </div>

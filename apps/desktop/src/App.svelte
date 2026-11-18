@@ -37,6 +37,7 @@
     }
     if (data.reason === 'kicked') showNotice(`You were removed from ${data.server_name}.`);
     if (data.reason === 'banned') showNotice(`You were banned from ${data.server_name}.`);
+    if (data.reason === 'deleted') showNotice(`${data.server_name} was deleted.`);
   });
 
   // Auth form state
@@ -136,6 +137,7 @@
         activeServer={activeServer}
         activeChannel={activeChannel}
         on:channelSelected={handleChannelSelected}
+        on:channelDeleted={() => (activeChannel = null)}
         on:createChannel={handleCreateChannel}
         on:logout={handleLogout}
       />

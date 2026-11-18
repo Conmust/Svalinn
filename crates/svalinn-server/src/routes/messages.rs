@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -123,36 +123,97 @@ fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server
     let _ = db.message_tx.send(BroadcastMessage::to_server(event_type, payload, server_id));
 }
 
-/// GET /api/v1/channels/:channel_id/messages
+/// Longest message content accepted.
+const MAX_CONTENT_CHARS: usize = 4000;
+/// Messages per page when loading history.
+const PAGE_SIZE: i64 = 50;
+const MAX_PAGE_SIZE: i64 = 100;
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    /// Load messages older than this message. Omit for the latest page.
+    pub before: Option<Uuid>,
+    pub limit: Option<i64>,
+}
+
+/// GET /api/v1/channels/:channel_id/messages?before=<message_id>&limit=50
 ///
-/// Returns the latest 100 messages (oldest first) and marks the channel as
-/// read for the current user.
+/// Returns a page of messages, oldest first: the latest ones, or with
+/// `before`, the ones just older than that message. Fewer than `limit`
+/// messages means there's no more history. Loading the latest page marks the
+/// channel as read.
 pub async fn get_channel_messages(
     State(db): State<Database>,
     CurrentSession { user_id, session_id }: CurrentSession,
     Path(channel_id): Path<Uuid>,
+    Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<Message>>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
+    let limit = query.limit.unwrap_or(PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
 
-    let messages: Vec<Message> = sqlx::query_as(&format!(
-        r#"
-        SELECT * FROM (
-            SELECT {MESSAGE_COLUMNS}
-            FROM messages m
-            JOIN users u ON m.user_id = u.id
-            WHERE m.channel_id = $2
-            ORDER BY m.created_at DESC
-            LIMIT 100
-        ) latest
-        ORDER BY created_at ASC
-        "#
-    ))
-    .bind(user_id)
-    .bind(channel_id)
-    .fetch_all(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // Page by (created_at, id) so messages with the same timestamp are
+    // neither skipped nor repeated.
+    let messages: Vec<Message> = if let Some(before) = query.before {
+        let cursor: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT created_at FROM messages WHERE id = $1 AND channel_id = $2")
+                .bind(before)
+                .bind(channel_id)
+                .fetch_optional(&db.pool)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        let cursor = cursor.ok_or_else(|| AppError::NotFound("Message not found in this channel".into()))?;
+
+        sqlx::query_as(&format!(
+            r#"
+            SELECT * FROM (
+                SELECT {MESSAGE_COLUMNS}
+                FROM messages m
+                JOIN users u ON m.user_id = u.id
+                WHERE m.channel_id = $2 AND (m.created_at, m.id) < ($3, $4)
+                ORDER BY m.created_at DESC, m.id DESC
+                LIMIT $5
+            ) older
+            ORDER BY created_at ASC, id ASC
+            "#
+        ))
+        .bind(user_id)
+        .bind(channel_id)
+        .bind(cursor)
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+    } else {
+        sqlx::query_as(&format!(
+            r#"
+            SELECT * FROM (
+                SELECT {MESSAGE_COLUMNS}
+                FROM messages m
+                JOIN users u ON m.user_id = u.id
+                WHERE m.channel_id = $2
+                ORDER BY m.created_at DESC, m.id DESC
+                LIMIT $3
+            ) latest
+            ORDER BY created_at ASC, id ASC
+            "#
+        ))
+        .bind(user_id)
+        .bind(channel_id)
+        .bind(limit)
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+    };
+
+    if query.before.is_some() {
+        let mut messages = messages;
+        for m in &mut messages {
+            sign_opt(&mut m.attachment_url, user_id, session_id);
+        }
+        return Ok(Json(messages));
+    }
 
     // Opening a channel marks it as read, so `has_unread` clears.
     sqlx::query(
@@ -220,6 +281,9 @@ pub async fn create_message(
         }
     }
 
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
+    }
     if content.trim().is_empty() && attachment_url.is_none() {
         return Err(AppError::BadRequest("Message cannot be empty".into()));
     }
@@ -401,4 +465,45 @@ pub(crate) async fn broadcast_reactions(db: &Database, message_id: Uuid, user_id
 /// Exposed for the reactions routes.
 pub(crate) async fn reaction_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<Uuid, AppError> {
     Ok(message_context(db, message_id, user_id).await?.server_id)
+}
+
+#[derive(Deserialize)]
+pub struct EditMessageRequest {
+    pub content: String,
+}
+
+/// PATCH /api/v1/messages/:message_id  `{ "content": "..." }` — authors only.
+pub async fn edit_message(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+    Json(payload): Json<EditMessageRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let ctx = message_context(&db, message_id, user_id).await?;
+    if ctx.author_id != user_id {
+        return Err(AppError::Forbidden("You can only edit your own messages".into()));
+    }
+    if payload.content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
+    }
+
+    let has_attachment: bool = sqlx::query_scalar("SELECT attachment_url IS NOT NULL FROM messages WHERE id = $1")
+        .bind(message_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if payload.content.trim().is_empty() && !has_attachment {
+        return Err(AppError::BadRequest("Message cannot be empty. Delete it instead.".into()));
+    }
+
+    sqlx::query("UPDATE messages SET content = $1, is_edited = true, updated_at = NOW() WHERE id = $2")
+        .bind(&payload.content)
+        .bind(message_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let update = serde_json::json!({ "id": message_id, "content": payload.content, "is_edited": true });
+    broadcast(&db, "message_updated", update.clone(), ctx.server_id);
+    Ok(Json(update))
 }

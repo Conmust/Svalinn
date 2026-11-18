@@ -26,8 +26,81 @@
   let newChannelName = '';
   let createChannelError = '';
 
+  // Admins and above can rename and delete channels.
+  let myRank = 1;
+  $: canManageChannels = myRank >= 3;
+  let renaming: Channel | null = null;
+  let renameValue = '';
+  let deleting: Channel | null = null;
+  let channelActionError = '';
+
   $: if (activeServer) {
     loadChannels(activeServer);
+    loadRank(activeServer);
+  }
+
+  async function loadRank(serverId: string) {
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/role`);
+      if (res.ok) myRank = (await res.json()).rank ?? 1;
+    } catch {
+      myRank = 1;
+    }
+  }
+
+  function startRename(channel: Channel) {
+    renaming = channel;
+    renameValue = channel.name;
+    channelActionError = '';
+  }
+
+  async function submitRename(e: Event) {
+    e.preventDefault();
+    if (!renaming) return;
+    const res = await apiFetch(`${apiBase()}/api/v1/channels/${renaming.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: renameValue }),
+    });
+    if (res.ok) {
+      const { id, name } = await res.json();
+      channels = channels.map(c => (c.id === id ? { ...c, name } : c));
+      renaming = null;
+    } else {
+      channelActionError = (await res.json().catch(() => ({}))).error || 'Could not rename channel';
+    }
+  }
+
+  async function confirmDelete() {
+    if (!deleting) return;
+    const channel = deleting;
+    const res = await apiFetch(`${apiBase()}/api/v1/channels/${channel.id}`, { method: 'DELETE' });
+    if (res.ok) {
+      removeChannel(channel.id);
+      deleting = null;
+    } else {
+      channelActionError = (await res.json().catch(() => ({}))).error || 'Could not delete channel';
+    }
+  }
+
+  function removeChannel(id: string) {
+    channels = channels.filter(c => c.id !== id);
+    if (id === activeChannel) dispatch('channelDeleted', id);
+  }
+
+  // Live channel changes from other people.
+  function onChannelCreated(data: Channel) {
+    if (data.server_id !== activeServer || channels.some(c => c.id === data.id)) return;
+    channels = [...channels, { ...data, has_unread: false }];
+  }
+  function onChannelUpdated(data: { id: string; name: string }) {
+    channels = channels.map(c => (c.id === data.id ? { ...c, name: data.name } : c));
+  }
+  function onChannelDeleted(data: { id: string }) {
+    removeChannel(data.id);
+  }
+  function onMemberUpdated(data: { server_id: string; user_id: string }) {
+    if (data.server_id === activeServer && data.user_id === currentUser?.id) loadRank(activeServer);
   }
 
   function onNewMessage(data: { channel_id?: string; user_id?: string }) {
@@ -41,10 +114,18 @@
   onMount(() => {
     wsClient.connect();
     wsClient.on('new_message', onNewMessage);
+    wsClient.on('channel_created', onChannelCreated);
+    wsClient.on('channel_updated', onChannelUpdated);
+    wsClient.on('channel_deleted', onChannelDeleted);
+    wsClient.on('member_updated', onMemberUpdated);
   });
 
   onDestroy(() => {
     wsClient.off('new_message', onNewMessage);
+    wsClient.off('channel_created', onChannelCreated);
+    wsClient.off('channel_updated', onChannelUpdated);
+    wsClient.off('channel_deleted', onChannelDeleted);
+    wsClient.off('member_updated', onMemberUpdated);
   });
 
    async function loadChannels(serverId: string) {
@@ -95,7 +176,7 @@
 
       if (response.ok) {
         const newChannel = await response.json();
-        channels = [...channels, newChannel];
+        if (!channels.some(c => c.id === newChannel.id)) channels = [...channels, newChannel];
         newChannelName = '';
         showCreateChannelModal = false;
         // Optionally auto-select the new channel
@@ -162,10 +243,12 @@
         {'>'} No channels yet
       </div>
     {:else}
-      {#each channels as channel}
+      {#each channels as channel (channel.id)}
+        <div class="relative group mb-1">
         <button
           type="button"
-          class="w-full text-left px-3 py-2 mb-1 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2 group {channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : ''}"
+          class="w-full text-left px-3 py-2 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)]' : channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : ''} {canManageChannels ? 'pr-14' : ''}"
+          aria-current={channel.id === activeChannel ? 'page' : undefined}
           on:click={() => handleChannelClick(channel.id)}
         >
           {#if channel.has_unread}
@@ -180,6 +263,13 @@
             </div>
           </div>
         </button>
+        {#if canManageChannels}
+          <div class="absolute right-1 top-1/2 -translate-y-1/2 hidden group-hover:flex group-focus-within:flex gap-1">
+            <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Rename channel" aria-label="Rename {channel.name}" on:click={() => startRename(channel)}>✎</button>
+            <button type="button" class="px-1.5 text-xs text-red-500 hover:text-red-400" title="Delete channel" aria-label="Delete {channel.name}" on:click={() => { deleting = channel; channelActionError = ''; }}>✕</button>
+          </div>
+        {/if}
+        </div>
       {/each}
     {/if}
   </div>
@@ -234,6 +324,34 @@
             <button type="submit" class="flex-1 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all text-sm terminal-glow">Create</button>
           </div>
         </form>
+      </div>
+    </div>
+  {/if}
+
+  {#if renaming}
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+      <form class="w-[400px] max-w-[90vw] bg-black border-2 border-[#00ff00] p-6 space-y-4" on:submit={submitRename}>
+        <h3 id="rename-title" class="text-sm font-bold text-[#00ff00] uppercase tracking-widest">{'>'} Rename #{renaming.name}</h3>
+        <input bind:value={renameValue} aria-label="Channel name" maxlength="100" required class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none" />
+        {#if channelActionError}<div class="text-xs text-red-500">{'>'} {channelActionError}</div>{/if}
+        <div class="flex gap-2">
+          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={() => (renaming = null)}>Cancel</button>
+          <button type="submit" class="flex-1 py-2 bg-[#00ff00] text-black font-bold text-sm">Rename</button>
+        </div>
+      </form>
+    </div>
+  {/if}
+
+  {#if deleting}
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="delete-channel-title">
+      <div class="w-[400px] max-w-[90vw] bg-black border-2 border-red-500 p-6 space-y-4">
+        <h3 id="delete-channel-title" class="text-sm font-bold text-red-500 uppercase tracking-widest">{'>'} Delete #{deleting.name}</h3>
+        <p class="text-xs text-[#00aa00]">All messages and files in this channel will be deleted for everyone. This can't be undone.</p>
+        {#if channelActionError}<div class="text-xs text-red-500">{'>'} {channelActionError}</div>{/if}
+        <div class="flex gap-2">
+          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={() => (deleting = null)}>Cancel</button>
+          <button type="button" class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black" on:click={confirmDelete}>Delete channel</button>
+        </div>
       </div>
     </div>
   {/if}

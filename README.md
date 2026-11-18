@@ -467,6 +467,14 @@ The server listens on `http://127.0.0.1:3001`.
 - **CORS:** only the desktop app and the dev server may call the API by default. Use `CORS_ALLOWED_ORIGINS` to change the list.
 - **Rate limits:** logins are limited to 20 attempts per IP address per 5 minutes and 5 failed attempts per account per 15 minutes. Registration is limited to 5 new accounts per IP per hour, and invite lookups to 20 per user per 10 minutes. Limits are kept in memory and reset when the server restarts.
 
+## Manage a Server
+
+- **Roles:** click **Manage** next to a member (in the member list). Admins and above can set roles below their own: admins make moderators, owners make admins.
+- **Channels:** admins and above can rename or delete a channel from its hover buttons in the channel list. Deleting a channel deletes its messages and files.
+- **Ownership:** the owner can transfer the server to another member from **Manage** (asks for your password); they stay on as an admin.
+- **Delete server:** owner only, in **Server Settings → Overview**. Asks for your password and the server name.
+- **History and editing:** scroll to the top of a channel to load older messages, 50 at a time. Use **Edit** on your own messages; edited messages are marked "(edited)".
+
 ## Account Settings
 
 The person icon at the bottom of the server list opens **Account Settings**, where you can change your email or password. Both need your current password. Changing your password logs you out on every other device.

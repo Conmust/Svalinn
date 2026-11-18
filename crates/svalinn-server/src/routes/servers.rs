@@ -177,3 +177,71 @@ pub async fn update_server(
     sign_opt(&mut server.icon_url, user_id, session_id);
     Ok(Json(server))
 }
+#[derive(Deserialize)]
+pub struct DeleteServerRequest {
+    pub current_password: String,
+}
+
+/// DELETE /api/v1/servers/:server_id  `{ "current_password": "..." }`
+///
+/// Owner (or site owner) only. Deletes the server with its channels,
+/// messages, emojis, invites and bans, and their uploaded files.
+pub async fn delete_server(
+    State(db): State<Database>,
+    CurrentSession { user_id, .. }: CurrentSession,
+    Path(server_id): Path<Uuid>,
+    Json(payload): Json<DeleteServerRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+
+    let rank = crate::access::member_rank(&db, server_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::Forbidden("You are not a member of this server".into()))?;
+    let (name, owner_id): (String, Uuid) = sqlx::query_as("SELECT name, owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(db_err)?;
+    if owner_id != user_id && rank < crate::access::SITE_OWNER_RANK {
+        return Err(AppError::Forbidden("Only the owner can delete this server".into()));
+    }
+
+    crate::routes::users::verify_current_password(&db, user_id, &payload.current_password).await?;
+
+    // Collect what the cascade won't clean up: members to notify and files on disk.
+    let members: Vec<Uuid> = sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+        .bind(server_id)
+        .fetch_all(&db.pool)
+        .await
+        .map_err(db_err)?;
+    let files: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT m.attachment_url FROM messages m JOIN channels c ON c.id = m.channel_id
+        WHERE c.server_id = $1 AND m.attachment_url IS NOT NULL
+        UNION ALL SELECT url FROM custom_emojis WHERE server_id = $1
+        UNION ALL SELECT icon_url FROM servers WHERE id = $1 AND icon_url IS NOT NULL
+        "#,
+    )
+    .bind(server_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(db_err)?;
+
+    // Channels, messages, members, emojis, invites and bans cascade.
+    sqlx::query("DELETE FROM servers WHERE id = $1")
+        .bind(server_id)
+        .execute(&db.pool)
+        .await
+        .map_err(db_err)?;
+
+    crate::files::remove_stored_files(&files).await;
+
+    for member in members {
+        let _ = db.message_tx.send(crate::models::message::BroadcastMessage::to_user(
+            "removed_from_server",
+            serde_json::json!({ "server_id": server_id, "server_name": name, "reason": "deleted" }),
+            member,
+        ));
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}

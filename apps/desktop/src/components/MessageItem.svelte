@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fileUrl } from '../lib/api';
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, tick } from 'svelte';
   import ReactionPicker from './ReactionPicker.svelte';
   import type { Message } from '../lib/messages';
 
@@ -22,7 +22,36 @@
     hide: Message;
     unhide: Message;
     delete: Message;
+    edit: { message: Message; content: string };
   }>();
+
+  let editing = false;
+  let draft = '';
+  let editor: HTMLTextAreaElement;
+
+  async function startEdit() {
+    draft = message.content;
+    editing = true;
+    await tick();
+    editor?.focus();
+    editor?.setSelectionRange(draft.length, draft.length);
+  }
+
+  function saveEdit() {
+    if (draft !== message.content) dispatch('edit', { message, content: draft });
+    editing = false;
+  }
+
+  // Enter saves, Shift+Enter adds a line, Escape cancels.
+  function onEditorKey(e: KeyboardEvent) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      saveEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      editing = false;
+    }
+  }
 
   let pickerOpen = false;
 
@@ -105,9 +134,23 @@
       </div>
     {/if}
 
-    {#if message.content}
+    {#if editing}
+      <textarea
+        bind:this={editor}
+        bind:value={draft}
+        on:keydown={onEditorKey}
+        rows={Math.min(8, draft.split('\n').length + 1)}
+        maxlength="4000"
+        aria-label="Edit message"
+        class="w-full bg-[#0a0e0a] border border-[#00ff00] px-2 py-1 text-sm text-[#00ff00] focus:outline-none resize-y"
+      ></textarea>
+      <div class="text-[10px] text-[#00aa00] mt-1">
+        Enter to <button type="button" class="underline hover:text-[#00ff00]" on:click={saveEdit}>save</button>
+        · Esc to <button type="button" class="underline hover:text-[#00ff00]" on:click={() => (editing = false)}>cancel</button>
+      </div>
+    {:else if message.content}
       <div class="text-sm text-[#00ff00] whitespace-pre-wrap break-words">
-        {message.content}
+        {message.content}{#if message.is_edited && !showHeader}<span class="ml-1 text-[10px] text-[#00aa00] italic">(edited)</span>{/if}
       </div>
     {/if}
 
@@ -164,7 +207,7 @@
   </div>
 
   <!-- Hover toolbar -->
-  {#if !selectionMode}
+  {#if !selectionMode && !editing}
     <div
       class="absolute -top-3 right-4 flex items-center bg-black border border-[#00ff00] shadow-[0_0_10px_rgba(0,255,0,0.3)] transition-opacity {pickerOpen ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'}"
     >
@@ -172,6 +215,9 @@
         on:openchange={(e) => (pickerOpen = e.detail)}
         on:select={(e) => dispatch('toggleReaction', { messageId: message.id, emoji: e.detail })}
       />
+      {#if isOwn}
+        <button type="button" class={toolButton} title="Edit your message" on:click={startEdit}>Edit</button>
+      {/if}
       {#if canModerate}
         <button type="button" class={toolButton} title={message.is_pinned ? 'Unpin' : 'Pin'} on:click={() => dispatch('pin', message)}>
           {message.is_pinned ? 'Unpin' : 'Pin'}
