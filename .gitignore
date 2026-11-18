@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Node
 node_modules/
@@ -24,3 +23,7 @@ dist/
 
 # User uploads saved by the server at runtime
 uploads/
+
+# Test output
+e2e/test-results/
+e2e/playwright-report/

@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "pnpm --filter desktop dev",
-    "build": "pnpm --filter desktop build"
+    "build": "pnpm --filter desktop build",
+    "test:e2e": "pnpm --filter e2e test",
+    "check": "pnpm --filter desktop check"
   },
   "devDependencies": {
     "typescript": "^5.3.3"

@@ -1,0 +1,146 @@
+import { test, expect } from '@playwright/test';
+import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { API, call, jwtPayload, login, nowSeconds, post, randomIp, register, signJwt, sql, uniq } from '../../support/api';
+import { APP_URL, DATABASE_URL, exe } from '../../support/config';
+
+test.describe('login tokens', () => {
+  test('register returns a 5-minute access token and a hashed 90-day refresh token', async () => {
+    const u = await register('tok');
+    const claims = jwtPayload(u.token);
+    expect(claims.exp - nowSeconds()).toBeGreaterThan(290);
+    expect(claims.exp - nowSeconds()).toBeLessThanOrEqual(300);
+    expect(claims.sid).toBeTruthy();
+    expect(u.refresh_token).toMatch(/^[0-9a-f]{64}$/);
+
+    const hash = crypto.createHash('sha256').update(u.refresh_token).digest('hex');
+    const rows = await sql(
+      `SELECT token_hash, round(extract(epoch from expires_at - now()) / 86400) AS days FROM refresh_tokens WHERE user_id = $1`,
+      [u.user.id],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].token_hash).toBe(hash); // only the hash is stored
+    expect(Number(rows[0].days)).toBe(90);
+  });
+
+  test('expired, forged and session-less access tokens are rejected', async () => {
+    const u = await register('tok');
+    const sid = jwtPayload(u.token).sid;
+    expect((await call(u, 'GET', '/servers')).status).toBe(200);
+
+    const expired = signJwt({ sub: u.user.id, username: 'x', sid, exp: nowSeconds() - 10 });
+    expect((await call({ ...u, token: expired }, 'GET', '/servers')).status).toBe(401);
+
+    const forged = u.token.slice(0, -4) + 'AAAA';
+    expect((await call({ ...u, token: forged }, 'GET', '/servers')).status).toBe(401);
+
+    // Tokens from before sessions existed have no "sid" and are refused.
+    const noSession = signJwt({ sub: u.user.id, username: 'x', exp: nowSeconds() + 300 });
+    expect((await call({ ...u, token: noSession }, 'GET', '/servers')).status).toBe(401);
+  });
+
+  test('refresh rotates the refresh token', async () => {
+    const u = await register('tok');
+    const r1 = await post('/auth/refresh', { refresh_token: u.refresh_token });
+    expect(r1.status).toBe(200);
+    expect(r1.body.refresh_token).not.toBe(u.refresh_token);
+    expect((await call({ ...u, token: r1.body.token }, 'GET', '/servers')).status).toBe(200);
+
+    // A retry within 30s (two windows refreshing at once) fails but doesn't end the session.
+    expect((await post('/auth/refresh', { refresh_token: u.refresh_token })).status).toBe(401);
+    expect((await post('/auth/refresh', { refresh_token: r1.body.refresh_token })).status).toBe(200);
+  });
+
+  test('replaying an old refresh token later revokes the whole session', async () => {
+    const u = await register('tok');
+    const r1 = (await post('/auth/refresh', { refresh_token: u.refresh_token })).body;
+    // Pretend the first token was replaced a while ago, so this looks like theft.
+    await sql(`UPDATE refresh_tokens SET replaced_at = now() - interval '5 minutes' WHERE user_id = $1 AND replaced_at IS NOT NULL`, [u.user.id]);
+
+    expect((await post('/auth/refresh', { refresh_token: u.refresh_token })).status).toBe(401);
+    // The legitimate newer token is dead too, and so is its access token.
+    expect((await post('/auth/refresh', { refresh_token: r1.refresh_token })).status).toBe(401);
+    expect((await call({ ...u, token: r1.token }, 'GET', '/servers')).status).toBe(401);
+  });
+
+  test('refresh tokens past 90 days are refused', async () => {
+    const u = await register('tok');
+    await sql(`UPDATE refresh_tokens SET expires_at = now() - interval '1 second' WHERE user_id = $1`, [u.user.id]);
+    const res = await post('/auth/refresh', { refresh_token: u.refresh_token });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain('expired');
+  });
+
+  test('logout revokes the session at once', async () => {
+    const u = await register('tok');
+    expect((await post('/auth/logout', { refresh_token: u.refresh_token })).status).toBe(204);
+    expect((await post('/auth/refresh', { refresh_token: u.refresh_token })).status).toBe(401);
+    // The access token stops working immediately, not after 5 minutes.
+    expect((await call(u, 'GET', '/servers')).status).toBe(401);
+  });
+});
+
+test.describe('rate limits', () => {
+  test('locks an account after 5 wrong passwords, without affecting others', async () => {
+    const u = await register('rl');
+    const ip = randomIp();
+    for (let i = 0; i < 5; i++) expect((await login(u.email, 'wrong', ip)).status).toBe(400);
+
+    const locked = await login(u.email, 'wrong', randomIp()); // from anywhere
+    expect(locked.status).toBe(429);
+    expect(Number(locked.headers.get('retry-after'))).toBeGreaterThan(800);
+    expect((await login(u.email, u.password, randomIp())).status).toBe(429); // even the right password
+
+    const other = await register('rl');
+    expect((await login(other.email, other.password, ip)).status).toBe(200);
+  });
+
+  test('limits logins per IP address', async () => {
+    const ip = randomIp();
+    for (let i = 0; i < 20; i++) await login(`${uniq('nobody')}@example.test`, 'x', ip);
+    expect((await login(`${uniq('nobody')}@example.test`, 'x', ip)).status).toBe(429);
+  });
+
+  test('limits new accounts per IP address', async () => {
+    const ip = randomIp();
+    for (let i = 0; i < 5; i++) {
+      const n = uniq('reg');
+      expect((await post('/auth/register', { username: n, email: `${n}@example.test`, password: 'secret123' }, ip)).status).toBe(200);
+    }
+    const n = uniq('reg');
+    expect((await post('/auth/register', { username: n, email: `${n}@example.test`, password: 'secret123' }, ip)).status).toBe(429);
+  });
+});
+
+test.describe('server startup', () => {
+  const start = (env: Record<string, string>) =>
+    spawnSync(exe('svalinn-server'), [], {
+      // Not the repository folder: the server would read your .env file there.
+      cwd: os.tmpdir(),
+      // A port nothing listens on: if the server did start, it fails to bind instead of running.
+      env: { PATH: process.env.PATH ?? '', DATABASE_URL, PORT: '1', ...env },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+
+  test('refuses to start without a proper JWT secret', () => {
+    expect(start({}).stderr).toContain('JWT_SECRET is not set');
+    expect(start({ JWT_SECRET: 'dev-secret-change-me-in-production' }).stderr).toContain('old built-in default');
+    expect(start({ JWT_SECRET: 'short', APP_ENV: 'production' }).stderr).toContain('shorter than 32');
+  });
+});
+
+test('CORS allows the app (including PUT) and blocks other sites', async () => {
+  const preflight = (origin: string, method: string) =>
+    fetch(`${API}/users/me/password`, {
+      method: 'OPTIONS',
+      headers: { Origin: origin, 'Access-Control-Request-Method': method, 'Access-Control-Request-Headers': 'authorization,content-type' },
+    });
+  const ok = await preflight(APP_URL, 'PUT');
+  expect(ok.headers.get('access-control-allow-origin')).toBe(APP_URL);
+  expect(ok.headers.get('access-control-allow-methods')).toContain('PUT');
+
+  const evil = await preflight('https://evil.example', 'PUT');
+  expect(evil.headers.get('access-control-allow-origin')).toBeNull();
+});

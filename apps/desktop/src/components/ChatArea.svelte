@@ -205,8 +205,10 @@
   }
 
   function onScroll() {
+    if (!container) return;
+    nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
     // Ignore scrolling while a channel is still loading or being positioned.
-    if (loading || !container || showPinnedOnly) return;
+    if (loading || showPinnedOnly) return;
     if (container.scrollTop < 120) loadOlder();
   }
 
@@ -224,7 +226,7 @@
         messages = await response.json();
         hasMore = messages.length === PAGE_SIZE;
         loading = false;
-        await scrollToBottom();
+        await scrollToBottom(true);
       } else if (response.status === 401) {
         localStorage.clear();
         location.reload();
@@ -285,7 +287,7 @@
         // 3. Clean up the input
         newMessage = '';
         clearAttachment();
-        scrollToBottom();
+        scrollToBottom(true);
       } else if (response.status === 401) {
         localStorage.clear();
         location.reload();
@@ -340,13 +342,21 @@
     dispatch('userClicked', userId);
   }
 
+  // Whether the view is at (or near) the newest message. New messages only
+  // pull the view down while it is, so reading older history isn't interrupted.
+  let nearBottom = true;
+
   // Jump to the newest message once it's rendered, and again shortly after in
-  // case images or other content change the height while loading.
-  async function scrollToBottom() {
+  // case images change the height, unless the user has scrolled up meanwhile.
+  // `force` is for opening a channel and sending your own message.
+  async function scrollToBottom(force = false) {
+    if (!force && !nearBottom) return;
     await tick();
-    if (container) container.scrollTop = container.scrollHeight;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
+    nearBottom = true;
     setTimeout(() => {
-      if (container) container.scrollTop = container.scrollHeight;
+      if (container && nearBottom) container.scrollTop = container.scrollHeight;
     }, 150);
   }
 </script>

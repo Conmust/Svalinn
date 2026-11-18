@@ -557,6 +557,32 @@ svalinn/
 
 ---
 
+## Tests
+
+The `e2e/` folder holds API and browser tests (Playwright). They start their own server on port 3101 and app on port 1421, using a separate `svalinn_test` database, so they don't touch your dev setup and can run while it's running.
+
+```bash
+docker compose up -d postgres
+```
+
+```bash
+pnpm install
+```
+
+```bash
+pnpm --filter e2e exec playwright install chromium
+```
+
+```bash
+pnpm test:e2e
+```
+
+Use `pnpm --filter e2e test:api` or `pnpm --filter e2e test:ui` to run one half, and `pnpm --filter e2e report` to open the last report. The test database is created on first run; set `E2E_DATABASE_URL` to use a different one. The server's unit tests run with `cargo test -p svalinn-server`.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the server build and unit tests, the desktop type check and build, and the full API and browser suite on every push and pull request.
+
+---
+
 ## Development Scripts
 
 Planned scripts:
