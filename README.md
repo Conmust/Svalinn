@@ -438,6 +438,20 @@ openssl rand -base64 48
 
 ---
 
+## Use Supabase as the Database
+
+Svalinn only needs Postgres, so a Supabase project works. Its server talks to the database directly and doesn't use Supabase's Data API, Auth or Storage.
+
+1. **Connection string:** in the Supabase dashboard, click **Connect** and copy the **Session pooler** string (port 5432). It looks like `postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`. Add `?sslmode=require` to the end and put it in `.env` as `DATABASE_URL`. If the password has characters like `@`, `:`, `/` or `#`, URL-encode them or choose a password without them.
+   - Don't use the **Transaction pooler** (port 6543). It breaks the prepared statements the server uses and the notifications that close a banned user's connection straight away.
+   - The **Direct connection** (`db.<project-ref>.supabase.co`) also works, but only if your network supports IPv6.
+2. **Turn off the Data API:** in **Project Settings → Data API**, disable it, or remove `public` from the exposed schemas. Supabase otherwise offers every table in `public`, including `users`, through a web API whose key is public. Migration `0028` also locks those tables down, as a second layer.
+3. **Run the migrations and start the server** as below.
+
+Keep the tests on a separate database (local Docker, or a second Supabase project via `E2E_DATABASE_URL`): they create many throwaway accounts.
+
+---
+
 ## Run Database Migrations
 
 Run this from the repository root:
