@@ -41,6 +41,12 @@ pub async fn websocket_handler(
     })
 }
 
+// CodeQL flags the three log lines in this function ("connected", "Closing
+// WebSocket", "disconnected") as "cleartext logging of sensitive
+// information" because they interpolate `user_id`. False positive: `user_id`
+// is an opaque `Uuid`, not a credential, and `AccessDenied::message()`
+// (sessions.rs) returns only a fixed string or an admin-entered ban reason
+// -- never a secret value.
 async fn handle_socket_connection(
     socket: WebSocket,
     user_id: Uuid,

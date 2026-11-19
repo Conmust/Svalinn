@@ -185,6 +185,12 @@ pub async fn refresh(
             // An old token came back: assume it was stolen and end the session.
             revoke_family(&mut tx, family_id).await?;
             tx.commit().await.map_err(db_err)?;
+            // CodeQL flags this as "cleartext logging of sensitive
+            // information" because the message mentions a refresh token.
+            // False positive: only `user_id` and `family_id` (opaque
+            // `Uuid`s identifying *who*/*which session*, not secret
+            // material) are interpolated here. The actual refresh token
+            // value is never read into this log line.
             eprintln!("⚠️  Refresh token reused for user {user_id}; session {family_id} revoked");
         }
         // A ban revokes every session; say so rather than "session ended".
