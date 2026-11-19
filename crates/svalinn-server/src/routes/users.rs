@@ -93,11 +93,25 @@ pub async fn update_patron_tier(
     Ok(Json(PublicUser::from(user)))
 }
 
+/// PATCH /api/v1/admin/patron-tier — site owners only.
 pub async fn admin_update_patron_tier(
     State(db): State<Database>,
-    CurrentUser(_user_id): CurrentUser,
+    CurrentUser(user_id): CurrentUser,
     Json(payload): Json<AdminUpdatePatronRequest>,
 ) -> Result<Json<PublicUser>, AppError> {
+    let is_site_owner: bool = sqlx::query_scalar(
+        "SELECT COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if !is_site_owner {
+        return Err(AppError::Forbidden(
+            "Only site owners can change another user's patron tier".into(),
+        ));
+    }
+
     if !["free", "patron", "guild", "enterprise"].contains(&payload.patron_tier.as_str()) {
         return Err(AppError::BadRequest("Invalid patron tier".into()));
     }
@@ -329,4 +343,111 @@ pub async fn change_password(
     tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "other_sessions_ended": ended })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Connects to the same database the app uses in development (see
+    /// `.env`), matching `main.rs`'s own startup. Every test using this
+    /// shares that database with manual testing and every other test, so
+    /// each test must create its own uniquely-named data and never mutate
+    /// or assert on rows it didn't create itself.
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    /// Inserts a throwaway non-site-owner user with a randomly-generated
+    /// unique username/email, so concurrent/test runs never collide. The
+    /// password hash is a dummy value: these users never log in.
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    /// Like `create_test_user`, but sets `site_role = 'owner'` directly via
+    /// SQL (see migrations/0026_site_owner.sql), matching how
+    /// `svalinn-admin set-site-owner` promotes an account in production.
+    async fn create_test_site_owner(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name, site_role) VALUES ($1, $2, $3, $4, 'owner') RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test Owner {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test site owner")
+    }
+
+    /// Deletes a test user by id. Best-effort / happy-path only: called at
+    /// the end of each test's function body, so a panicking `assert!`
+    /// earlier in the test will skip it and leave that test's row behind.
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn non_site_owner_is_forbidden_from_admin_patron_tier() {
+        let db = test_db().await;
+        let caller = create_test_user(&db).await;
+        let target = create_test_user(&db).await;
+
+        let result = admin_update_patron_tier(
+            State(db.clone()),
+            CurrentUser(caller),
+            Json(AdminUpdatePatronRequest { user_id: target, patron_tier: "enterprise".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden for a non-site-owner caller, got {other:?}"),
+        }
+
+        let patron_tier: String =
+            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(target).fetch_one(&db.pool).await.expect("fetching target's patron_tier failed");
+        assert_eq!(patron_tier, "free", "a forbidden call must not change the target's patron tier");
+
+        cleanup_test_user(&db, caller).await;
+        cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn site_owner_can_update_another_users_patron_tier() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+        let target = create_test_user(&db).await;
+
+        let result = admin_update_patron_tier(
+            State(db.clone()),
+            CurrentUser(owner),
+            Json(AdminUpdatePatronRequest { user_id: target, patron_tier: "patron".into() }),
+        )
+        .await
+        .expect("a site owner should be able to update another user's patron tier");
+
+        assert_eq!(result.0.patron_tier, "patron");
+
+        let patron_tier: String =
+            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(target).fetch_one(&db.pool).await.expect("fetching target's patron_tier failed");
+        assert_eq!(patron_tier, "patron", "the database row should reflect the update");
+
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, target).await;
+    }
 }
