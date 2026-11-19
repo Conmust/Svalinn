@@ -15,6 +15,7 @@
     id: string;
     server_id: string;
     name: string;
+    channel_type: string;
     created_at: string;
     has_unread: boolean;
   }
@@ -24,6 +25,7 @@
   let showServerSettings = false;
   let showCreateChannelModal = false;
   let newChannelName = '';
+  let newChannelType = 'text';
   let createChannelError = '';
 
   // Admins and above can rename and delete channels.
@@ -152,10 +154,10 @@
     }
   }
 
-  function handleChannelClick(channelId: string) {
-    dispatch('channelSelected', channelId);
-    channels = channels.map(c => 
-      c.id === channelId ? { ...c, has_unread: false } : c
+  function handleChannelClick(channel: Channel) {
+    dispatch('channelSelected', channel);
+    channels = channels.map(c =>
+      c.id === channel.id ? { ...c, has_unread: false } : c
     );
   }
 
@@ -171,16 +173,17 @@
           'Content-Type': 'application/json',
           ...getAuthHeaders()
         },
-        body: JSON.stringify({ name: newChannelName.trim() }),
+        body: JSON.stringify({ name: newChannelName.trim(), channel_type: newChannelType }),
       });
 
       if (response.ok) {
         const newChannel = await response.json();
         if (!channels.some(c => c.id === newChannel.id)) channels = [...channels, newChannel];
         newChannelName = '';
+        newChannelType = 'text';
         showCreateChannelModal = false;
         // Optionally auto-select the new channel
-        dispatch('channelSelected', newChannel.id);
+        dispatch('channelSelected', newChannel);
       } else {
         const err = await response.json();
         createChannelError = err.error || 'Failed to create channel';
@@ -249,7 +252,7 @@
           type="button"
           class="w-full text-left px-3 py-2 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)]' : channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : ''} {canManageChannels ? 'pr-14' : ''}"
           aria-current={channel.id === activeChannel ? 'page' : undefined}
-          on:click={() => handleChannelClick(channel.id)}
+          on:click={() => handleChannelClick(channel)}
         >
           {#if channel.has_unread}
             <div class="w-2 h-2 bg-[#00ff00] rounded-full shadow-[0_0_8px_#00ff00] flex-shrink-0 animate-pulse"></div>
@@ -259,7 +262,7 @@
 
           <div class="flex-1 min-w-0">
             <div class="text-sm terminal-glow truncate {channel.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
-              # {channel.name}
+              {channel.channel_type === 'voice' ? '🔊' : '#'} {channel.name}
             </div>
           </div>
         </button>
@@ -316,11 +319,24 @@
               placeholder="e.g., general" required autofocus
             />
           </div>
+          <fieldset>
+            <legend class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Channel Type</legend>
+            <div class="flex gap-4">
+              <label class="flex items-center gap-1.5 text-sm text-[#00ff00]">
+                <input type="radio" name="new-channel-type" value="text" bind:group={newChannelType} />
+                # Text
+              </label>
+              <label class="flex items-center gap-1.5 text-sm text-[#00ff00]">
+                <input type="radio" name="new-channel-type" value="voice" bind:group={newChannelType} />
+                🔊 Voice
+              </label>
+            </div>
+          </fieldset>
           {#if createChannelError}
             <div class="text-xs text-red-500 terminal-glow">{'>'} {createChannelError}</div>
           {/if}
           <div class="flex gap-2 pt-2">
-            <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] hover:bg-[#00aa00]/10 transition-all text-sm" on:click={() => showCreateChannelModal = false}>Cancel</button>
+            <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] hover:bg-[#00aa00]/10 transition-all text-sm" on:click={() => { showCreateChannelModal = false; newChannelType = 'text'; }}>Cancel</button>
             <button type="submit" class="flex-1 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all text-sm terminal-glow">Create</button>
           </div>
         </form>
