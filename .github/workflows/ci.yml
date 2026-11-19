@@ -89,7 +89,19 @@ jobs:
       - name: Build the server
         run: cargo build -p svalinn-server --bins --locked
       - name: Install the test browser
-        run: pnpm --filter e2e exec playwright install --with-deps chromium
+        # apt installs for chromium's OS-level deps occasionally fail on transient
+        # Ubuntu-mirror outages (connection resets / unreachable routes on
+        # security.ubuntu.com); retry a few times with backoff before giving up.
+        run: |
+          for attempt in 1 2 3; do
+            if pnpm --filter e2e exec playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "Browser install attempt $attempt failed, retrying in 20s..."
+            sleep 20
+          done
+          echo "Browser install failed after 3 attempts" >&2
+          exit 1
       - name: Run tests
         run: pnpm test:e2e
       - name: Upload the test report
