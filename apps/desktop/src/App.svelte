@@ -5,6 +5,7 @@
   import { getCurrentUser, login, register, logout } from './lib/auth';
   import { deviceEncryptionReady, recoveryChoiceNeeded, recoveryCheckFailed, resetDeviceEncryptionSetup } from './lib/recovery';
   import ServerRail from './components/ServerRail.svelte';
+  import SvalinnGauge from './components/SvalinnGauge.svelte';
   import ChannelList from './components/ChannelList.svelte';
   import ChatArea from './components/ChatArea.svelte';
   import Roster from './components/Roster.svelte';
@@ -164,6 +165,7 @@
 {/if}
 
 {#if currentUser}
+  <SvalinnGauge />
   <div class="flex h-screen bg-black text-[#00ff00] overflow-hidden font-mono">
     <!-- 1. Server Rail -->
     <ServerRail
