@@ -56,8 +56,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Type check
         run: pnpm --filter desktop check
-      - name: Build
+      - name: Build frontend
         run: pnpm --filter desktop build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Tauri Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Build Tauri backend
+        run: cargo build -p svalinn-desktop --locked
 
   e2e:
     name: API and browser tests
