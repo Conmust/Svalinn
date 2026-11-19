@@ -11,6 +11,7 @@
 // devices.
 import sodium from 'libsodium-wrappers-sumo';
 import { registerDevice } from './devices';
+import { withTimeout, TimeoutError } from './timeout';
 
 const PUBLIC_KEY_STORAGE_KEY = 'svalinn_e2ee_public_key';
 const PRIVATE_KEY_STORAGE_KEY = 'svalinn_e2ee_private_key';
@@ -25,21 +26,106 @@ export interface DeviceKeypair {
   deviceId: string;
 }
 
-let readyPromise: Promise<void> | null = null;
-let keypairPromise: Promise<DeviceKeypair> | null = null;
+// --- Distinct, non-conflated failure modes --------------------------------
+//
+// Everything below used to end up as a bare `Error` (or wasn't caught at
+// all), which meant a genuine bug -- libsodium's WASM module never loading,
+// `localStorage` being unavailable, a device-registration request that
+// keeps failing -- looked, to a caller, exactly like any other rejected
+// promise. That's fine for "retry and move on" logic, but it's not enough
+// for UI that's supposed to tell a user (or a test) WHY encrypted messaging
+// isn't working right now. These classes exist so call sites can tell "the
+// crypto library itself is broken" apart from "this device couldn't be
+// registered" apart from "unexpected error", instead of guessing from a
+// free-text message.
 
-/** Resolves once libsodium's WASM module has finished loading. */
+/** The libsodium WASM module never finished loading (or threw while
+ * loading) -- e.g. a webview without real WASM support, a blocked/corrupt
+ * asset, or a CSP that forbids it. Nothing that depends on `sodium` can
+ * work at all until this is fixed; there is no key-specific recovery from
+ * it. */
+export class CryptoLibraryError extends Error {
+  constructor(message = 'The encryption library failed to load.') {
+    super(message);
+    this.name = 'CryptoLibraryError';
+  }
+}
+
+/** This device couldn't be prepared for encrypted messaging for a reason
+ * that has nothing to do with any particular key or passphrase -- e.g.
+ * `localStorage` is unavailable/full/disabled (private/incognito-like
+ * webview modes), or the device-registration request to the server kept
+ * failing. Distinct from `CryptoLibraryError`: the crypto library itself
+ * is fine, this device specifically just isn't set up. */
+export class DeviceSetupError extends Error {
+  constructor(message = 'This device could not be set up for encrypted messaging.') {
+    super(message);
+    this.name = 'DeviceSetupError';
+  }
+}
+
+/** How long we're willing to wait for libsodium's WASM module to finish
+ * initializing before giving up and surfacing `CryptoLibraryError`, rather
+ * than leaving every caller (device setup, recovery, every DM view) stuck
+ * on a promise that may simply never resolve. */
+const SODIUM_READY_TIMEOUT_MS = 8000;
+
+let readyPromise: Promise<void> | null = null;
+
+/** Resolves once libsodium's WASM module has finished loading, or rejects
+ * with `CryptoLibraryError` if it hasn't within `SODIUM_READY_TIMEOUT_MS`.
+ * A timeout here doesn't cancel the real `sodium.ready` -- if it later
+ * resolves on its own, the NEXT call to `ready()` (this promise is reset on
+ * failure) picks it up immediately instead of staying stuck forever. */
 function ready(): Promise<void> {
-  if (!readyPromise) readyPromise = sodium.ready;
+  if (!readyPromise) {
+    readyPromise = withTimeout(
+      sodium.ready,
+      SODIUM_READY_TIMEOUT_MS,
+      'The encryption library took too long to load.'
+    ).catch((err) => {
+      readyPromise = null;
+      throw err instanceof CryptoLibraryError
+        ? err
+        : new CryptoLibraryError(err instanceof TimeoutError ? err.message : undefined);
+    });
+  }
   return readyPromise;
 }
 
+/** `localStorage.setItem`/`.getItem` can throw synchronously -- full quota,
+ * disabled storage, or some private/incognito-like webview modes reject it
+ * outright. Checked once, up front, so a broken store surfaces as one clear
+ * `DeviceSetupError` instead of a confusing failure deep inside whichever
+ * `localStorage` call happened to run first. */
+let keypairPromise: Promise<DeviceKeypair> | null = null;
+
+function checkStorageAvailable(): void {
+  const probeKey = '__svalinn_storage_probe__';
+  try {
+    localStorage.setItem(probeKey, '1');
+    localStorage.removeItem(probeKey);
+  } catch {
+    throw new DeviceSetupError(
+      'This device cannot store an encryption key (local storage is unavailable, full, or disabled).'
+    );
+  }
+}
+
 function readStoredKeypair(): DeviceKeypair | null {
-  const publicKey = localStorage.getItem(PUBLIC_KEY_STORAGE_KEY);
-  const privateKey = localStorage.getItem(PRIVATE_KEY_STORAGE_KEY);
-  const deviceId = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
-  if (!publicKey || !privateKey || !deviceId) return null;
-  return { publicKey, privateKey, deviceId };
+  try {
+    const publicKey = localStorage.getItem(PUBLIC_KEY_STORAGE_KEY);
+    const privateKey = localStorage.getItem(PRIVATE_KEY_STORAGE_KEY);
+    const deviceId = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+    if (!publicKey || !privateKey || !deviceId) return null;
+    return { publicKey, privateKey, deviceId };
+  } catch {
+    // Treated as "nothing stored yet" here -- `ensureDeviceKeypair` always
+    // runs `checkStorageAvailable()` before it would try to persist a new
+    // key, so a genuinely broken store still surfaces as `DeviceSetupError`
+    // rather than silently regenerating a key every call.
+    return null;
+  }
 }
 
 /**
@@ -81,6 +167,12 @@ export function ensureDeviceKeypair(): Promise<DeviceKeypair> {
       const existing = readStoredKeypair();
       if (existing) return existing;
 
+      // Fail fast and clearly if this device simply can't persist a key at
+      // all, rather than generating one, registering it with the server,
+      // and only THEN discovering `localStorage.setItem` throws -- that
+      // would leave an orphaned registration server-side for no benefit.
+      checkStorageAvailable();
+
       await ready();
       const generated = sodium.crypto_box_keypair();
       const publicKey = sodium.to_base64(generated.publicKey, sodium.base64_variants.ORIGINAL);
@@ -89,11 +181,24 @@ export function ensureDeviceKeypair(): Promise<DeviceKeypair> {
       // Register before persisting locally: if registration fails, nothing
       // is written to localStorage, so the next call starts over instead of
       // treating this device as "set up" with a key/id the server never saw.
-      const deviceId = await registerDevice(publicKey, defaultDeviceLabel());
+      let deviceId: string;
+      try {
+        deviceId = await registerDevice(publicKey, defaultDeviceLabel());
+      } catch (err) {
+        throw new DeviceSetupError(
+          err instanceof Error ? `Failed to register this device: ${err.message}` : 'Failed to register this device.'
+        );
+      }
 
-      localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, publicKey);
-      localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, privateKey);
-      localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
+      try {
+        localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, publicKey);
+        localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, privateKey);
+        localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
+      } catch {
+        throw new DeviceSetupError(
+          'This device cannot store an encryption key (local storage is unavailable, full, or disabled).'
+        );
+      }
 
       return { publicKey, privateKey, deviceId };
     })().catch((err) => {
@@ -138,7 +243,11 @@ export function adoptRecoveredKeypair(keypair: DeviceKeypair): void {
  * other device's".
  */
 export function getMyDeviceId(): string | null {
-  return localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+  try {
+    return localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -190,15 +299,34 @@ export function decryptFromSender(
   otherPartyPublicKeyBase64: string,
   myPrivateKeyBase64: string
 ): string | null {
+  // Two genuinely different failure points, kept in separate try/catches
+  // purely so the console log can say which one actually happened --
+  // decoding four base64 strings should essentially never fail unless a
+  // `message_recipients` row (or this device's own stored key) is corrupt,
+  // whereas `crypto_box_open_easy` rejecting is the ordinary, expected
+  // "wrong key/tampered ciphertext" case. Both still resolve to the exact
+  // same `null` return (there's no safe way to show "corrupt" vs "wrong
+  // key" differently in a message bubble without leaking more than we
+  // should), so this changes nothing about behavior -- only about what
+  // shows up in the console when diagnosing a real bug.
+  let ciphertext: Uint8Array, nonce: Uint8Array, otherPartyPublicKey: Uint8Array, myPrivateKey: Uint8Array;
   try {
-    const ciphertext = sodium.from_base64(ciphertextBase64, sodium.base64_variants.ORIGINAL);
-    const nonce = sodium.from_base64(nonceBase64, sodium.base64_variants.ORIGINAL);
-    const otherPartyPublicKey = sodium.from_base64(otherPartyPublicKeyBase64, sodium.base64_variants.ORIGINAL);
-    const myPrivateKey = sodium.from_base64(myPrivateKeyBase64, sodium.base64_variants.ORIGINAL);
+    ciphertext = sodium.from_base64(ciphertextBase64, sodium.base64_variants.ORIGINAL);
+    nonce = sodium.from_base64(nonceBase64, sodium.base64_variants.ORIGINAL);
+    otherPartyPublicKey = sodium.from_base64(otherPartyPublicKeyBase64, sodium.base64_variants.ORIGINAL);
+    myPrivateKey = sodium.from_base64(myPrivateKeyBase64, sodium.base64_variants.ORIGINAL);
+  } catch (err) {
+    console.warn('Could not decode a DM for decryption (malformed base64 -- likely a corrupt row):', err);
+    return null;
+  }
 
+  try {
     const plaintextBytes = sodium.crypto_box_open_easy(ciphertext, nonce, otherPartyPublicKey, myPrivateKey);
     return sodium.to_string(plaintextBytes);
   } catch {
+    // Expected, ordinary failure: wrong key, tampered ciphertext, or wrong
+    // nonce. Not logged as an error -- this happens routinely for anyone's
+    // own non-matching history and isn't a sign of a bug.
     return null;
   }
 }

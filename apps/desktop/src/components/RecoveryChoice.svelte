@@ -10,7 +10,13 @@
   // unlike AccountSettings, this is a real fork in what the user gets, not
   // a dismissable settings panel, so it always resolves via one of the
   // two explicit buttons below.
-  import { restoreFromBackup, resolveRecoveryChoice, IncorrectPassphraseError } from '../lib/recovery';
+  import {
+    restoreFromBackup,
+    resolveRecoveryChoice,
+    retryRecoveryCheck,
+    recoveryCheckFailed,
+    IncorrectPassphraseError,
+  } from '../lib/recovery';
   import { ensureDeviceKeypair } from '../lib/crypto';
 
   let mode: 'choice' | 'recovering' = 'choice';
@@ -65,7 +71,21 @@
   <div class="relative w-[460px] max-w-[92vw] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-6 space-y-4">
     <h3 id="recovery-title" class="font-bold uppercase tracking-widest text-sm text-[#00ff00]">{'>'} Encrypted messaging on this device</h3>
 
-    {#if mode === 'choice'}
+    {#if $recoveryCheckFailed}
+      <p class="text-xs text-[#00aa00]">
+        We couldn't check whether this account has a recovery backup set up, so we can't safely decide for you
+        whether to restore an old key or start fresh. (This is usually a slow or dropped connection, not necessarily
+        a sign that anything is actually broken.)
+      </p>
+      <div class="text-xs text-red-500">{'>'} {$recoveryCheckFailed}</div>
+      <button type="button" class={primaryButton} on:click={retryRecoveryCheck} disabled={busy}>
+        Try again
+      </button>
+      <button type="button" class={secondaryButton} on:click={startFresh} disabled={busy}>
+        {busy ? 'Setting up...' : 'Start fresh with a new key instead'}
+      </button>
+      {#if error}<div class="text-xs text-red-500">{'>'} {error}</div>{/if}
+    {:else if mode === 'choice'}
       <p class="text-xs text-[#00aa00]">
         This account has a recovery backup set up. You can restore your old encryption key with your recovery
         passphrase (so your old encrypted direct messages stay readable), or start fresh with a brand new key

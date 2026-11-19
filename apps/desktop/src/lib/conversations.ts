@@ -1,5 +1,19 @@
 import { getAuthHeaders, apiFetch, apiBase } from './api';
 import { type UploadedFile } from './messages';
+import { withTimeout } from './timeout';
+
+// Bounds how long a conversation-messages fetch or send is willing to wait,
+// consistent with the other E2EE-adjacent network calls in `devices.ts`/
+// `recovery.ts` (which use 10s for comparably-sized device/participant-
+// device lookups) -- nothing in this subsystem should be able to hang the
+// UI indefinitely (see `DMChatArea.svelte`'s "Loading messages..."/sending
+// states, which otherwise had no bound at all). Message history pages can
+// carry up to `PAGE_SIZE` full message bodies (plus attachment metadata)
+// rather than the small, fixed-shape JSON a device lookup returns, so this
+// uses a somewhat longer bound than that 10s to leave headroom for a
+// slower connection to still succeed instead of being timed out for simply
+// fetching more data.
+const CONVERSATION_NETWORK_TIMEOUT_MS = 15_000;
 
 
 export interface Conversation {
@@ -108,9 +122,13 @@ export async function fetchConversationMessages(
   if (options.before) params.append('before', options.before);
   if (options.deviceId) params.append('device_id', options.deviceId);
 
-  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages?${params}`, {
-    headers: getAuthHeaders(),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages?${params}`, {
+      headers: getAuthHeaders(),
+    }),
+    CONVERSATION_NETWORK_TIMEOUT_MS,
+    'Timed out loading messages.'
+  );
 
   if (!response.ok) {
     throw new Error('Failed to fetch messages');
@@ -164,24 +182,28 @@ export async function sendDirectMessage(
 ): Promise<ConversationMessage> {
   const usingFanout = !!options.encryptedFor && options.encryptedFor.length > 0;
 
-  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({
-      conversation_id: conversationId,
-      content: usingFanout ? null : content,
-      attachment_url: attachment?.url || null,
-      attachment_filename: attachment?.filename || null,
-      attachment_size: attachment?.size || null,
-      attachment_mime_type: attachment?.mime_type || null,
-      is_encrypted: usingFanout ? false : (options.isEncrypted ?? false),
-      nonce: usingFanout ? null : (options.nonce ?? null),
-      encrypted_for: usingFanout
-        ? options.encryptedFor!.map((r) => ({ device_id: r.deviceId, ciphertext: r.ciphertext, nonce: r.nonce }))
-        : null,
-      sender_device_id: usingFanout ? options.senderDeviceId ?? null : null,
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        content: usingFanout ? null : content,
+        attachment_url: attachment?.url || null,
+        attachment_filename: attachment?.filename || null,
+        attachment_size: attachment?.size || null,
+        attachment_mime_type: attachment?.mime_type || null,
+        is_encrypted: usingFanout ? false : (options.isEncrypted ?? false),
+        nonce: usingFanout ? null : (options.nonce ?? null),
+        encrypted_for: usingFanout
+          ? options.encryptedFor!.map((r) => ({ device_id: r.deviceId, ciphertext: r.ciphertext, nonce: r.nonce }))
+          : null,
+        sender_device_id: usingFanout ? options.senderDeviceId ?? null : null,
+      }),
     }),
-  });
+    CONVERSATION_NETWORK_TIMEOUT_MS,
+    'Timed out sending message.'
+  );
 
   if (!response.ok) {
     let serverMessage: string | null = null;

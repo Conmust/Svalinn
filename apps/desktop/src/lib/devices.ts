@@ -3,6 +3,15 @@
 // participant devices before composing a fan-out send. Pairs with
 // `lib/crypto.ts`, which owns the actual keypair generation/storage.
 import { getAuthHeaders, apiFetch, apiBase } from './api';
+import { withTimeout } from './timeout';
+
+/** Every network call below feeds either the "can this device send
+ * encrypted DMs at all" gate or the devices settings UI -- neither should
+ * be able to hang forever on a dead connection. This bounds each one so a
+ * stuck request surfaces as a clear failure instead of an indefinite
+ * spinner (callers already treat any rejection here as "assume the worst,
+ * block sending" -- see `DMChatArea.svelte`'s `canSend`). */
+const DEVICE_NETWORK_TIMEOUT_MS = 10_000;
 
 /** One of the current user's own registered devices, as shown in the
  * devices settings UI. Never carries a public key -- the owning client
@@ -29,11 +38,15 @@ export interface ParticipantDevice {
  * Called once per device by `ensureDeviceKeypair` -- not meant to be
  * called directly elsewhere. */
 export async function registerDevice(publicKeyBase64: string, deviceLabel: string): Promise<string> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/devices`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ public_key: publicKeyBase64, device_label: deviceLabel }),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/users/me/devices`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ public_key: publicKeyBase64, device_label: deviceLabel }),
+    }),
+    DEVICE_NETWORK_TIMEOUT_MS,
+    'Timed out registering this device.'
+  );
   if (!response.ok) {
     throw new Error('Failed to register device');
   }
@@ -44,9 +57,13 @@ export async function registerDevice(publicKeyBase64: string, deviceLabel: strin
 /** Lists the current user's own registered devices, for the devices
  * settings UI. */
 export async function fetchMyDevices(): Promise<MyDevice[]> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/devices`, {
-    headers: getAuthHeaders(),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/users/me/devices`, {
+      headers: getAuthHeaders(),
+    }),
+    DEVICE_NETWORK_TIMEOUT_MS,
+    'Timed out fetching your devices.'
+  );
   if (!response.ok) {
     throw new Error('Failed to fetch devices');
   }
@@ -87,9 +104,13 @@ export async function removeDevice(deviceId: string): Promise<void> {
  * set up encrypted messaging on any device yet -- sending must be blocked
  * client-side rather than falling back to plaintext. */
 export async function fetchParticipantDevices(conversationId: string): Promise<ParticipantDevice[]> {
-  const response = await apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/participant-devices`, {
-    headers: getAuthHeaders(),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/conversations/${conversationId}/participant-devices`, {
+      headers: getAuthHeaders(),
+    }),
+    DEVICE_NETWORK_TIMEOUT_MS,
+    'Timed out fetching the other participant\'s devices.'
+  );
   if (!response.ok) {
     throw new Error('Failed to fetch participant devices');
   }

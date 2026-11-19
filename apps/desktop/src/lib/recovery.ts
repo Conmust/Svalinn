@@ -26,11 +26,50 @@ import sodium from 'libsodium-wrappers-sumo';
 import { writable, type Writable } from 'svelte/store';
 import { apiFetch, apiBase, getAuthHeaders } from './api';
 import { fetchMyDevices, registerDevice } from './devices';
-import { adoptRecoveredKeypair, ensureDeviceKeypair, hasLocalKeypair, type DeviceKeypair } from './crypto';
+import {
+  adoptRecoveredKeypair,
+  ensureDeviceKeypair,
+  hasLocalKeypair,
+  CryptoLibraryError,
+  type DeviceKeypair,
+} from './crypto';
+import { withTimeout, TimeoutError } from './timeout';
+
+/** Same bound as `lib/crypto.ts`'s own `ready()` -- this module loads
+ * `sodium` independently (it needs `crypto_pwhash`/`crypto_secretbox`,
+ * which `crypto.ts` never touches), so it needs the exact same "don't wait
+ * forever" guard rather than inheriting one from there. */
+const SODIUM_READY_TIMEOUT_MS = 8000;
+const KEY_BACKUP_NETWORK_TIMEOUT_MS = 10_000;
+
+/** Bound for the ONE network call that gates this device's first-ever
+ * keypair (`needsRecoveryChoice()`'s call to `fetchKeyBackup()`, via
+ * `runDeviceEncryptionSetup()` below) -- deliberately much more generous
+ * than `KEY_BACKUP_NETWORK_TIMEOUT_MS` (used for ordinary, foreground,
+ * user-initiated save/delete backup actions). A merely slow (not hung)
+ * server/connection must not be indistinguishable from a genuinely broken
+ * one here: unlike a save/delete click, THIS check's failure mode is "give
+ * up and silently generate an unrelated fresh key", permanently forfeiting
+ * the normal path back to a real backed-up key with no warning. Picking a
+ * bound this generous means a check that's merely slow -- even "just over
+ * the old 10s timeout" slow -- succeeds on the very first attempt, well
+ * before `runDeviceEncryptionSetup()`'s retry loop would ever give up. */
+const BACKUP_EXISTENCE_CHECK_TIMEOUT_MS = 20_000;
 
 let readyPromise: Promise<void> | null = null;
 function ready(): Promise<void> {
-  if (!readyPromise) readyPromise = sodium.ready;
+  if (!readyPromise) {
+    readyPromise = withTimeout(
+      sodium.ready,
+      SODIUM_READY_TIMEOUT_MS,
+      'The encryption library took too long to load.'
+    ).catch((err) => {
+      readyPromise = null;
+      throw err instanceof CryptoLibraryError
+        ? err
+        : new CryptoLibraryError(err instanceof TimeoutError ? err.message : undefined);
+    });
+  }
   return readyPromise;
 }
 
@@ -77,10 +116,14 @@ function deriveKey(passphrase: string, salt: Uint8Array, params: KdfParams): Uin
 /** Does the current account have a recovery backup set up at all? Used to
  * decide, on a device with no local keypair yet, whether to offer
  * recovery before generating a brand new key. */
-export async function fetchKeyBackup(): Promise<KeyBackupRecord | null> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
-    headers: getAuthHeaders(),
-  });
+export async function fetchKeyBackup(timeoutMs: number = KEY_BACKUP_NETWORK_TIMEOUT_MS): Promise<KeyBackupRecord | null> {
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
+      headers: getAuthHeaders(),
+    }),
+    timeoutMs,
+    'Timed out checking for an existing recovery backup.'
+  );
   if (response.status === 404) return null;
   if (!response.ok) {
     throw new Error('Failed to check for an existing recovery backup');
@@ -127,11 +170,15 @@ export async function createOrReplaceKeyBackup(
   const encryptedBlob = sodium.to_base64(combined, sodium.base64_variants.ORIGINAL);
   const saltBase64 = sodium.to_base64(salt, sodium.base64_variants.ORIGINAL);
 
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ encrypted_blob: encryptedBlob, salt: saltBase64, kdf_params: params }),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ encrypted_blob: encryptedBlob, salt: saltBase64, kdf_params: params }),
+    }),
+    KEY_BACKUP_NETWORK_TIMEOUT_MS,
+    'Timed out uploading the recovery backup.'
+  );
   if (!response.ok) {
     throw new Error('Failed to upload recovery backup');
   }
@@ -140,10 +187,14 @@ export async function createOrReplaceKeyBackup(
 /** Removes the account's recovery backup, e.g. because the user no longer
  * wants this recovery option enabled. */
 export async function deleteKeyBackup(): Promise<void> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
-    method: 'DELETE',
-    headers: getAuthHeaders(),
-  });
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/users/me/key-backup`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    }),
+    KEY_BACKUP_NETWORK_TIMEOUT_MS,
+    'Timed out removing the recovery backup.'
+  );
   if (!response.ok) {
     throw new Error('Failed to remove recovery backup');
   }
@@ -265,7 +316,11 @@ export async function restoreFromBackup(passphrase: string): Promise<DeviceKeypa
  */
 export async function needsRecoveryChoice(): Promise<boolean> {
   if (hasLocalKeypair()) return false;
-  const record = await fetchKeyBackup();
+  // Uses the generous `BACKUP_EXISTENCE_CHECK_TIMEOUT_MS` bound, not the
+  // shorter one `fetchKeyBackup()` defaults to for ordinary save/delete
+  // calls -- see that constant's comment for why this specific call needs
+  // more room before it's treated as failed.
+  const record = await fetchKeyBackup(BACKUP_EXISTENCE_CHECK_TIMEOUT_MS);
   return record !== null;
 }
 
@@ -299,6 +354,22 @@ export async function needsRecoveryChoice(): Promise<boolean> {
  * `resolveRecoveryChoice`. */
 export const recoveryChoiceNeeded: Writable<boolean> = writable(false);
 
+/** Non-null while this device has no local keypair AND the backup-existence
+ * check (`needsRecoveryChoice()`) has failed `MAX_BACKUP_CHECK_ATTEMPTS`
+ * times in a row WITHOUT ever determining whether the account has a
+ * backup -- i.e. every attempt was a timeout or network error, never a
+ * clean "no backup exists" (that's reported as an ordinary `false`, not an
+ * error -- see `needsRecoveryChoice()`). This is "couldn't determine",
+ * which must never be treated the same as "confirmed no backup" -- doing
+ * so would silently and permanently forfeit this device's only path back
+ * to a real backed-up key, with no indication anything was skipped. Holds
+ * a user-facing message describing the failure; `App.svelte` shows
+ * `RecoveryChoice.svelte`'s explicit "couldn't check" screen whenever this
+ * is set, exactly like it does for `recoveryChoiceNeeded`, so the
+ * recover-vs-fresh choice is always made knowingly by the user, never by a
+ * transient failure on their behalf. */
+export const recoveryCheckFailed: Writable<string | null> = writable(null);
+
 /** The current value of this device's keypair, kept in sync with
  * `deviceReadyPromise` below -- `null` until that promise first settles.
  * Existing in addition to (not instead of) `deviceEncryptionReady()`
@@ -315,10 +386,14 @@ let deviceReadyPromise: Promise<DeviceKeypair> | null = null;
 let resolveReady: ((kp: DeviceKeypair) => void) | null = null;
 let rejectReady: ((err: unknown) => void) | null = null;
 
-/** Maximum number of times to retry the backup-existence check after a
- * transient error (e.g. a dropped network request) before falling back to
- * just generating a fresh key, so a genuine error never leaves the device
- * permanently stuck with no keypair (see non-blocking issue #1). */
+/** Maximum number of times to retry the backup-existence check after an
+ * AMBIGUOUS failure (a timeout, or an ordinary network error -- never
+ * resolved to a clean yes/no) before giving up and surfacing
+ * `recoveryCheckFailed` instead of silently guessing. Paired with
+ * `BACKUP_EXISTENCE_CHECK_TIMEOUT_MS` being generous enough that a merely
+ * slow (not hung) check already succeeds on the FIRST attempt, this retry
+ * loop mainly exists for a check that fails fast and repeatedly (e.g. no
+ * network at all), not for one that's just slow. */
 const MAX_BACKUP_CHECK_ATTEMPTS = 3;
 
 /** Settles `deviceReadyPromise` (if a resolver is still waiting) and
@@ -330,31 +405,61 @@ function settleDeviceReady(keypair: DeviceKeypair): void {
 }
 
 async function runDeviceEncryptionSetup(attempt = 1): Promise<void> {
+  // Step 1: does this device need to ask the user to choose? This is the
+  // ONLY part that's retried -- it's the part that can fail AMBIGUOUSLY
+  // (a timeout or network error never tells us whether a backup exists).
+  // Kept in its own try/catch, separate from the `ensureDeviceKeypair()`
+  // call below, so a real failure from THAT (a broken crypto library, a
+  // broken device registration -- see should-fix #1) is never misdiagnosed
+  // as a backup-check problem and retried under this schedule for no
+  // reason.
+  let needsChoice: boolean;
   try {
-    if (!(await needsRecoveryChoice())) {
-      settleDeviceReady(await ensureDeviceKeypair());
-      return;
-    }
-    recoveryChoiceNeeded.set(true);
-    // Deliberately leaves `deviceReadyPromise` pending here -- it's resolved
-    // later by `resolveRecoveryChoice()`, once the user has made their
-    // choice in `RecoveryChoice.svelte`.
+    needsChoice = await needsRecoveryChoice();
   } catch (e) {
     console.error('Failed to check for an existing recovery backup:', e);
     if (attempt < MAX_BACKUP_CHECK_ATTEMPTS) {
       setTimeout(() => void runDeviceEncryptionSetup(attempt + 1), 1000 * attempt);
       return;
     }
-    // Out of retries on a genuine error (as opposed to "no backup exists",
-    // which `needsRecoveryChoice()` reports as a normal `false`, not an
-    // error): fail toward the safe default of just generating a fresh key,
-    // same as the no-backup case, rather than leaving the device stuck
-    // with no key and no message-sending capability until a full reload.
-    try {
-      settleDeviceReady(await ensureDeviceKeypair());
-    } catch (err) {
-      rejectReady?.(err);
-    }
+    // Out of retries WITHOUT ever confirming whether a backup exists --
+    // this is "couldn't determine", never "confirmed no backup" (that's
+    // `needsRecoveryChoice()` returning a clean `false`, handled below,
+    // not landing here at all). Silently falling back to generating an
+    // unrelated fresh key here would permanently and invisibly forfeit
+    // this device's only path back to a real backed-up key -- exactly the
+    // blocking bug this guards against. Surface an explicit, actionable
+    // error instead and leave `deviceReadyPromise` pending: the user
+    // decides, via `RecoveryChoice.svelte`'s "couldn't check" screen,
+    // whether to retry (`retryRecoveryCheck()`) or knowingly start fresh.
+    recoveryCheckFailed.set(
+      e instanceof TimeoutError
+        ? e.message
+        : e instanceof Error
+          ? e.message
+          : 'Could not check for an existing recovery backup.'
+    );
+    return;
+  }
+
+  if (needsChoice) {
+    recoveryChoiceNeeded.set(true);
+    // Deliberately leaves `deviceReadyPromise` pending here -- it's resolved
+    // later by `resolveRecoveryChoice()`, once the user has made their
+    // choice in `RecoveryChoice.svelte`.
+    return;
+  }
+
+  // No backup exists (a clean, confirmed "no" -- not an ambiguous
+  // failure): safe to generate a fresh key with no prompt, same as always.
+  // NOT wrapped in the backup-check's retry logic above: a real failure
+  // here (`CryptoLibraryError`/`DeviceSetupError`) is a non-transient bug
+  // that retrying under THAT schedule would only delay surfacing, with a
+  // misleading "recovery backup" console message to boot (should-fix #1).
+  try {
+    settleDeviceReady(await ensureDeviceKeypair());
+  } catch (err) {
+    rejectReady?.(err);
   }
 }
 
@@ -384,7 +489,21 @@ export function deviceEncryptionReady(): Promise<DeviceKeypair> {
  * modal flag. */
 export function resolveRecoveryChoice(keypair: DeviceKeypair): void {
   recoveryChoiceNeeded.set(false);
+  recoveryCheckFailed.set(null);
   settleDeviceReady(keypair);
+}
+
+/** Called by `RecoveryChoice.svelte`'s "couldn't check" screen when the
+ * user chooses to retry the backup-existence check rather than start
+ * fresh. `deviceReadyPromise` is still pending at this point (the failure
+ * path above never rejects or resolves it), so this just clears the error
+ * and re-runs the check from attempt 1 -- any of `App.svelte`,
+ * `DMChatArea.svelte`, or `AccountSettings.svelte` already awaiting
+ * `deviceEncryptionReady()` keep waiting on the exact same promise and
+ * pick up whatever this new attempt resolves to. */
+export function retryRecoveryCheck(): void {
+  recoveryCheckFailed.set(null);
+  void runDeviceEncryptionSetup();
 }
 
 /**
@@ -413,6 +532,7 @@ export function resolveRecoveryChoice(keypair: DeviceKeypair): void {
  */
 export function replaceActiveKeypair(keypair: DeviceKeypair): void {
   recoveryChoiceNeeded.set(false);
+  recoveryCheckFailed.set(null);
   resolveReady?.(keypair);
   resolveReady = null;
   rejectReady = null;
@@ -428,5 +548,6 @@ export function resetDeviceEncryptionSetup(): void {
   resolveReady = null;
   rejectReady = null;
   recoveryChoiceNeeded.set(false);
+  recoveryCheckFailed.set(null);
   activeDeviceKeypair.set(null);
 }
