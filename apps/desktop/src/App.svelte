@@ -3,11 +3,13 @@
   import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
   import { getCurrentUser, login, register, logout } from './lib/auth';
+  import { deviceEncryptionReady, recoveryChoiceNeeded, resetDeviceEncryptionSetup } from './lib/recovery';
   import ServerRail from './components/ServerRail.svelte';
   import ChannelList from './components/ChannelList.svelte';
   import ChatArea from './components/ChatArea.svelte';
   import Roster from './components/Roster.svelte';
   import AccountSettings from './components/AccountSettings.svelte';
+  import RecoveryChoice from './components/RecoveryChoice.svelte';
   import DMList from './components/DMList.svelte';
   import DMChatArea from './components/DMChatArea.svelte';
   import type { Conversation } from './lib/conversations';
@@ -23,6 +25,24 @@
   // Stay connected whenever logged in, whatever is on screen, so live
   // updates and a ban or revoked session reach the app straight away.
   $: if (currentUser) wsClient.connect();
+
+  // Make sure this device has an E2EE keypair (generating and uploading one
+  // on first use) as soon as we're logged in, so it's ready before the user
+  // opens a DM. Reactive rather than onMount so it also runs right after
+  // login/register, not just on page load while already logged in.
+  //
+  // All of the actual decision logic -- including the recovery-backup
+  // check and the single shared promise that keeps `DMChatArea.svelte` and
+  // `AccountSettings.svelte` from racing ahead and creating a throwaway key
+  // of their own -- lives in `deviceEncryptionReady()` (see
+  // `lib/recovery.ts`). This effect just kicks it off once per login;
+  // `recoveryChoiceNeeded` (a store, also from `lib/recovery.ts`) drives
+  // whether the unskippable `RecoveryChoice` modal below is shown.
+  let checkedEncryptionSetup = false;
+  $: if (currentUser && !checkedEncryptionSetup) {
+    checkedEncryptionSetup = true;
+    deviceEncryptionReady().catch((e) => console.error('Failed to set up encryption keys:', e));
+  }
 
   // Short message at the top of the screen, e.g. "You were kicked from X".
   let notice = '';
@@ -95,6 +115,8 @@
     activeServer = null;
     activeChannel = null;
     activeConversation = null;
+    checkedEncryptionSetup = false;
+    resetDeviceEncryptionSetup();
   }
 
   async function handleAuthSubmit(e: Event) {
@@ -139,6 +161,9 @@
     />
     {#if showAccountSettings}
       <AccountSettings on:close={() => (showAccountSettings = false)} />
+    {/if}
+    {#if $recoveryChoiceNeeded}
+      <RecoveryChoice />
     {/if}
     
     <!-- 2. Channel List (Only show if a server is selected) -->
@@ -188,6 +213,7 @@
         <DMChatArea
           conversationId={activeConversation.id}
           participantUsername={activeConversation.participant_username}
+          participantPublicKey={activeConversation.participant_public_key}
           {currentUser}
         />
       {:else}

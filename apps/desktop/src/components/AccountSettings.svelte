@@ -2,12 +2,220 @@
   import { createEventDispatcher, onMount } from 'svelte';
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
+  import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
+  import { getMyDeviceId } from '../lib/crypto';
+  import { deviceEncryptionReady, replaceActiveKeypair, restoreFromBackup, IncorrectPassphraseError } from '../lib/recovery';
+  import { fetchKeyBackup, createOrReplaceKeyBackup, deleteKeyBackup, type KeyBackupRecord } from '../lib/recovery';
 
   const dispatch = createEventDispatcher();
 
   let username = '';
   let email = '';
   let isSiteOwner = false;
+
+  // Devices (per-device E2EE keys)
+  let devices: MyDevice[] = [];
+  let devicesError = '';
+  let devicesBusy = false;
+  let renamingDeviceId: string | null = null;
+  let renameLabel = '';
+  let thisDeviceId = getMyDeviceId();
+
+  async function loadDevices() {
+    devicesError = '';
+    try {
+      devices = await fetchMyDevices();
+    } catch (err: any) {
+      devicesError = err.message || 'Failed to load devices';
+    }
+  }
+
+  function startRename(device: MyDevice) {
+    renamingDeviceId = device.id;
+    renameLabel = device.device_label;
+  }
+
+  async function confirmRename() {
+    if (!renamingDeviceId) return;
+    devicesBusy = true;
+    try {
+      const updated = await renameDevice(renamingDeviceId, renameLabel.trim() || 'Unnamed device');
+      devices = devices.map(d => (d.id === updated.id ? updated : d));
+      renamingDeviceId = null;
+    } catch (err: any) {
+      devicesError = err.message || 'Failed to rename device';
+    } finally {
+      devicesBusy = false;
+    }
+  }
+
+  async function handleRemoveDevice(device: MyDevice) {
+    const isThisDevice = device.id === thisDeviceId;
+    const warning = isThisDevice
+      ? 'This is the device you are using right now. Removing it means THIS device will no longer be able to read any new encrypted messages until you set it up again. Continue?'
+      : `Remove "${device.device_label}"? Any messages already sent to it will become permanently unreadable on it.`;
+    if (!confirm(warning)) return;
+
+    devicesBusy = true;
+    try {
+      await removeDevice(device.id);
+      devices = devices.filter(d => d.id !== device.id);
+    } catch (err: any) {
+      devicesError = err.message || 'Failed to remove device';
+    } finally {
+      devicesBusy = false;
+    }
+  }
+
+  // Account recovery (passphrase-encrypted backup of this device's key)
+  let keyBackup: KeyBackupRecord | null = null;
+  let recoveryLoading = true;
+  let recoveryError = '';
+  let recoveryMessage = '';
+  let recoveryBusy = false;
+  // Shows the set-up/change-passphrase form; false just shows the current
+  // status + action buttons.
+  let showRecoveryForm = false;
+  let recoveryPassphrase = '';
+  let recoveryPassphraseConfirm = '';
+
+  async function loadKeyBackup() {
+    recoveryError = '';
+    recoveryLoading = true;
+    try {
+      keyBackup = await fetchKeyBackup();
+    } catch (err: any) {
+      recoveryError = err.message || 'Failed to check recovery backup status';
+    } finally {
+      recoveryLoading = false;
+    }
+  }
+
+  function openRecoveryForm() {
+    recoveryError = '';
+    recoveryMessage = '';
+    recoveryPassphrase = '';
+    recoveryPassphraseConfirm = '';
+    showRecoveryForm = true;
+  }
+
+  async function confirmRecoverySetup() {
+    recoveryError = '';
+    recoveryMessage = '';
+    if (recoveryPassphrase.length < 8) {
+      recoveryError = 'Choose a passphrase of at least 8 characters.';
+      return;
+    }
+    if (recoveryPassphrase !== recoveryPassphraseConfirm) {
+      recoveryError = "The passphrases don't match.";
+      return;
+    }
+    if (!confirm(
+      "If you forget this passphrase, there is NO way to recover it or the backup it protects -- " +
+      "not even Svalinn's server operators can help. Continue?"
+    )) {
+      return;
+    }
+
+    recoveryBusy = true;
+    try {
+      // Guarantees this device has a keypair before backing it up -- goes
+      // through the same shared gate as `App.svelte`/`DMChatArea.svelte`
+      // (see `lib/recovery.ts`) rather than `ensureDeviceKeypair()`
+      // directly, so opening Account Settings can't race ahead of an
+      // in-flight recovery-backup check either. A no-op if a keypair
+      // already exists.
+      const kp = await deviceEncryptionReady();
+      await createOrReplaceKeyBackup(recoveryPassphrase, kp.publicKey, kp.privateKey, kp.deviceId);
+      recoveryPassphrase = '';
+      recoveryPassphraseConfirm = '';
+      showRecoveryForm = false;
+      recoveryMessage = 'Recovery backup saved.';
+      await loadKeyBackup();
+    } catch (err: any) {
+      recoveryError = err.message || 'Failed to save recovery backup';
+    } finally {
+      recoveryBusy = false;
+    }
+  }
+
+  async function handleRemoveBackup() {
+    if (!confirm('Remove your recovery backup? If you lose every device after this, old encrypted messages will never be recoverable.')) return;
+    recoveryBusy = true;
+    recoveryError = '';
+    recoveryMessage = '';
+    try {
+      await deleteKeyBackup();
+      keyBackup = null;
+      recoveryMessage = 'Recovery backup removed.';
+    } catch (err: any) {
+      recoveryError = err.message || 'Failed to remove recovery backup';
+    } finally {
+      recoveryBusy = false;
+    }
+  }
+
+  // Manual "recover from backup" escape hatch. Unlike `RecoveryChoice.svelte`
+  // (which only ever appears once, before THIS device has any local key at
+  // all -- see `needsRecoveryChoice()` in `lib/recovery.ts`, which
+  // short-circuits to false forever once a local keypair exists, even a
+  // throwaway one generated by the retry-then-fallback path after a
+  // transient network error), this button stays available any time the
+  // account has a server-side backup, REGARDLESS of whether this device
+  // already has its own local key -- it's the only way back to the real
+  // backed-up key if that short-circuit already fired on this device.
+  let showRecoverForm = false;
+  let recoverPassphrase = '';
+  let recoverBusy = false;
+  let recoverError = '';
+  let recoverMessage = '';
+
+  function openRecoverForm() {
+    recoverError = '';
+    recoverMessage = '';
+    recoverPassphrase = '';
+    showRecoverForm = true;
+  }
+
+  async function confirmRecoverFromBackup() {
+    recoverError = '';
+    if (!recoverPassphrase) return;
+    // Same stakes as `RecoveryChoice.svelte`'s choice screen, but phrased
+    // for the fact that THIS device may already have its own key in active
+    // use -- that current key is about to be replaced, not merely created.
+    if (!confirm(
+      "This will REPLACE this device's current encryption key with the one recovered from your backup. " +
+      "Going forward, this device will send and receive encrypted messages under the recovered key instead -- " +
+      "this device's current key (and anything that still relies on it) is left behind. Continue?"
+    )) {
+      return;
+    }
+
+    recoverBusy = true;
+    try {
+      const keypair = await restoreFromBackup(recoverPassphrase);
+      // `restoreFromBackup()` only updates `localStorage` and `crypto.ts`'s
+      // own keypair cache -- it has no idea that `deviceEncryptionReady()`'s
+      // shared gate (in `lib/recovery.ts`) already handed the OLD keypair
+      // out to things like an open `DMChatArea.svelte`. Without this call,
+      // this device would keep silently encrypting/sending under the
+      // stale, abandoned key for the rest of the session even though this
+      // panel and `localStorage` both correctly show the recovered
+      // identity. This makes every current and future
+      // `deviceEncryptionReady()` consumer pick up the recovered key
+      // immediately, with no reload required.
+      replaceActiveKeypair(keypair);
+      recoverPassphrase = '';
+      showRecoverForm = false;
+      recoverMessage = 'Key recovered from backup -- this device now uses the recovered key.';
+      thisDeviceId = keypair.deviceId;
+      await loadDevices();
+    } catch (err: any) {
+      recoverError = err instanceof IncorrectPassphraseError ? err.message : (err.message || 'Failed to recover from backup');
+    } finally {
+      recoverBusy = false;
+    }
+  }
 
   // Change email
   let newEmail = '';
@@ -32,6 +240,8 @@
       email = account.email;
       isSiteOwner = account.is_site_owner;
     }
+    await loadDevices();
+    await loadKeyBackup();
   });
 
   async function errorFrom(res: Response, fallback: string): Promise<string> {
@@ -152,6 +362,136 @@
         {#if passwordMessage}<div class="text-xs text-[#00ff00]">{'>'} {passwordMessage}</div>{/if}
         <button type="submit" class={submit} disabled={passwordBusy}>{passwordBusy ? 'Saving...' : 'Change password'}</button>
       </form>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Encrypted messaging devices</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          Each device you've used for encrypted messages keeps its own key -- a private key never leaves the device
+          it was created on. Removing a device means messages already sent to it can never be read on it again.
+        </p>
+        {#if devicesError}<div class="text-xs text-red-500">{'>'} {devicesError}</div>{/if}
+        {#if devices.length === 0}
+          <div class="text-xs text-[#00aa00]">{'>'} No devices registered yet.</div>
+        {:else}
+          <ul class="space-y-2">
+            {#each devices as device (device.id)}
+              <li class="flex items-center justify-between gap-2 border border-[#00aa00] px-3 py-2">
+                {#if renamingDeviceId === device.id}
+                  <input
+                    bind:value={renameLabel}
+                    class={input}
+                    style="flex: 1"
+                    on:keydown={(e) => e.key === 'Enter' && confirmRename()}
+                  />
+                  <button type="button" class="text-xs text-[#00ff00] underline" on:click={confirmRename} disabled={devicesBusy}>Save</button>
+                  <button type="button" class="text-xs text-[#00aa00] underline" on:click={() => (renamingDeviceId = null)}>Cancel</button>
+                {:else}
+                  <div class="flex-1 min-w-0">
+                    <div class="text-sm text-[#00ff00] truncate">
+                      {device.device_label}
+                      {#if device.id === thisDeviceId}<span class="text-[10px] text-[#ffaa00]"> (this device)</span>{/if}
+                    </div>
+                    <div class="text-[10px] text-[#00aa00]">Added {new Date(device.created_at).toLocaleDateString()}</div>
+                  </div>
+                  <button type="button" class="text-xs text-[#00ff00] underline" on:click={() => startRename(device)} disabled={devicesBusy}>Rename</button>
+                  <button type="button" class="text-xs text-red-500 underline" on:click={() => handleRemoveDevice(device)} disabled={devicesBusy}>Remove</button>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Account recovery</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          Optional: back up this device's encryption key under a passphrase, so a brand new device can recover it
+          later and still read your old encrypted direct messages. Without this, losing every device means old
+          encrypted history is gone for good -- that stays true unless you set this up.
+        </p>
+
+        {#if recoveryError}<div class="text-xs text-red-500">{'>'} {recoveryError}</div>{/if}
+        {#if recoveryMessage}<div class="text-xs text-[#00ff00]">{'>'} {recoveryMessage}</div>{/if}
+
+        {#if recoveryLoading}
+          <div class="text-xs text-[#00aa00]">{'>'} Checking...</div>
+        {:else if showRecoveryForm}
+          <div class="space-y-3 border border-[#00aa00] p-3">
+            <p class="text-[11px] text-[#ffaa00]">
+              There is no way to recover this passphrase if you forget it -- write it down somewhere safe.
+            </p>
+            <div>
+              <label for="recovery-new-passphrase" class={label}>Recovery passphrase</label>
+              <input id="recovery-new-passphrase" type="password" bind:value={recoveryPassphrase} class={input} autocomplete="off" minlength="8" />
+            </div>
+            <div>
+              <label for="recovery-confirm-passphrase" class={label}>Confirm passphrase</label>
+              <input id="recovery-confirm-passphrase" type="password" bind:value={recoveryPassphraseConfirm} class={input} autocomplete="off" minlength="8" />
+            </div>
+            <div class="flex gap-2">
+              <button type="button" class={submit} on:click={confirmRecoverySetup} disabled={recoveryBusy}>
+                {recoveryBusy ? 'Saving...' : 'Save recovery backup'}
+              </button>
+              <button type="button" class="text-xs text-[#00aa00] underline" on:click={() => (showRecoveryForm = false)} disabled={recoveryBusy}>Cancel</button>
+            </div>
+          </div>
+        {:else if keyBackup}
+          <div class="flex items-center justify-between gap-2 border border-[#00aa00] px-3 py-2">
+            <div class="text-xs text-[#00ff00]">
+              {'>'} Recovery backup is set up.
+              <div class="text-[10px] text-[#00aa00]">Last updated {new Date(keyBackup.updated_at).toLocaleDateString()}</div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <button type="button" class="text-xs text-[#00ff00] underline" on:click={openRecoveryForm} disabled={recoveryBusy}>Change passphrase</button>
+              <button type="button" class="text-xs text-red-500 underline" on:click={handleRemoveBackup} disabled={recoveryBusy}>Remove</button>
+            </div>
+          </div>
+        {:else}
+          <div class="text-xs text-[#00aa00]">{'>'} No recovery backup set up yet.</div>
+          <button type="button" class={submit} on:click={openRecoveryForm} disabled={recoveryBusy}>Set up a recovery passphrase</button>
+        {/if}
+
+        {#if !recoveryLoading && keyBackup && !showRecoveryForm}
+          {#if showRecoverForm}
+            <div class="space-y-3 border border-[#ffaa00] p-3">
+              <p class="text-[11px] text-[#ffaa00]">
+                This replaces THIS device's current encryption key with the one recovered from the backup. Enter the
+                recovery passphrase.
+              </p>
+              <div>
+                <label for="recover-passphrase" class={label}>Recovery passphrase</label>
+                <input
+                  id="recover-passphrase"
+                  type="password"
+                  bind:value={recoverPassphrase}
+                  class={input}
+                  autocomplete="off"
+                  on:keydown={(e) => e.key === 'Enter' && confirmRecoverFromBackup()}
+                />
+              </div>
+              {#if recoverError}<div class="text-xs text-red-500">{'>'} {recoverError}</div>{/if}
+              <div class="flex gap-2">
+                <button type="button" class={submit} on:click={confirmRecoverFromBackup} disabled={recoverBusy || !recoverPassphrase}>
+                  {recoverBusy ? 'Recovering...' : 'Recover my key'}
+                </button>
+                <button type="button" class="text-xs text-[#00aa00] underline" on:click={() => (showRecoverForm = false)} disabled={recoverBusy}>Cancel</button>
+              </div>
+            </div>
+          {:else}
+            <div>
+              <button type="button" class="text-xs text-[#00ff00] underline" on:click={openRecoverForm} disabled={recoveryBusy || recoverBusy}>
+                Recover from backup
+              </button>
+              <p class="text-[10px] text-[#00aa00] mt-1">
+                Restore this account's backed-up key onto THIS device, replacing its current key. Use this if this
+                device ended up with the wrong key (e.g. a fresh one was generated after a network error) even
+                though a backup already exists.
+              </p>
+            </div>
+          {/if}
+          {#if recoverMessage}<div class="text-xs text-[#00ff00]">{'>'} {recoverMessage}</div>{/if}
+        {/if}
+      </section>
     </div>
   </div>
 </div>

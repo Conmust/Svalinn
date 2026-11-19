@@ -107,6 +107,21 @@ async fn main() {
         .route("/api/v1/users", get(routes::users::get_all_users))
         .route("/api/v1/users/me", get(routes::users::get_current_user))
         .route("/api/v1/users/me/status", patch(routes::users::update_status))
+        .route("/api/v1/users/me/public-key", patch(routes::users::update_public_key))
+        .route(
+            "/api/v1/users/me/devices",
+            get(routes::devices::list_my_devices).post(routes::devices::register_device),
+        )
+        .route(
+            "/api/v1/users/me/devices/:device_id",
+            patch(routes::devices::rename_device).delete(routes::devices::delete_device),
+        )
+        .route(
+            "/api/v1/users/me/key-backup",
+            get(routes::users::get_key_backup)
+                .put(routes::users::put_key_backup)
+                .delete(routes::users::delete_key_backup),
+        )
         .route("/api/v1/users/me/account", get(routes::users::get_account))
         .route("/api/v1/users/me/email", patch(routes::users::change_email))
         .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
@@ -161,6 +176,10 @@ async fn main() {
         .route(
             "/api/v1/conversations/:conversation_id/messages",
             get(routes::conversations::get_conversation_messages).post(routes::conversations::send_conversation_message),
+        )
+        .route(
+            "/api/v1/conversations/:conversation_id/participant-devices",
+            get(routes::conversations::get_participant_devices),
         )
 
         // --- Emoji Routes ---

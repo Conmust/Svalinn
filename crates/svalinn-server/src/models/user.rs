@@ -15,6 +15,11 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub patron_tier: String,
     pub bio: Option<String>,
+    /// Base64-encoded X25519 public key for this user's (single) device, used
+    /// for end-to-end encrypting direct messages. NULL until the user has
+    /// logged in on an E2EE-aware client -- the normal state for most
+    /// existing accounts.
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,6 +30,7 @@ pub struct PublicUser {
     pub status: String,
     pub patron_tier: String,
     pub bio: Option<String>,
+    pub public_key: Option<String>,
 }
 
 impl From<User> for PublicUser {
@@ -36,6 +42,7 @@ impl From<User> for PublicUser {
             status: user.status,
             patron_tier: user.patron_tier,
             bio: user.bio,
+            public_key: user.public_key,
         }
     }
 }
