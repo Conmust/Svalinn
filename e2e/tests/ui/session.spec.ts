@@ -23,7 +23,7 @@ test('register from the login screen, with server address checks', async ({ page
   await page.getByLabel('Email').fill(`${name}@example.test`);
   await page.getByLabel('Password').fill('secret123');
   await page.getByRole('button', { name: 'Register' }).click();
-  await expect(page.getByText('Direct Messages (Coming Soon)')).toBeVisible();
+  await expect(page.getByText('Select a conversation to start chatting')).toBeVisible();
   expect(await page.evaluate(() => localStorage.getItem('refresh_token'))).toMatch(/^[0-9a-f]{64}$/);
 });
 

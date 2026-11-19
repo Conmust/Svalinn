@@ -34,7 +34,7 @@ pub async fn get_all_users(
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     let users: Vec<User> = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
         FROM users
         WHERE banned_at IS NULL
         ORDER BY username ASC
@@ -54,7 +54,7 @@ pub async fn get_current_user(
 ) -> Result<Json<PublicUser>, AppError> {
     let user: User = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
         FROM users
         WHERE id = $1
         "#,
@@ -81,7 +81,7 @@ pub async fn update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
         "#,
     )
     .bind(&payload.patron_tier)
@@ -121,7 +121,7 @@ pub async fn admin_update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
         "#,
     )
     .bind(&payload.patron_tier)
@@ -150,7 +150,7 @@ pub async fn update_status(
         UPDATE users
         SET status = $1, is_online = $2, last_activity = CURRENT_TIMESTAMP
         WHERE id = $3
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
         "#,
     )
     .bind(&payload.status)
@@ -162,6 +162,58 @@ pub async fn update_status(
 
     let visible = if is_online { payload.status.as_str() } else { "offline" };
     crate::presence::broadcast_status(&db, user_id, visible).await;
+
+    Ok(Json(PublicUser::from(user)))
+}
+
+/// Decoded length of a valid X25519 public key, in bytes.
+const PUBLIC_KEY_BYTES: usize = 32;
+
+#[derive(Deserialize)]
+pub struct UpdatePublicKeyRequest {
+    pub public_key: String,
+}
+
+/// PATCH /api/v1/users/me/public-key
+///
+/// Sets (overwriting any existing value) the base64-encoded X25519 public
+/// key for the current user's device, used for end-to-end encrypting direct
+/// messages. The server only ever stores/relays this public key -- it never
+/// sees the matching private key.
+///
+/// Single-device model: uploading a new key replaces the old one outright.
+/// There's no multi-device key management here (e.g. keeping multiple
+/// devices' keys, or letting a device trust another device's key) -- that's
+/// out of scope for this pass.
+pub async fn update_public_key(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<UpdatePublicKeyRequest>,
+) -> Result<Json<PublicUser>, AppError> {
+    use base64::Engine;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload.public_key.trim())
+        .map_err(|_| AppError::BadRequest("public_key must be valid base64".into()))?;
+    if decoded.len() != PUBLIC_KEY_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "public_key must decode to exactly {PUBLIC_KEY_BYTES} bytes (an X25519 public key)"
+        )));
+    }
+
+    let user: User = sqlx::query_as(
+        r#"
+        UPDATE users
+        SET public_key = $1
+        WHERE id = $2
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        "#,
+    )
+    .bind(payload.public_key.trim())
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(Json(PublicUser::from(user)))
 }
@@ -345,6 +397,191 @@ pub async fn change_password(
     Ok(Json(serde_json::json!({ "other_sessions_ended": ended })))
 }
 
+// ---------- Passphrase-based key recovery backup ----------
+//
+// Opt-in only: a user who never calls `PUT .../key-backup` has a row here
+// that never exists, and every other code path (new-device key generation,
+// message encryption/decryption) is completely unaffected. The server only
+// ever stores/relays the opaque blob the client already encrypted --
+// `encrypted_blob`/`salt`/`kdf_params` are never used here to derive or
+// inspect anything, and the passphrase itself and the derived symmetric key
+// never appear in any request this server handles.
+
+/// A few KB is generously more than enough for one passphrase-encrypted
+/// X25519 private key (32 raw bytes, base64'd, plus a small JSON envelope
+/// and libsodium's secretbox overhead) -- this is just a ceiling to reject
+/// abuse, not a realistic size.
+const MAX_KEY_BACKUP_BLOB_CHARS: usize = 8192;
+const MAX_KEY_BACKUP_SALT_CHARS: usize = 512;
+const MAX_KEY_BACKUP_KDF_PARAMS_CHARS: usize = 1024;
+
+/// `kdf_params` is opaque in the sense that this server never uses it to
+/// derive or inspect anything (see the comment above) -- but it IS stored
+/// and relayed back verbatim, and by the time any check runs here axum's
+/// `Json` extractor has already fully parsed whatever shape of JSON the
+/// caller sent. The size cap above keeps a wildly oversized body from
+/// getting this far at all; this check goes further and pins the actual
+/// SHAPE down to exactly what `apps/desktop/src/lib/recovery.ts`'s
+/// `KdfParams` sends -- a flat object with only `algorithm` (a string),
+/// `opslimit`/`memlimit` (required numbers) and an optional `version`
+/// number -- so nothing else (nested objects/arrays, unexpected keys,
+/// wrong types for a known key) is ever accepted or stored, rather than
+/// trusting an arbitrary `serde_json::Value`.
+fn validate_kdf_params(value: &serde_json::Value) -> Result<(), AppError> {
+    const REQUIRED_STRING_KEYS: &[&str] = &["algorithm"];
+    const REQUIRED_NUMBER_KEYS: &[&str] = &["opslimit", "memlimit"];
+    const OPTIONAL_NUMBER_KEYS: &[&str] = &["version"];
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("kdf_params must be a flat JSON object".into()))?;
+
+    for (key, val) in obj {
+        if REQUIRED_STRING_KEYS.contains(&key.as_str()) {
+            if !val.is_string() {
+                return Err(AppError::BadRequest(format!("kdf_params.{key} must be a string")));
+            }
+        } else if REQUIRED_NUMBER_KEYS.contains(&key.as_str()) || OPTIONAL_NUMBER_KEYS.contains(&key.as_str()) {
+            if !val.is_number() {
+                return Err(AppError::BadRequest(format!("kdf_params.{key} must be a number")));
+            }
+        } else {
+            return Err(AppError::BadRequest(format!(
+                "kdf_params has an unexpected field: {key}"
+            )));
+        }
+    }
+
+    for required in REQUIRED_STRING_KEYS.iter().chain(REQUIRED_NUMBER_KEYS.iter()) {
+        if !obj.contains_key(*required) {
+            return Err(AppError::BadRequest(format!(
+                "kdf_params is missing required field: {required}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct PutKeyBackupRequest {
+    pub encrypted_blob: String,
+    pub salt: String,
+    pub kdf_params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct KeyBackup {
+    pub encrypted_blob: String,
+    pub salt: String,
+    pub kdf_params: serde_json::Value,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// PUT /api/v1/users/me/key-backup
+///
+/// Upserts (inserts, or replaces if one already exists) the caller's OWN
+/// recovery backup. There is at most one backup per user (see migration
+/// 0031) -- a second `PUT` overwrites the first outright rather than
+/// keeping both, which is an accepted limitation of this simple one-slot
+/// design (only one device's key can usefully be backed up at a time).
+pub async fn put_key_backup(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<PutKeyBackupRequest>,
+) -> Result<Json<KeyBackup>, AppError> {
+    let blob = payload.encrypted_blob.trim();
+    if blob.is_empty() {
+        return Err(AppError::BadRequest("encrypted_blob is required".into()));
+    }
+    if blob.len() > MAX_KEY_BACKUP_BLOB_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "encrypted_blob can be at most {MAX_KEY_BACKUP_BLOB_CHARS} characters"
+        )));
+    }
+
+    let salt = payload.salt.trim();
+    if salt.is_empty() {
+        return Err(AppError::BadRequest("salt is required".into()));
+    }
+    if salt.len() > MAX_KEY_BACKUP_SALT_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "salt can be at most {MAX_KEY_BACKUP_SALT_CHARS} characters"
+        )));
+    }
+
+    if payload.kdf_params.is_null() {
+        return Err(AppError::BadRequest("kdf_params is required".into()));
+    }
+    if payload.kdf_params.to_string().len() > MAX_KEY_BACKUP_KDF_PARAMS_CHARS {
+        return Err(AppError::BadRequest("kdf_params is too large".into()));
+    }
+    validate_kdf_params(&payload.kdf_params)?;
+
+    let backup: KeyBackup = sqlx::query_as(
+        r#"
+        INSERT INTO key_backups (user_id, encrypted_blob, salt, kdf_params)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id) DO UPDATE
+            SET encrypted_blob = EXCLUDED.encrypted_blob,
+                salt = EXCLUDED.salt,
+                kdf_params = EXCLUDED.kdf_params,
+                updated_at = NOW()
+        RETURNING encrypted_blob, salt, kdf_params, updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(blob)
+    .bind(salt)
+    .bind(&payload.kdf_params)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(backup))
+}
+
+/// GET /api/v1/users/me/key-backup
+///
+/// Returns the caller's OWN backup, or 404 if they don't have one. Scoped
+/// to `CurrentUser` exactly like the device endpoints -- there is no way to
+/// fetch another user's backup through this handler, since the query is
+/// always `WHERE user_id = <the authenticated caller>`, never a
+/// caller-supplied id.
+pub async fn get_key_backup(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+) -> Result<Json<KeyBackup>, AppError> {
+    let backup: Option<KeyBackup> = sqlx::query_as(
+        "SELECT encrypted_blob, salt, kdf_params, updated_at FROM key_backups WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    backup.map(Json).ok_or_else(|| AppError::NotFound("No key backup set up".into()))
+}
+
+/// DELETE /api/v1/users/me/key-backup
+///
+/// Removes the caller's own backup, e.g. if they no longer want this
+/// recovery option enabled. Idempotent-ish: deleting when none exists is
+/// treated as success (204) rather than an error, since the end state the
+/// caller wants ("no backup exists") is already true.
+pub async fn delete_key_backup(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+) -> Result<axum::http::StatusCode, AppError> {
+    sqlx::query("DELETE FROM key_backups WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +686,296 @@ mod tests {
 
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn key_backup_upsert_replaces_previous_backup() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let first = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "first-blob".into(),
+                salt: "first-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13", "opslimit": 3, "memlimit": 268435456}),
+            }),
+        )
+        .await
+        .expect("creating a key backup should succeed")
+        .0;
+        assert_eq!(first.encrypted_blob, "first-blob");
+
+        let fetched = get_key_backup(State(db.clone()), CurrentUser(user))
+            .await
+            .expect("fetching the backup should succeed")
+            .0;
+        assert_eq!(fetched.encrypted_blob, "first-blob");
+
+        let second = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "second-blob".into(),
+                salt: "second-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13", "opslimit": 3, "memlimit": 268435456}),
+            }),
+        )
+        .await
+        .expect("replacing a key backup should succeed")
+        .0;
+        assert_eq!(second.encrypted_blob, "second-blob");
+
+        let refetched = get_key_backup(State(db.clone()), CurrentUser(user))
+            .await
+            .expect("fetching the backup should succeed")
+            .0;
+        assert_eq!(refetched.encrypted_blob, "second-blob", "a second PUT must replace, not duplicate, the backup");
+        assert_eq!(refetched.salt, "second-salt");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_backups WHERE user_id = $1")
+            .bind(user)
+            .fetch_one(&db.pool)
+            .await
+            .expect("counting backups failed");
+        assert_eq!(count, 1, "there must only ever be one backup row per user");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn get_key_backup_returns_not_found_when_none_exists() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = get_key_backup(State(db.clone()), CurrentUser(user)).await;
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected AppError::NotFound when no backup exists, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn cannot_fetch_another_users_key_backup() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let other = create_test_user(&db).await;
+
+        let _ = put_key_backup(
+            State(db.clone()),
+            CurrentUser(owner),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "owners-blob".into(),
+                salt: "owners-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13", "opslimit": 3, "memlimit": 268435456}),
+            }),
+        )
+        .await
+        .expect("creating a key backup should succeed");
+
+        // `other` fetching "their own" backup (there is no way to pass
+        // `owner`'s id in -- CurrentUser always scopes to the caller) must
+        // see "no backup", never the owner's.
+        let result = get_key_backup(State(db.clone()), CurrentUser(other)).await;
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected AppError::NotFound for a user with no backup of their own, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, other).await;
+    }
+
+    #[tokio::test]
+    async fn delete_key_backup_removes_it_and_is_idempotent() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let _ = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13", "opslimit": 3, "memlimit": 268435456}),
+            }),
+        )
+        .await
+        .expect("creating a key backup should succeed");
+
+        let status = delete_key_backup(State(db.clone()), CurrentUser(user))
+            .await
+            .expect("deleting own backup should succeed");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        let result = get_key_backup(State(db.clone()), CurrentUser(user)).await;
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected AppError::NotFound after deletion, got {other:?}"),
+        }
+
+        // Deleting again (no backup left) should still succeed, not error.
+        let status_again = delete_key_backup(State(db.clone()), CurrentUser(user))
+            .await
+            .expect("deleting when no backup exists should still succeed");
+        assert_eq!(status_again, axum::http::StatusCode::NO_CONTENT);
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn put_key_backup_rejects_empty_fields() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "   ".into(),
+                salt: "some-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13"}),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an empty encrypted_blob, got {other:?}"),
+        }
+
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "   ".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13"}),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an empty salt, got {other:?}"),
+        }
+
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::Value::Null,
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for null kdf_params, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn put_key_backup_rejects_malformed_kdf_params_shape() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        // Not an object at all.
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!("argon2id13"),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a non-object kdf_params, got {other:?}"),
+        }
+
+        // Missing a required field.
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!({"algorithm": "argon2id13", "opslimit": 3}),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for kdf_params missing memlimit, got {other:?}"),
+        }
+
+        // An unexpected extra field.
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!({
+                    "algorithm": "argon2id13",
+                    "opslimit": 3,
+                    "memlimit": 268435456,
+                    "nested": {"not": "expected"},
+                }),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for kdf_params with an unexpected field, got {other:?}"),
+        }
+
+        // Right keys, wrong type.
+        let result = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!({
+                    "algorithm": "argon2id13",
+                    "opslimit": "3",
+                    "memlimit": 268435456,
+                }),
+            }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for opslimit as a string, got {other:?}"),
+        }
+
+        // A well-formed shape (with the optional `version` field) must
+        // still succeed.
+        let ok = put_key_backup(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(PutKeyBackupRequest {
+                encrypted_blob: "a-blob".into(),
+                salt: "a-salt".into(),
+                kdf_params: serde_json::json!({
+                    "algorithm": "argon2id13",
+                    "opslimit": 3,
+                    "memlimit": 268435456,
+                    "version": 1,
+                }),
+            }),
+        )
+        .await;
+        assert!(ok.is_ok(), "a well-formed kdf_params shape should still be accepted: {ok:?}");
+
+        cleanup_test_user(&db, user).await;
     }
 }

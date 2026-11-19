@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod conversations;
+pub mod devices;
 pub mod health;
 pub mod members;
 pub mod messages;

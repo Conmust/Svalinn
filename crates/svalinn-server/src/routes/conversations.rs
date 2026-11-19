@@ -4,12 +4,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
 use crate::models::conversation::ConversationWithParticipant;
+use crate::models::device::{EncryptedRecipient, MessageRecipientPayload, ParticipantDevice};
 use crate::models::message::BroadcastMessage;
 
 /// Columns for `ConversationWithParticipant`: the conversation plus the
@@ -23,6 +25,7 @@ const CONVERSATION_COLUMNS: &str = r#"
     COALESCE(u.is_online, false) AS participant_is_online,
     u.status AS participant_status,
     COALESCE(u.patron_tier, 'free') AS participant_patron_tier,
+    u.public_key AS participant_public_key,
     EXISTS(
         SELECT 1 FROM messages m
         WHERE m.conversation_id = c.id
@@ -201,12 +204,49 @@ pub struct ConversationMessage {
     pub conversation_id: Uuid,
     pub user_id: Uuid,
     pub username: String,
-    pub content: String,
+    /// Legacy ciphertext (single-device model) or plaintext. `None` for a
+    /// message sent through the new per-device fan-out model -- that
+    /// message's ciphertext lives entirely in `recipients` below. This is
+    /// the discriminator the frontend uses to tell "legacy encrypted
+    /// message, decrypt with the old single-key path" apart from "new
+    /// fan-out message, decrypt via `recipients`": `is_encrypted && content
+    /// == null` means the latter.
+    pub content: Option<String>,
     pub attachment_url: Option<String>,
     pub attachment_filename: Option<String>,
     pub attachment_mime_type: Option<String>,
     pub attachment_size: Option<i64>,
     pub is_edited: bool,
+    /// Whether this message is encrypted (either the legacy single-device
+    /// way, with ciphertext in `content`, or the new fan-out way, with
+    /// ciphertext in `recipients`). False for all pre-E2EE history, which
+    /// is left exactly as it was sent.
+    pub is_encrypted: bool,
+    /// Base64-encoded nonce used to encrypt the legacy `content`. Only
+    /// present for a legacy single-device-era encrypted message; `None` for
+    /// a new fan-out message (whose per-recipient nonces are in
+    /// `recipients`) and for plaintext messages.
+    pub nonce: Option<String>,
+    /// Per-device ciphertext for a fan-out (new multi-device model)
+    /// message. Always empty for plaintext and for legacy single-device
+    /// messages.
+    ///
+    /// Populated differently depending on how this `ConversationMessage`
+    /// was built, since who's allowed to see which device's ciphertext
+    /// differs by delivery path:
+    /// - History fetch (`get_conversation_messages`): at most one entry --
+    ///   the row addressed to the requesting device (`?device_id=`), if
+    ///   any. Other devices' ciphertext for this message is never sent
+    ///   here.
+    /// - WebSocket broadcast (`new_direct_message`): every recipient
+    ///   device's entry, for both participants. Each connected device
+    ///   picks out the one entry matching its own device id and ignores
+    ///   the rest; this avoids the server needing to filter per-connection
+    ///   (every device of a user already receives the same broadcast
+    ///   event, the same way pre-fan-out single-shared-ciphertext messages
+    ///   did).
+    #[sqlx(skip)]
+    pub recipients: Vec<MessageRecipientPayload>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -214,6 +254,7 @@ const CONVERSATION_MESSAGE_COLUMNS: &str = r#"
     m.id, m.conversation_id, m.user_id, u.username, m.content,
     m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
     COALESCE(m.is_edited, false) AS is_edited,
+    m.is_encrypted, m.nonce,
     m.created_at
 "#;
 
@@ -226,6 +267,66 @@ pub struct HistoryQuery {
     /// Load messages older than this message. Omit for the latest page.
     pub before: Option<Uuid>,
     pub limit: Option<i64>,
+    /// This client's own device id (from `POST /users/me/devices`'s
+    /// response, as stored locally). Needed to pick this device's own
+    /// ciphertext out of `message_recipients` for any fan-out message in
+    /// the page -- see `ConversationMessage::recipients`. Omitting it
+    /// (e.g. an old client that hasn't adopted per-device keys) just means
+    /// every fan-out message comes back with no ciphertext, same as an
+    /// unrecognized device id would.
+    pub device_id: Option<Uuid>,
+}
+
+/// Looks up `message_recipients` rows for a set of messages, grouped by
+/// message id.
+///
+/// `device_id_filter`:
+/// - `Some(id)`: only rows addressed to that device (used by the history
+///   fetch endpoint -- a client only ever gets its own ciphertext).
+/// - `None`: every row for those messages, across every recipient device
+///   of both participants (used when building the WebSocket broadcast
+///   payload -- see `ConversationMessage::recipients` for why).
+async fn fetch_recipients_for_messages(
+    db: &Database,
+    message_ids: &[Uuid],
+    device_id_filter: Option<Uuid>,
+) -> Result<HashMap<Uuid, Vec<MessageRecipientPayload>>, AppError> {
+    if message_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    #[derive(FromRow)]
+    struct RecipientRow {
+        message_id: Uuid,
+        device_id: Uuid,
+        ciphertext: String,
+        nonce: String,
+        sender_public_key: String,
+    }
+
+    let rows: Vec<RecipientRow> = sqlx::query_as(
+        r#"
+        SELECT message_id, device_id, ciphertext, nonce, sender_public_key
+        FROM message_recipients
+        WHERE message_id = ANY($1) AND ($2::uuid IS NULL OR device_id = $2)
+        "#,
+    )
+    .bind(message_ids)
+    .bind(device_id_filter)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut map: HashMap<Uuid, Vec<MessageRecipientPayload>> = HashMap::new();
+    for row in rows {
+        map.entry(row.message_id).or_default().push(MessageRecipientPayload {
+            device_id: row.device_id,
+            ciphertext: row.ciphertext,
+            nonce: row.nonce,
+            sender_public_key: row.sender_public_key,
+        });
+    }
+    Ok(map)
 }
 
 /// GET /api/v1/conversations/:id/messages?before=<message_id>&limit=50
@@ -245,7 +346,7 @@ pub async fn get_conversation_messages(
 
     // Page by (created_at, id) so messages with the same timestamp are
     // neither skipped nor repeated.
-    let messages: Vec<ConversationMessage> = if let Some(before) = query.before {
+    let mut messages: Vec<ConversationMessage> = if let Some(before) = query.before {
         let cursor: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("SELECT created_at FROM messages WHERE id = $1 AND conversation_id = $2")
                 .bind(before)
@@ -296,6 +397,42 @@ pub async fn get_conversation_messages(
         .map_err(|e| AppError::Database(e.to_string()))?
     };
 
+    // A client that never set up per-device keys (or just hasn't told us
+    // which device it is) must never see ANY device's ciphertext for a
+    // fan-out message -- not even by accident via a NULL-matches-anything
+    // filter bug. Uuid::nil() is never a real device id, so filtering by it
+    // deterministically yields zero rows, same as an unrecognized real id
+    // would.
+    //
+    // `device_id` is caller-supplied and otherwise unverified: without
+    // confirming it's actually one of the caller's OWN registered devices,
+    // a participant could pass another participant's device_id and receive
+    // that device's per-device ciphertext/nonce instead of their own. A
+    // device_id that doesn't belong to the caller is treated exactly like
+    // no device_id was supplied -- i.e. it falls back to the nil sentinel --
+    // so a confused/stale/malicious client gets back no ciphertext rather
+    // than being told why.
+    let device_filter = match query.device_id {
+        Some(id) => {
+            let owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device_keys WHERE id = $1 AND user_id = $2)")
+                    .bind(id)
+                    .bind(user_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            if owned { id } else { Uuid::nil() }
+        }
+        None => Uuid::nil(),
+    };
+    let message_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
+    let recipients_by_message = fetch_recipients_for_messages(&db, &message_ids, Some(device_filter)).await?;
+    for message in &mut messages {
+        if let Some(entries) = recipients_by_message.get(&message.id) {
+            message.recipients = entries.clone();
+        }
+    }
+
     // Opening a conversation (loading its latest page) marks it as read, so
     // `has_unread` clears. Paging into older history doesn't touch the read
     // cursor.
@@ -327,13 +464,83 @@ pub async fn get_conversation_messages(
 /// Longest message content accepted (matches channel messages).
 const MAX_CONTENT_CHARS: usize = 4000;
 
+/// GET /api/v1/conversations/:id/participant-devices
+///
+/// Lists every registered device (id, owning user, public key, label) for
+/// BOTH participants of this conversation -- the current user and the
+/// other one. A client composing a send uses this to know exactly which
+/// devices to encrypt a copy for: every entry with `is_me: false` (the
+/// other participant's devices -- skipping sending leaves them unable to
+/// read anything, which must never happen silently) plus every other entry
+/// with `is_me: true` besides the device making the request itself (so the
+/// sender's OWN other sessions can read what it just sent). The current
+/// device doesn't need a copy of its own plaintext -- it already has it.
+pub async fn get_participant_devices(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(conversation_id): Path<Uuid>,
+) -> Result<Json<Vec<ParticipantDevice>>, AppError> {
+    require_participant(&db, conversation_id, user_id).await?;
+
+    let devices: Vec<ParticipantDevice> = sqlx::query_as(
+        r#"
+        SELECT dk.id AS device_id, dk.user_id, dk.public_key, dk.device_label, (dk.user_id = $1) AS is_me
+        FROM device_keys dk
+        JOIN conversation_participants cp ON cp.user_id = dk.user_id
+        WHERE cp.conversation_id = $2
+        ORDER BY dk.created_at ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(devices))
+}
+
 #[derive(Deserialize)]
 pub struct SendDirectMessageRequest {
-    pub content: String,
+    /// Plaintext, or legacy single-device ciphertext (paired with the
+    /// legacy `is_encrypted`/`nonce` fields below). Ignored when
+    /// `encrypted_for` is present and non-empty -- a fan-out send carries
+    /// no shared `content` at all, only per-device ciphertext.
+    #[serde(default)]
+    pub content: Option<String>,
     pub attachment_url: Option<String>,
     pub attachment_filename: Option<String>,
     pub attachment_size: Option<i64>,
     pub attachment_mime_type: Option<String>,
+    /// Legacy single-device encryption flag: whether `content` is base64
+    /// ciphertext (NaCl `crypto_box`) rather than plaintext. Kept only for
+    /// backward compatibility / non-encrypted sends -- a new E2EE send
+    /// should use `encrypted_for` instead.
+    #[serde(default)]
+    pub is_encrypted: bool,
+    /// Base64-encoded nonce for the legacy `content` ciphertext. Required
+    /// (and must be non-empty) when `is_encrypted` is true and
+    /// `encrypted_for` is absent/empty.
+    #[serde(default)]
+    pub nonce: Option<String>,
+    /// New per-device fan-out send: one ciphertext per recipient device
+    /// (every device of both participants that should receive this
+    /// message -- see `get_participant_devices`). When this is present and
+    /// non-empty, it takes over the whole send: `content`/`is_encrypted`/
+    /// `nonce` above are ignored, the `messages` row is stored with
+    /// `is_encrypted = true` and `content`/`nonce` left NULL, and one
+    /// `message_recipients` row is inserted per entry, atomically with the
+    /// `messages` insert.
+    #[serde(default)]
+    pub encrypted_for: Option<Vec<EncryptedRecipient>>,
+    /// Required when `encrypted_for` is non-empty: the id of the device
+    /// (one of the caller's own, from `POST /users/me/devices`) that did
+    /// the encrypting. Used to resolve and record `sender_public_key` on
+    /// every inserted `message_recipients` row -- see migration 0030's
+    /// comment on why a recipient device needs the *sender's* public key,
+    /// not just its own, to decrypt.
+    #[serde(default)]
+    pub sender_device_id: Option<Uuid>,
 }
 
 /// POST /api/v1/conversations/:id/messages
@@ -348,30 +555,12 @@ pub async fn send_conversation_message(
 ) -> Result<Json<ConversationMessage>, AppError> {
     require_participant(&db, conversation_id, user_id).await?;
 
-    if payload.content.chars().count() > MAX_CONTENT_CHARS {
-        return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
-    }
-    if payload.content.trim().is_empty() && payload.attachment_url.is_none() {
-        return Err(AppError::BadRequest("Message cannot be empty".into()));
-    }
-
-    let msg_id: Uuid = sqlx::query_scalar(
-        r#"
-        INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size)
-        VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
-        RETURNING id
-        "#,
-    )
-    .bind(conversation_id)
-    .bind(user_id)
-    .bind(&payload.content)
-    .bind(&payload.attachment_url)
-    .bind(&payload.attachment_filename)
-    .bind(&payload.attachment_mime_type)
-    .bind(payload.attachment_size)
-    .fetch_one(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let recipients = payload.encrypted_for.clone().unwrap_or_default();
+    let msg_id = if !recipients.is_empty() {
+        send_fanout_message(&db, conversation_id, user_id, &payload, &recipients).await?
+    } else {
+        send_legacy_message(&db, conversation_id, user_id, &payload).await?
+    };
 
     let message: ConversationMessage = sqlx::query_as(&format!(
         "SELECT {CONVERSATION_MESSAGE_COLUMNS} FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $1"
@@ -381,24 +570,182 @@ pub async fn send_conversation_message(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Notify the other participant(s) over the websocket; the sender gets
-    // the new message back in this response already.
-    let other_participants: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
+    // For a fan-out message, attach every recipient device's entry (not
+    // just the sender's) -- the broadcast below, and this same response
+    // object, are shared across both participants' connected devices, each
+    // of which picks out its own entry. See `ConversationMessage::recipients`.
+    let mut message = message;
+    if message.is_encrypted && message.content.is_none() {
+        let recipients_by_message = fetch_recipients_for_messages(&db, &[message.id], None).await?;
+        if let Some(entries) = recipients_by_message.get(&message.id) {
+            message.recipients = entries.clone();
+        }
+    }
+
+    // Notify every participant over the websocket -- including the sender's
+    // own user_id. `BroadcastMessage::to_user` fans out to every connection
+    // registered for that user_id (see `ws.rs`), so including the sender
+    // here is what actually reaches the sender's OTHER connected devices
+    // (e.g. phone + laptop on the same account). The sending device itself
+    // already has the message from this handler's HTTP response and dedupes
+    // the echoed broadcast by message id (see `addMessage` in
+    // `DMChatArea.svelte`), so re-including the sender is safe.
+    let participants: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM conversation_participants WHERE conversation_id = $1",
     )
     .bind(conversation_id)
-    .bind(user_id)
     .fetch_all(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     if let Ok(payload) = serde_json::to_value(&message) {
-        for recipient in other_participants {
+        for recipient in participants {
             let _ = db.message_tx.send(BroadcastMessage::to_user("new_direct_message", payload.clone(), recipient));
         }
     }
 
     Ok(Json(message))
+}
+
+/// The old plaintext / single-device-encrypted send path, unchanged in
+/// behavior from before per-device fan-out existed.
+async fn send_legacy_message(
+    db: &Database,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    payload: &SendDirectMessageRequest,
+) -> Result<Uuid, AppError> {
+    let content = payload.content.clone().unwrap_or_default();
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
+    }
+    if content.trim().is_empty() && payload.attachment_url.is_none() {
+        return Err(AppError::BadRequest("Message cannot be empty".into()));
+    }
+    if payload.is_encrypted && payload.nonce.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::BadRequest("nonce is required for an encrypted message".into()));
+    }
+
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, is_encrypted, nonce)
+        VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .bind(&content)
+    .bind(&payload.attachment_url)
+    .bind(&payload.attachment_filename)
+    .bind(&payload.attachment_mime_type)
+    .bind(payload.attachment_size)
+    .bind(payload.is_encrypted)
+    .bind(&payload.nonce)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// The new per-device fan-out send path: validates every recipient device
+/// actually belongs to a real participant of this conversation and that
+/// `sender_device_id` belongs to the caller, then inserts the `messages`
+/// row and every `message_recipients` row in one transaction -- either all
+/// of it lands, or none of it does.
+async fn send_fanout_message(
+    db: &Database,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    payload: &SendDirectMessageRequest,
+    recipients: &[EncryptedRecipient],
+) -> Result<Uuid, AppError> {
+    let sender_device_id = payload
+        .sender_device_id
+        .ok_or_else(|| AppError::BadRequest("sender_device_id is required when encrypted_for is set".into()))?;
+
+    for r in recipients {
+        if r.ciphertext.trim().is_empty() || r.nonce.trim().is_empty() {
+            return Err(AppError::BadRequest("ciphertext and nonce are required for every entry in encrypted_for".into()));
+        }
+    }
+    let device_ids: Vec<Uuid> = recipients.iter().map(|r| r.device_id).collect();
+    let mut seen = HashSet::new();
+    for id in &device_ids {
+        if !seen.insert(*id) {
+            return Err(AppError::BadRequest("encrypted_for contains the same device_id more than once".into()));
+        }
+    }
+
+    let participant_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM conversation_participants WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut tx = db.pool.begin().await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    let sender_public_key: Option<String> =
+        sqlx::query_scalar("SELECT public_key FROM device_keys WHERE id = $1 AND user_id = $2")
+            .bind(sender_device_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let sender_public_key =
+        sender_public_key.ok_or_else(|| AppError::BadRequest("sender_device_id must be one of your own registered devices".into()))?;
+
+    // Every recipient device must belong to device_keys owned by one of
+    // this conversation's two real participants -- otherwise reject the
+    // whole send rather than partially deliver it.
+    let valid_device_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_keys WHERE id = ANY($1) AND user_id = ANY($2)",
+    )
+    .bind(&device_ids)
+    .bind(&participant_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if valid_device_count as usize != device_ids.len() {
+        return Err(AppError::BadRequest(
+            "encrypted_for contains a device_id that doesn't belong to a participant in this conversation".into(),
+        ));
+    }
+
+    let msg_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, is_encrypted, nonce)
+        VALUES ($1, NULL, $2, NULL, $3, $4, $5, $6, true, NULL)
+        RETURNING id
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .bind(&payload.attachment_url)
+    .bind(&payload.attachment_filename)
+    .bind(&payload.attachment_mime_type)
+    .bind(payload.attachment_size)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    for r in recipients {
+        sqlx::query(
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(msg_id)
+        .bind(r.device_id)
+        .bind(&r.ciphertext)
+        .bind(&r.nonce)
+        .bind(&sender_public_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
+    tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(msg_id)
 }
 
 #[cfg(test)]
@@ -655,7 +1002,7 @@ mod tests {
             State(db.clone()),
             CurrentUser(user_c),
             Path(conversation_id),
-            Query(HistoryQuery { before: None, limit: None }),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
         .await;
         match read_result {
@@ -668,11 +1015,15 @@ mod tests {
             CurrentUser(user_c),
             Path(conversation_id),
             Json(SendDirectMessageRequest {
-                content: "hello from an outsider".into(),
+                content: Some("hello from an outsider".into()),
                 attachment_url: None,
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
             }),
         )
         .await;
@@ -708,25 +1059,29 @@ mod tests {
             CurrentUser(user_a),
             Path(conversation_id),
             Json(SendDirectMessageRequest {
-                content: "hello from A".into(),
+                content: Some("hello from A".into()),
                 attachment_url: None,
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
             }),
         )
         .await
         .expect("sending message failed")
         .0;
 
-        assert_eq!(sent.content, "hello from A");
+        assert_eq!(sent.content.as_deref(), Some("hello from A"));
         assert_eq!(sent.user_id, user_a);
 
         let messages = get_conversation_messages(
             State(db.clone()),
             CurrentUser(user_b),
             Path(conversation_id),
-            Query(HistoryQuery { before: None, limit: None }),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
         .await
         .expect("fetching messages failed")
@@ -734,7 +1089,7 @@ mod tests {
 
         let found = messages.iter().find(|m| m.id == sent.id);
         let found = found.expect("the message sent by A should appear in B's view of the conversation");
-        assert_eq!(found.content, "hello from A");
+        assert_eq!(found.content.as_deref(), Some("hello from A"));
         assert_eq!(found.user_id, user_a);
 
         cleanup_test_user(&db, user_a).await;
@@ -763,11 +1118,15 @@ mod tests {
             CurrentUser(user_a),
             Path(conversation_id),
             Json(SendDirectMessageRequest {
-                content: "ping".into(),
+                content: Some("ping".into()),
                 attachment_url: None,
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
             }),
         )
         .await
@@ -800,7 +1159,7 @@ mod tests {
             State(db.clone()),
             CurrentUser(user_b),
             Path(conversation_id),
-            Query(HistoryQuery { before: None, limit: None }),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
         .await
         .expect("fetching messages as B failed");
@@ -848,6 +1207,580 @@ mod tests {
 
         cleanup_test_user(&db, user_a).await;
         cleanup_test_user(&db, patron_user).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// An encrypted message's `content` is opaque ciphertext to the server;
+    /// it must still be stored and returned faithfully, along with
+    /// `is_encrypted`/`nonce`, exactly as given -- the server never
+    /// interprets or validates the ciphertext itself.
+    #[tokio::test]
+    async fn encrypted_message_round_trips_content_and_nonce() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let fake_ciphertext = "dGhpcyBpcyBub3QgcmVhbCBjaXBoZXJ0ZXh0";
+        let fake_nonce = "dGhpcyBpcyBub3QgYSByZWFsIG5vbmNl";
+
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: Some(fake_ciphertext.into()),
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: true,
+                nonce: Some(fake_nonce.into()),
+                encrypted_for: None,
+                sender_device_id: None,
+            }),
+        )
+        .await
+        .expect("sending encrypted message failed")
+        .0;
+
+        assert!(sent.is_encrypted);
+        assert_eq!(sent.content.as_deref(), Some(fake_ciphertext));
+        assert_eq!(sent.nonce.as_deref(), Some(fake_nonce));
+
+        let messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
+        )
+        .await
+        .expect("fetching messages failed")
+        .0;
+
+        let found = messages.iter().find(|m| m.id == sent.id).expect("encrypted message should appear in history");
+        assert!(found.is_encrypted, "fetched message should still be flagged as encrypted");
+        assert_eq!(found.content.as_deref(), Some(fake_ciphertext), "ciphertext content must round-trip unchanged");
+        assert_eq!(found.nonce.as_deref(), Some(fake_nonce), "nonce must round-trip unchanged");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// An encrypted message sent without a nonce (or with an empty one) is
+    /// rejected -- the single most important invariant is that the server
+    /// never silently accepts something that looks like a plaintext
+    /// fallback for what was supposed to be encrypted.
+    #[tokio::test]
+    async fn encrypted_message_without_nonce_is_rejected() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: Some("ciphertext-looking-thing".into()),
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: true,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an encrypted message with no nonce, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// Uploading a public key makes it retrievable through the conversation
+    /// endpoint that the client relies on to find the other participant's
+    /// key before encrypting a message to them.
+    #[tokio::test]
+    async fn public_key_upload_is_visible_via_conversation_participant() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        // A 32-byte value, base64-encoded, matching the shape of a real
+        // X25519 public key (the server only checks the shape, not that it's
+        // "real").
+        let fake_public_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+
+        let updated = crate::routes::users::update_public_key(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Json(crate::routes::users::UpdatePublicKeyRequest { public_key: fake_public_key.clone() }),
+        )
+        .await
+        .expect("uploading public key failed")
+        .0;
+        assert_eq!(updated.public_key.as_deref(), Some(fake_public_key.as_str()));
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+            .await
+            .expect("fetching A's conversations failed")
+            .0;
+        let view = a_conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .expect("A should see the conversation with B");
+        assert_eq!(
+            view.participant_public_key.as_deref(),
+            Some(fake_public_key.as_str()),
+            "B's uploaded public key should be visible to A as the conversation's participant_public_key"
+        );
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// A public key that doesn't decode to exactly 32 bytes is rejected.
+    #[tokio::test]
+    async fn public_key_upload_rejects_wrong_length() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+
+        let too_short = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1u8; 16]);
+        let result = crate::routes::users::update_public_key(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(crate::routes::users::UpdatePublicKeyRequest { public_key: too_short }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a too-short public key, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+    }
+
+    fn fake_public_key(byte: u8) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [byte; 32])
+    }
+
+    async fn register_device(db: &Database, user_id: Uuid, byte: u8, label: &str) -> Uuid {
+        crate::routes::devices::register_device(
+            State(db.clone()),
+            CurrentUser(user_id),
+            Json(crate::routes::devices::RegisterDeviceRequest {
+                public_key: fake_public_key(byte),
+                device_label: label.into(),
+            }),
+        )
+        .await
+        .expect("registering a device should succeed")
+        .0
+        .id
+    }
+
+    /// The core new-model flow: A sends a fan-out message addressed to both
+    /// of B's devices (and A's own second device); each device fetching
+    /// history gets back only its own ciphertext, and a device that isn't
+    /// in `encrypted_for` at all gets none.
+    #[tokio::test]
+    async fn fanout_message_round_trips_per_device_ciphertext() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 1, "A's Laptop").await;
+        let a_device2 = register_device(&db, user_a, 2, "A's Phone").await;
+        let b_device1 = register_device(&db, user_b, 3, "B's Laptop").await;
+
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient { device_id: a_device2, ciphertext: "ct-for-a2".into(), nonce: "nonce-a2".into() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into() },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await
+        .expect("sending fan-out message failed")
+        .0;
+
+        assert!(sent.is_encrypted);
+        assert!(sent.content.is_none(), "a fan-out message's shared content column must stay NULL");
+        // The response (and broadcast payload it's reused for) carries every
+        // recipient's entry, not just one.
+        assert_eq!(sent.recipients.len(), 2);
+
+        // A's device 2 fetching history sees only its own ciphertext.
+        let a2_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(a_device2) }),
+        )
+        .await
+        .expect("fetching as A's device 2 failed")
+        .0;
+        let found = a2_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert_eq!(found.recipients.len(), 1);
+        assert_eq!(found.recipients[0].ciphertext, "ct-for-a2");
+        assert_eq!(found.recipients[0].nonce, "nonce-a2");
+        assert_eq!(found.recipients[0].sender_public_key, fake_public_key(1), "sender_public_key must be A's SENDING device's key");
+
+        // B's device 1 fetching history sees only its own ciphertext.
+        let b1_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
+        )
+        .await
+        .expect("fetching as B's device 1 failed")
+        .0;
+        let found = b1_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert_eq!(found.recipients.len(), 1);
+        assert_eq!(found.recipients[0].ciphertext, "ct-for-b1");
+
+        // A's SENDING device (device 1) wasn't in `encrypted_for` at all --
+        // it already has the plaintext locally, so it gets no ciphertext
+        // back. This must be told apart from "legacy encrypted message" by
+        // the frontend via `content` staying null; here we just confirm no
+        // ciphertext comes back for it.
+        let a1_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(a_device1) }),
+        )
+        .await
+        .expect("fetching as A's device 1 failed")
+        .0;
+        let found = a1_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert!(found.recipients.is_empty());
+        assert!(found.content.is_none(), "still must not fall back to showing anything in the legacy content column");
+
+        // Omitting device_id entirely must behave the same as an
+        // unrecognized device id: no ciphertext handed out.
+        let no_device_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
+        )
+        .await
+        .expect("fetching without a device_id failed")
+        .0;
+        let found = no_device_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert!(found.recipients.is_empty(), "no device_id supplied must never leak any device's ciphertext");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// A participant can't read another participant's per-device
+    /// ciphertext by passing that OTHER user's device_id as the `?device_id=`
+    /// query filter. Even though A and B are both legitimate participants
+    /// in the conversation (so `require_participant` passes for both), A's
+    /// device_id is not B's, so A supplying B's device_id must be treated
+    /// exactly like supplying no device_id at all -- no ciphertext handed
+    /// back, not B's row.
+    #[tokio::test]
+    async fn get_conversation_messages_rejects_unowned_device_id() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 1, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 3, "B's Laptop").await;
+
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![EncryptedRecipient {
+                    device_id: b_device1,
+                    ciphertext: "ct-for-b1".into(),
+                    nonce: "nonce-b1".into(),
+                }]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await
+        .expect("sending fan-out message failed")
+        .0;
+
+        // A is a legitimate participant, so `require_participant` passes.
+        // But A passes B's device_id -- NOT one of A's own registered
+        // devices -- as the filter. This must not leak B's ciphertext.
+        let messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
+        )
+        .await
+        .expect("fetching as A with B's device_id failed")
+        .0;
+        let found = messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert!(
+            found.recipients.is_empty(),
+            "A must not receive B's per-device ciphertext by passing B's device_id as the filter"
+        );
+
+        // Confirm B's own device, fetching for itself, still gets its
+        // ciphertext -- i.e. the fix rejects cross-user use of a device_id,
+        // not the device_id itself.
+        let b_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
+        )
+        .await
+        .expect("fetching as B's device 1 failed")
+        .0;
+        let found = b_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert_eq!(found.recipients.len(), 1, "B fetching with B's own device_id must still see B's ciphertext");
+        assert_eq!(found.recipients[0].ciphertext, "ct-for-b1");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// A send is rejected outright (nothing partially inserted) if any
+    /// device_id in `encrypted_for` doesn't belong to one of the two real
+    /// participants in the conversation -- e.g. a stale/forged device id,
+    /// or a device belonging to some unrelated third user.
+    #[tokio::test]
+    async fn fanout_rejects_device_not_belonging_to_a_participant() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 10, "A's Laptop").await;
+        let outsider_device = register_device(&db, outsider, 11, "Outsider's Phone").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![EncryptedRecipient {
+                    device_id: outsider_device,
+                    ciphertext: "ct".into(),
+                    nonce: "nonce".into(),
+                }]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a device_id outside the conversation, got {other:?}"),
+        }
+
+        // Nothing should have been inserted -- the whole send is atomic.
+        let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count query failed");
+        assert_eq!(message_count, 0, "a rejected fan-out send must not leave a partial message row behind");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_user(&db, outsider).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// `sender_device_id` must be one of the caller's OWN devices -- it
+    /// can't be used to forge messages as if sent from someone else's
+    /// device.
+    #[tokio::test]
+    async fn fanout_rejects_sender_device_not_owned_by_caller() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let b_device1 = register_device(&db, user_b, 20, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![EncryptedRecipient {
+                    device_id: b_device1,
+                    ciphertext: "ct".into(),
+                    nonce: "nonce".into(),
+                }]),
+                // B's device, not A's -- A must not be able to claim it.
+                sender_device_id: Some(b_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest when sender_device_id isn't the caller's own device, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// `get_participant_devices` returns every device of both participants,
+    /// correctly tagging which ones belong to the caller.
+    #[tokio::test]
+    async fn participant_devices_lists_both_sides_with_is_me() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 30, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 31, "B's Laptop").await;
+
+        let devices = get_participant_devices(State(db.clone()), CurrentUser(user_a), Path(conversation_id))
+            .await
+            .expect("fetching participant devices failed")
+            .0;
+
+        assert_eq!(devices.len(), 2);
+        let mine = devices.iter().find(|d| d.device_id == a_device1).expect("A's own device should be listed");
+        assert!(mine.is_me);
+        let theirs = devices.iter().find(|d| d.device_id == b_device1).expect("B's device should be listed");
+        assert!(!theirs.is_me);
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
         cleanup_test_conversation(&db, conversation_id).await;
     }
 }

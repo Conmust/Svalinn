@@ -29,6 +29,7 @@ export interface PublicUser {
   status: string;
   patron_tier: string;
   bio?: string | null;
+  public_key?: string | null;
 }
 
 /** All non-banned users, for pickers like "start a new DM". */
