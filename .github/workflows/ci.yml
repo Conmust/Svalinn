@@ -16,12 +16,30 @@ jobs:
   server:
     name: Server build and unit tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: svalinn
+          POSTGRES_PASSWORD: svalinn_dev
+          POSTGRES_DB: svalinn_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U svalinn"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://svalinn:svalinn_dev@localhost:5432/svalinn_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build -p svalinn-server --bins --locked
+      - name: Run migrations
+        run: cargo run -p svalinn-server --bin run-migrations --locked
       - name: Unit tests
         run: cargo test -p svalinn-server --locked
 
