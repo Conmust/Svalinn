@@ -7,9 +7,41 @@
     sendDirectMessage,
     SendDirectMessageError,
   } from '../lib/conversations';
-  import { encryptForRecipient, decryptFromSender } from '../lib/crypto';
+  import { encryptForRecipient, decryptFromSender, CryptoLibraryError, DeviceSetupError } from '../lib/crypto';
   import { activeDeviceKeypair, deviceEncryptionReady } from '../lib/recovery';
   import { fetchParticipantDevices, type ParticipantDevice } from '../lib/devices';
+  import { TimeoutError } from '../lib/timeout';
+
+  // --- DM-specific error boundary -----------------------------------------
+  //
+  // Svelte 4 has no `<svelte:boundary>` (that's a Svelte 5 feature), so
+  // this component is its own error boundary: every path that could throw
+  // -- device setup, network calls, decryption -- is wrapped in try/catch
+  // right here, and any failure is funneled into `panelError` instead of
+  // being allowed to escape as an uncaught exception during a reactive
+  // update (which, in Svelte, can propagate well beyond this component and
+  // take down the rest of the app). `panelError` being set swaps the WHOLE
+  // conversation view for a plain, specific "unavailable" message -- see
+  // the template below -- while everything outside this component (the
+  // server rail, channel list, every other chat surface) stays completely
+  // unaffected, since none of it depends on anything this component does.
+  //
+  // `describeCryptoError` is what keeps this from flattening every failure
+  // into one generic message: a broken libsodium load, a broken device
+  // registration, and a plain network timeout are reported distinctly,
+  // instead of a real bug quietly reading the same as "not set up yet".
+  function describeCryptoError(e: unknown): string {
+    if (e instanceof CryptoLibraryError) {
+      return 'Encrypted messaging is currently unavailable: the encryption library failed to load.';
+    }
+    if (e instanceof DeviceSetupError) {
+      return `Encrypted messaging is currently unavailable: ${e.message}`;
+    }
+    if (e instanceof TimeoutError) {
+      return 'Encrypted messaging is currently unavailable: the server did not respond in time.';
+    }
+    return 'Encrypted messaging is currently unavailable due to an unexpected error.';
+  }
 
   export let conversationId: string;
   export let participantUsername: string = '';
@@ -32,6 +64,24 @@
   let newMessage = '';
   let sending = false;
 
+  /** Set the moment ANY part of this panel's setup hits an unrecoverable
+   * failure (crypto library, device setup, or an unexpected exception
+   * while preparing messages for display). Non-null means the template
+   * below shows a plain error state instead of the chat UI -- see the
+   * error-boundary note above. Deliberately never cleared automatically:
+   * the fixes for all of these (reload, fix the webview/network, etc.)
+   * require a fresh component instance anyway, which happens naturally
+   * when the user picks a different conversation or reopens this one. */
+  let panelError: string | null = null;
+
+  /** Separately tracks a failure to fetch the OTHER participant's device
+   * list, so that's never confused with "they haven't set up encrypted
+   * messaging" (`participantDevices.some(d => !d.is_me)` being false for a
+   * perfectly innocent reason) -- see `loadParticipantDevices` and the
+   * input-area notice below. Sending stays blocked either way; this only
+   * changes which message is shown. */
+  let participantDevicesLoadFailed = false;
+
   /** This device's own X25519 private key and id, set once
    * `deviceEncryptionReady` resolves. Goes through the SAME shared gate
    * `App.svelte` uses -- never `ensureDeviceKeypair()` directly -- so
@@ -42,7 +92,10 @@
   let myDeviceId: string | null = null;
   deviceEncryptionReady()
     .then(kp => { myPrivateKey = kp.privateKey; myDeviceId = kp.deviceId; })
-    .catch(e => console.error('Failed to set up encryption keys:', e));
+    .catch(e => {
+      console.error('Failed to set up encryption keys:', e);
+      panelError = describeCryptoError(e);
+    });
 
   // Keeps this device's key in sync with LATER changes too, not just the
   // first-ever resolution above -- e.g. the manual "Recover from backup"
@@ -84,6 +137,7 @@
 
   const DECRYPT_FAILED_PLACEHOLDER = '[Unable to decrypt this message]';
   const SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER = '[Sent before this device was added]';
+  const UNEXPECTED_MESSAGE_ERROR_PLACEHOLDER = '[This message could not be displayed due to an unexpected error]';
 
   // Decrypting a message depends on which model it was sent under:
   // - Not encrypted: show `content` as-is.
@@ -100,35 +154,69 @@
   //   `encryptAndSend`), so there's always a real `message_recipients` row
   //   for the sending device, decrypted via this exact same path as any
   //   other device.
+  // Wrapped in try/catch, unlike the rest of this module's decrypt path:
+  // this is called from the `messages` derivation below, which runs during
+  // Svelte's reactive update whenever `rawMessages` changes -- a throw here
+  // (e.g. `message.recipients` coming back as something other than an
+  // array, from a corrupted row or a server bug) would otherwise escape
+  // this component entirely rather than just this one message. One bad row
+  // degrades to a placeholder on that row alone; it's deliberately NOT
+  // escalated to `panelError` (which would take out the whole
+  // conversation), since nothing about every other message is affected.
   function toDisplayMessage(message: ConversationMessage): DisplayMessage {
-    if (!message.is_encrypted) {
-      return { ...message, displayContent: message.content ?? '' };
-    }
-    if (!myPrivateKey) {
-      return { ...message, displayContent: DECRYPT_FAILED_PLACEHOLDER };
-    }
-    if (message.content !== null && message.content !== undefined) {
-      // Legacy single-device-era message.
-      if (!participantPublicKey || !message.nonce) {
+    try {
+      if (!message.is_encrypted) {
+        return { ...message, displayContent: message.content ?? '' };
+      }
+      if (!myPrivateKey) {
         return { ...message, displayContent: DECRYPT_FAILED_PLACEHOLDER };
       }
-      const decrypted = decryptFromSender(message.content, message.nonce, participantPublicKey, myPrivateKey);
+      if (message.content !== null && message.content !== undefined) {
+        // Legacy single-device-era message.
+        if (!participantPublicKey || !message.nonce) {
+          return { ...message, displayContent: DECRYPT_FAILED_PLACEHOLDER };
+        }
+        const decrypted = decryptFromSender(message.content, message.nonce, participantPublicKey, myPrivateKey);
+        return { ...message, displayContent: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
+      }
+      // Fan-out message: find this device's own entry. Guards against
+      // `recipients` being present but not actually an array (malformed
+      // row) -- `?.find` alone wouldn't catch that, since a non-array
+      // truthy value still passes the `?.` check and only throws once
+      // `.find` is actually called.
+      const recipients = Array.isArray(message.recipients) ? message.recipients : [];
+      const mine = myDeviceId ? recipients.find(r => r.device_id === myDeviceId) : undefined;
+      if (!mine) {
+        return { ...message, displayContent: SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER };
+      }
+      const decrypted = decryptFromSender(mine.ciphertext, mine.nonce, mine.sender_public_key, myPrivateKey);
       return { ...message, displayContent: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
+    } catch (e) {
+      console.error('Unexpected error while preparing a DM for display:', e);
+      return { ...message, displayContent: UNEXPECTED_MESSAGE_ERROR_PLACEHOLDER };
     }
-    // Fan-out message: find this device's own entry.
-    const mine = myDeviceId ? message.recipients?.find(r => r.device_id === myDeviceId) : undefined;
-    if (!mine) {
-      return { ...message, displayContent: SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER };
-    }
-    const decrypted = decryptFromSender(mine.ciphertext, mine.nonce, mine.sender_public_key, myPrivateKey);
-    return { ...message, displayContent: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
   }
 
   // Re-derived whenever the raw messages, our key, or their key changes --
   // e.g. `myPrivateKey` arriving asynchronously after messages were already
   // loaded shouldn't leave them stuck showing the decrypt-failed placeholder.
+  //
+  // The `map` itself is also guarded: `toDisplayMessage` already catches
+  // per-message, but this is the last line of defense against anything
+  // escaping it (or failing some other way, e.g. `rawMessages` itself ever
+  // becoming something unexpected) during Svelte's reactive update --
+  // which is exactly the kind of uncaught exception that could otherwise
+  // propagate past this component. See the error-boundary note above.
   let messages: DisplayMessage[] = [];
-  $: messages = rawMessages.map(toDisplayMessage);
+  $: {
+    try {
+      messages = rawMessages.map(toDisplayMessage);
+    } catch (e) {
+      console.error('Unexpected error building the DM message list:', e);
+      messages = [];
+      if (!panelError) panelError = 'Encrypted messaging is currently unavailable due to an unexpected error.';
+    }
+  }
 
   // History is loaded a page at a time; scrolling to the top loads more.
   const PAGE_SIZE = 50;
@@ -154,10 +242,17 @@
       const devices = await fetchParticipantDevices(forConversation);
       if (forConversation !== conversationId) return;
       participantDevices = devices;
+      participantDevicesLoadFailed = false;
     } catch (e) {
       if (forConversation !== conversationId) return;
       console.error('Failed to load participant devices:', e);
+      // Leaves `participantDevices` empty, same as before -- `canSend`
+      // below still blocks sending either way -- but flags the specific
+      // reason (a failed/timed-out lookup) so the input area doesn't
+      // falsely tell the user the other participant has no encrypted
+      // devices at all when we simply couldn't check.
       participantDevices = [];
+      participantDevicesLoadFailed = true;
     }
   }
 
@@ -205,6 +300,17 @@
       if (forConversation !== conversationId) return;
       console.error('Failed to load messages:', e);
       loading = false;
+      // Both failure points above (`deviceEncryptionReady()` and
+      // `fetchConversationMessages()`, which now has its own bounded
+      // timeout -- see `lib/conversations.ts`) land here. Previously, a
+      // failed `fetchConversationMessages()` call with `myPrivateKey`
+      // already set just silently left the history empty (indistinguishable
+      // from "no messages yet"), and a hung network call left `loading`
+      // (and the "Loading messages..." spinner) stuck forever with no
+      // bound at all. Now that the fetch itself can't hang indefinitely,
+      // always surface a clear, specific error here instead of a
+      // misleadingly empty conversation.
+      if (!panelError) panelError = describeCryptoError(e);
     }
   }
 
@@ -336,6 +442,20 @@
       console.error('Failed to send direct message:', e);
       if (isStaleDeviceListError(e)) {
         alert("Couldn't send: the recipient's devices changed, please try again");
+      } else if (e instanceof CryptoLibraryError || e instanceof DeviceSetupError) {
+        // Encryption itself broke mid-session (vs. a network hiccup) --
+        // nothing sent, same as every other path here, but worth
+        // surfacing as a panel-level failure since retrying "send" again
+        // won't help until this is fixed.
+        panelError = describeCryptoError(e);
+      } else if (e instanceof TimeoutError) {
+        // `sendDirectMessage` now has its own bounded timeout (see
+        // `lib/conversations.ts`), so this used to be able to hang here
+        // forever with `sending` stuck `true` and no feedback at all --
+        // the `finally` below still always clears `sending`, but say
+        // specifically what happened rather than the generic network-error
+        // message, since retrying is very likely to help here.
+        alert('Timed out sending message. Please try again.');
       } else {
         alert('Network error while sending message');
       }
@@ -345,11 +465,16 @@
   }
 
   // Whether we're able to send an encrypted message right now: the other
-  // participant must have at least one device registered, and our own
-  // keypair must have finished loading/generating. (`participantDevices`
-  // includes our own devices too, so this specifically checks for any
-  // entry that ISN'T ours.)
-  $: canSend = !!myPrivateKey && !!myDeviceId && participantDevices.some(d => !d.is_me);
+  // participant must have at least one device registered, our own keypair
+  // must have finished loading/generating, AND nothing has gone wrong at
+  // the panel level. (`participantDevices` includes our own devices too,
+  // so this specifically checks for any entry that ISN'T ours.) The
+  // `!panelError` clause is belt-and-suspenders: every path that sets
+  // `panelError` already clears/never-sets `myPrivateKey`/`myDeviceId`
+  // too, so this alone wouldn't yet be reachable as a false positive --
+  // but sending must stay hard-blocked on ANY of these failures, so it's
+  // checked explicitly rather than relying on that staying true forever.
+  $: canSend = !panelError && !!myPrivateKey && !!myDeviceId && participantDevices.some(d => !d.is_me);
 
   function formatTime(ts: string): string {
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -368,7 +493,16 @@
 
   <!-- Messages -->
   <div class="flex-1 overflow-y-auto p-4 custom-scrollbar messages-container" bind:this={container} on:scroll={onScroll}>
-    {#if loading}
+    {#if panelError}
+      <!-- The DM-specific error boundary: this swaps out the whole
+           conversation view, but only this one -- the server rail, channel
+           list, and every other part of the app keep working normally. -->
+      <div class="flex flex-col items-center justify-center h-full text-center px-6" role="alert">
+        <div class="text-4xl mb-4">⚠</div>
+        <div class="text-sm text-[#ffaa00] terminal-glow">{'>'} Encrypted messaging is currently unavailable</div>
+        <div class="text-xs text-[#00aa00] mt-2 max-w-md">{panelError}</div>
+      </div>
+    {:else if loading}
       <div class="flex items-center justify-center h-full">
         <div class="text-[#00aa00] animate-pulse terminal-glow">{'>'} Loading messages...</div>
       </div>
@@ -422,7 +556,13 @@
 
   <!-- Input Area -->
   <div class="border-t-2 border-[#00ff00] p-4">
-    {#if !participantDevices.some(d => !d.is_me)}
+    {#if panelError}
+      <div class="text-xs text-[#ffaa00] mb-2 terminal-glow">{'>'} {panelError}</div>
+    {:else if participantDevicesLoadFailed}
+      <div class="text-xs text-[#ffaa00] mb-2 terminal-glow">
+        {'>'} Couldn't check whether this user has encrypted messaging set up (network error) &mdash; you can't send them a message right now.
+      </div>
+    {:else if !participantDevices.some(d => !d.is_me)}
       <div class="text-xs text-[#ffaa00] mb-2 terminal-glow">
         {'>'} This user hasn't set up encrypted messaging on any device yet &mdash; you can't send them a message.
       </div>

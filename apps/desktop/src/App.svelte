@@ -3,7 +3,7 @@
   import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
   import { getCurrentUser, login, register, logout } from './lib/auth';
-  import { deviceEncryptionReady, recoveryChoiceNeeded, resetDeviceEncryptionSetup } from './lib/recovery';
+  import { deviceEncryptionReady, recoveryChoiceNeeded, recoveryCheckFailed, resetDeviceEncryptionSetup } from './lib/recovery';
   import ServerRail from './components/ServerRail.svelte';
   import ChannelList from './components/ChannelList.svelte';
   import ChatArea from './components/ChatArea.svelte';
@@ -38,6 +38,17 @@
   // `lib/recovery.ts`). This effect just kicks it off once per login;
   // `recoveryChoiceNeeded` (a store, also from `lib/recovery.ts`) drives
   // whether the unskippable `RecoveryChoice` modal below is shown.
+  //
+  // Deliberately fire-and-forget (`.catch` just logs): nothing in the
+  // template below -- the server rail, channel list, channel chat, or any
+  // of the login/account-settings UI -- reads `deviceEncryptionReady()` or
+  // awaits it before rendering. Whether this resolves in a millisecond,
+  // hangs for the full bounded timeout inside `lib/crypto.ts`/`recovery.ts`
+  // before failing, or never gets called at all, every non-DM part of the
+  // app renders and works exactly the same. Only `DMChatArea.svelte` (which
+  // awaits this itself before showing a conversation) and the optional
+  // `RecoveryChoice` modal depend on it -- see `DMChatArea.svelte` for how
+  // a failure there degrades to an in-place error instead of reaching here.
   let checkedEncryptionSetup = false;
   $: if (currentUser && !checkedEncryptionSetup) {
     checkedEncryptionSetup = true;
@@ -162,7 +173,7 @@
     {#if showAccountSettings}
       <AccountSettings on:close={() => (showAccountSettings = false)} />
     {/if}
-    {#if $recoveryChoiceNeeded}
+    {#if $recoveryChoiceNeeded || $recoveryCheckFailed}
       <RecoveryChoice />
     {/if}
     
