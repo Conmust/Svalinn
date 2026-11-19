@@ -17,6 +17,7 @@ pub struct Channel {
     pub id: Uuid,
     pub server_id: Uuid,
     pub name: String,
+    pub channel_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub has_unread: bool,
 }
@@ -24,6 +25,18 @@ pub struct Channel {
 #[derive(Deserialize)]
 pub struct CreateChannelRequest {
     pub name: String,
+    #[serde(default)]
+    pub channel_type: Option<String>,
+}
+
+/// Channel types: "text" or "voice". Defaults to "text" when absent, for
+/// backward compatibility with clients that don't send it.
+fn clean_channel_type(channel_type: Option<String>) -> Result<String, AppError> {
+    let channel_type = channel_type.unwrap_or_else(|| "text".to_string());
+    if !["text", "voice"].contains(&channel_type.as_str()) {
+        return Err(AppError::BadRequest("Invalid channel type".into()));
+    }
+    Ok(channel_type)
 }
 
 /// GET /api/v1/servers/:server_id/channels
@@ -38,7 +51,7 @@ pub async fn get_server_channels(
     let channels: Vec<Channel> = sqlx::query_as(
         r#"
         SELECT
-            c.id, c.server_id, c.name, c.created_at,
+            c.id, c.server_id, c.name, COALESCE(c.type, 'text') AS channel_type, c.created_at,
             EXISTS(
                 SELECT 1 FROM messages m
                 WHERE m.channel_id = c.id
@@ -89,17 +102,19 @@ pub async fn create_channel(
     Json(payload): Json<CreateChannelRequest>,
 ) -> Result<Json<Channel>, AppError> {
     let name = clean_name(&payload.name)?;
+    let channel_type = clean_channel_type(payload.channel_type)?;
 
     require_member(&db, server_id, user_id).await?;
 
     let channel: Channel = sqlx::query_as(
         r#"
-        INSERT INTO channels (server_id, name) VALUES ($1, $2)
-        RETURNING id, server_id, name, created_at, false AS has_unread
+        INSERT INTO channels (server_id, name, type) VALUES ($1, $2, $3)
+        RETURNING id, server_id, name, COALESCE(type, 'text') AS channel_type, created_at, false AS has_unread
         "#,
     )
     .bind(server_id)
     .bind(name)
+    .bind(channel_type)
     .fetch_one(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -107,7 +122,7 @@ pub async fn create_channel(
     // Everyone else's channel list updates straight away.
     let _ = db.message_tx.send(BroadcastMessage::to_server(
         "channel_created",
-        serde_json::json!({ "id": channel.id, "server_id": server_id, "name": channel.name, "created_at": channel.created_at }),
+        serde_json::json!({ "id": channel.id, "server_id": server_id, "name": channel.name, "channel_type": channel.channel_type, "created_at": channel.created_at }),
         server_id,
     ));
 

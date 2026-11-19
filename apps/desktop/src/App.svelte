@@ -11,10 +11,11 @@
   import DMList from './components/DMList.svelte';
   import DMChatArea from './components/DMChatArea.svelte';
   import type { Conversation } from './lib/conversations';
+  import type { Channel } from './lib/servers';
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
-  let activeChannel: string | null = null;
+  let activeChannel: Channel | null = null;
   let activeConversation: Conversation | null = null;
   let showRoster = false;
   let showAccountSettings = false;
@@ -62,7 +63,7 @@
     activeConversation = null;
   }
 
-  function handleChannelSelected(event: CustomEvent<string>) {
+  function handleChannelSelected(event: CustomEvent<Channel>) {
     activeChannel = event.detail;
   }
 
@@ -142,10 +143,10 @@
     
     <!-- 2. Channel List (Only show if a server is selected) -->
     {#if activeServer}
-      <ChannelList 
+      <ChannelList
         {currentUser}
         activeServer={activeServer}
-        activeChannel={activeChannel}
+        activeChannel={activeChannel?.id ?? null}
         on:channelSelected={handleChannelSelected}
         on:channelDeleted={() => (activeChannel = null)}
         on:createChannel={handleCreateChannel}
@@ -154,9 +155,15 @@
     {/if}
 
     <!-- 3. Chat Area (Only show if a channel is selected) -->
-    {#if activeChannel && activeServer}
+    {#if activeChannel && activeServer && activeChannel.channel_type === 'voice'}
+      <!-- Voice channels aren't wired up yet; be honest instead of showing a chat view. -->
+      <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
+        <div class="text-4xl mb-4">🔊</div>
+        <div class="text-xl font-bold">{'>'} Voice channels aren't supported yet</div>
+      </div>
+    {:else if activeChannel && activeServer}
       <ChatArea
-        channelId={activeChannel}
+        channelId={activeChannel.id}
         serverId={activeServer}
         {currentUser}
         {showRoster}
