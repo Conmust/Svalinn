@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "pnpm --filter desktop dev",
-    "build": "pnpm --filter desktop build",
+    "dev": "pnpm --filter desktop tauri dev",
+    "build": "pnpm --filter desktop tauri build",
     "test:e2e": "pnpm --filter e2e test",
     "check": "pnpm --filter desktop check"
   },
