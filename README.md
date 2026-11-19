@@ -53,12 +53,18 @@ The goal is to build a sharp, reliable wedge:
 
 Svalinn is designed to use as little memory and CPU as possible.
 
-Instead of bundling a full Chromium runtime like Electron apps do, Svalinn uses **Tauri** and the operating system’s native webview.
+Instead of bundling a full Chromium runtime like Electron apps do, Svalinn uses **Tauri** and the operating system's native webview.
+
+This buys very different results depending on platform. macOS (WKWebView) and Linux (WebKitGTK) are genuinely lightweight, OS-shared frameworks. Windows has no equivalent: Tauri's only supported webview there is **WebView2**, which is Chromium itself, running its own multi-process architecture (browser, GPU, renderer, network processes). There is no official lighter alternative today — Tauri's Servo-based experiment to replace system webviews (Verso) has stalled and isn't production-ready.
 
 Target MVP memory footprint:
 
 ```text
-Idle desktop client: <35 MB RAM
+Idle desktop client (macOS/Linux): <35 MB RAM
+Idle desktop client (Windows): Svalinn's own processes stay under 35 MB RAM, but total
+  Task-Manager-visible usage will be substantially higher (hundreds of MB) due to
+  WebView2's own Chromium process tree. This is WebView2 overhead, not Svalinn's
+  footprint — see "Important measurement note" below.
 ```
 
 This is a target, not a marketing guarantee. Benchmark methodology will be published as the app matures.
