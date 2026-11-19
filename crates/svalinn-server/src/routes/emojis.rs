@@ -66,6 +66,15 @@ pub async fn upload_emoji(
             let filename = field.file_name().unwrap_or("emoji.png").to_string();
             let bytes = field.bytes().await.map_err(|e| multipart_error(e, MAX_EMOJI_BYTES))?.to_vec();
 
+            // CodeQL flags `file_path` below as "uncontrolled data used in
+            // path expression" (same alert class as messages.rs's upload
+            // handler). Same false positive, for the same reason: neither
+            // `Uuid::new_v4()` (server-generated) nor `server_id` (a `Uuid`
+            // from the route's `Path<Uuid>` extractor -- axum rejects the
+            // request before this handler runs if it isn't a valid UUID)
+            // let attacker input through, and `file_ext` is filtered by
+            // `safe_extension()`'s strict ASCII-alphanumeric allowlist. See
+            // messages.rs's `create_message` for the full writeup.
             let file_ext = safe_extension(&filename, "png");
             let new_filename = format!("emoji_{}_{}.{}", Uuid::new_v4(), server_id, file_ext);
             let file_path = format!("uploads/{}", new_filename);

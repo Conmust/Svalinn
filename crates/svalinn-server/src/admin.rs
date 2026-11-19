@@ -10,6 +10,24 @@
 //!
 //! Banning takes effect immediately: the database notifies running servers,
 //! which close the user's connections, and every request checks the ban.
+//!
+//! **On the `println!("... {username} <{email}> ...")`-style confirmations
+//! throughout this file:** CodeQL flags each one as "cleartext logging of
+//! sensitive information" (nine alerts). This is a judgment call, not a
+//! clear-cut false positive the way the path/token ones elsewhere in this
+//! codebase are -- usernames and emails genuinely are PII, and they do get
+//! printed. But the risk profile is different from a server logging a
+//! secret into a shared, widely-accessible store: this is a one-shot,
+//! interactively-run CLI tool, invoked by a trusted operator, printing back
+//! to that same operator's own terminal an account identifier they either
+//! typed in as the command's argument or already looked up to run the
+//! command at all. No new exposure is created -- the operator already had
+//! this information. Stripping it from the output would make the tool's
+//! confirmations ("Banned so-and-so", "Created alice <alice@example.com>")
+//! useless for the operator to actually verify they did what they meant to.
+//! If this tool's output is ever piped into a shared/persistent log (e.g.
+//! a systemd journal collected centrally), that's worth revisiting then --
+//! not a reason to make the interactive case worse today.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

@@ -29,6 +29,13 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     // 2. Refuse to start without a proper secret for signing login tokens
+    //
+    // CodeQL flags the `eprintln!` below as "cleartext logging of sensitive
+    // information" because `warning` traces back to a function parameter
+    // named `secret`. False positive: `validate_jwt_secret()` (auth.rs)
+    // only ever returns a fixed diagnostic string about the secret's
+    // *length* (e.g. "JWT_SECRET is shorter than N characters...") -- it
+    // never returns, or logs, the secret's actual value.
     match crate::extractors::auth::init_jwt_secret() {
         Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
         Ok(None) => {}
