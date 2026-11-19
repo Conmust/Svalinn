@@ -1,29 +1,46 @@
 <script lang="ts">
   // The "Svalinn Gauge" -- see README.md's "The Svalinn Gauge" section.
-  // Polls the Tauri backend's `get_gauge_stats` command (apps/desktop/src-tauri/src/gauge.rs),
-  // which sums RSS/CPU across our process and every child process (webview
-  // helpers included), so the number reflects the whole app, not just the
-  // Rust side of it.
+  // Polls the Tauri backend's `get_gauge_stats` command (apps/desktop/src-tauri/src/gauge.rs).
+  //
+  // The badge shows Svalinn's OWN footprint (just our process, comparable to
+  // the README's memory target). Clicking it expands to the TOTAL across our
+  // whole process tree -- our process plus every webview/GPU/network helper
+  // -- broken down by which other processes it's tied to, since on Windows
+  // that total is dominated by WebView2's own Chromium process tree rather
+  // than anything Svalinn's own code is doing.
   import { onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
 
   const POLL_INTERVAL_MS = 1500;
   const HISTORY_LENGTH = 30;
 
-  interface GaugeStats {
-    memory_bytes: number;
-    cpu_percent: number;
+  interface ProcessGroup {
+    name: string;
     process_count: number;
+    memory_bytes: number;
   }
 
-  let memoryMb: number | null = null;
-  let cpuPercent: number | null = null;
+  interface GaugeStats {
+    app_memory_bytes: number;
+    app_cpu_percent: number;
+    total_memory_bytes: number;
+    total_cpu_percent: number;
+    process_count: number;
+    other_processes: ProcessGroup[];
+  }
+
+  let appMemoryMb: number | null = null;
+  let appCpuPercent: number | null = null;
+  let totalMemoryMb: number | null = null;
+  let totalCpuPercent: number | null = null;
   let processCount: number | null = null;
+  let otherProcesses: ProcessGroup[] = [];
   let unavailable = false;
   let expanded = false;
 
-  // Ring buffer of recent memory samples (MB), oldest first, for the
-  // optional sparkline the README calls for.
+  // Ring buffer of recent app-memory samples (MB), oldest first, for the
+  // optional sparkline the README calls for. Tracks the badge's own number
+  // (app usage), not the total, since that's what's always visible.
   let history: number[] = [];
 
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -31,12 +48,15 @@
   async function poll() {
     try {
       const stats = await invoke<GaugeStats>('get_gauge_stats');
-      memoryMb = stats.memory_bytes / (1024 * 1024);
-      cpuPercent = stats.cpu_percent;
+      appMemoryMb = stats.app_memory_bytes / (1024 * 1024);
+      appCpuPercent = stats.app_cpu_percent;
+      totalMemoryMb = stats.total_memory_bytes / (1024 * 1024);
+      totalCpuPercent = stats.total_cpu_percent;
       processCount = stats.process_count;
+      otherProcesses = stats.other_processes;
       unavailable = false;
 
-      history = [...history, memoryMb].slice(-HISTORY_LENGTH);
+      history = [...history, appMemoryMb].slice(-HISTORY_LENGTH);
     } catch (e) {
       // Not running under Tauri (e.g. `vite dev` in a plain browser tab for
       // frontend-only work), or the native call itself failed. Either way,
@@ -80,23 +100,24 @@
 >
   {#if unavailable}
     [ -- ]
-  {:else if memoryMb === null}
+  {:else if appMemoryMb === null}
     [ measuring... ]
   {:else}
-    [ {memoryMb.toFixed(0)} MB | {(cpuPercent ?? 0).toFixed(1)}% CPU ]
+    [ {appMemoryMb.toFixed(0)} MB | {(appCpuPercent ?? 0).toFixed(1)}% CPU ]
   {/if}
 </button>
 
 {#if expanded}
   <div
-    class="fixed bottom-10 left-2 z-[150] p-3 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono w-56 space-y-2"
+    class="fixed bottom-10 left-2 z-[150] p-3 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono w-64 space-y-2"
   >
     {#if unavailable}
       <div class="text-[#ffaa00]">Gauge unavailable in this environment.</div>
     {:else}
-      <div class="flex justify-between"><span class="text-[#00aa00]">Memory (RSS)</span><span>{memoryMb?.toFixed(1) ?? '--'} MB</span></div>
-      <div class="flex justify-between"><span class="text-[#00aa00]">CPU</span><span>{(cpuPercent ?? 0).toFixed(1)}%</span></div>
-      <div class="flex justify-between"><span class="text-[#00aa00]">Processes summed</span><span>{processCount ?? '--'}</span></div>
+      <div class="text-[#00aa00]">Svalinn (app only)</div>
+      <div class="flex justify-between pl-2"><span class="text-[#00aa00]">Memory (RSS)</span><span>{appMemoryMb?.toFixed(1) ?? '--'} MB</span></div>
+      <div class="flex justify-between pl-2"><span class="text-[#00aa00]">CPU</span><span>{(appCpuPercent ?? 0).toFixed(1)}%</span></div>
+
       {#if history.length >= 2}
         <svg viewBox="0 0 100 24" class="w-full h-6" preserveAspectRatio="none">
           <polyline
@@ -109,10 +130,29 @@
         </svg>
         <div class="text-[#006600]">last {history.length} samples (~{((history.length * POLL_INTERVAL_MS) / 1000).toFixed(0)}s)</div>
       {/if}
-      {#if import.meta.env.DEV && memoryMb !== null}
+
+      <div class="pt-2 border-t border-[#00aa00]/30 text-[#00aa00]">Total (incl. tied processes)</div>
+      <div class="flex justify-between pl-2"><span class="text-[#00aa00]">Memory</span><span>{totalMemoryMb?.toFixed(1) ?? '--'} MB</span></div>
+      <div class="flex justify-between pl-2"><span class="text-[#00aa00]">CPU</span><span>{(totalCpuPercent ?? 0).toFixed(1)}%</span></div>
+      <div class="flex justify-between pl-2"><span class="text-[#00aa00]">Processes summed</span><span>{processCount ?? '--'}</span></div>
+
+      {#if otherProcesses.length > 0}
+        <div class="pl-2 space-y-0.5">
+          {#each otherProcesses as group}
+            <div class="flex justify-between text-[#006600]">
+              <span>{group.name} ({group.process_count})</span>
+              <span>{(group.memory_bytes / (1024 * 1024)).toFixed(1)} MB</span>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="pl-2 text-[#006600]">No other processes tied to this app right now.</div>
+      {/if}
+
+      {#if import.meta.env.DEV && appMemoryMb !== null}
         <div class="text-[#006600] pt-1 border-t border-[#00aa00]/30 space-y-0.5">
-          <div>raw RSS: {Math.round(memoryMb * 1024 * 1024).toLocaleString()} bytes</div>
-          <div>methodology: sum of RSS/CPU across our process + every child OS process (webview helpers included)</div>
+          <div>raw app RSS: {Math.round(appMemoryMb * 1024 * 1024).toLocaleString()} bytes</div>
+          <div>methodology: "app" = our own process only; "total" = our process + every descendant OS process (webview/GPU/network helpers included)</div>
         </div>
       {/if}
     {/if}

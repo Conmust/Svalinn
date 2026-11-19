@@ -50,16 +50,42 @@ impl GaugeState {
 }
 
 #[derive(Serialize)]
-pub struct GaugeStats {
-    /// Resident-set size, in bytes, summed across our process tree.
-    pub memory_bytes: u64,
-    /// CPU usage in percent, summed across our process tree. May exceed
-    /// 100% on a multi-core machine if more than one core's worth of work
-    /// is in flight — intentional, matches what tools like Activity
-    /// Monitor / Task Manager show for multi-threaded processes.
-    pub cpu_percent: f32,
-    /// How many OS processes (main + any webview/GPU helpers) were summed.
+pub struct ProcessGroup {
+    /// Executable name as reported by the OS (e.g. "msedgewebview2.exe").
+    pub name: String,
+    /// How many processes with this name are in our tree (webview engines
+    /// commonly spawn several: browser/renderer/GPU/network, etc.).
     pub process_count: u32,
+    /// Resident-set size, in bytes, summed across those processes.
+    pub memory_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct GaugeStats {
+    /// Resident-set size, in bytes, of just our own process — the Rust
+    /// binary itself, excluding any webview/GPU helper processes. This is
+    /// the number comparable to the README's memory target.
+    pub app_memory_bytes: u64,
+    /// CPU usage in percent of just our own process.
+    pub app_cpu_percent: f32,
+    /// Resident-set size, in bytes, summed across our entire process tree
+    /// (our own process plus every descendant: webview renderer/GPU/network
+    /// helpers, etc.). This is what a user's Task Manager/Activity Monitor
+    /// total actually reflects.
+    pub total_memory_bytes: u64,
+    /// CPU usage in percent, summed across our entire process tree. May
+    /// exceed 100% on a multi-core machine if more than one core's worth of
+    /// work is in flight — intentional, matches what tools like Activity
+    /// Monitor / Task Manager show for multi-threaded processes.
+    pub total_cpu_percent: f32,
+    /// How many OS processes (main + any webview/GPU helpers) were summed
+    /// into `total_memory_bytes`.
+    pub process_count: u32,
+    /// Everything in the tree other than our own process, grouped by
+    /// executable name and sorted largest-first — e.g. so the UI can show
+    /// "msedgewebview2.exe (4 processes): 390 MB" when a user asks why
+    /// total usage is higher than the app's own footprint.
+    pub other_processes: Vec<ProcessGroup>,
 }
 
 fn get_gauge_stats_impl(state: tauri::State<'_, GaugeState>) -> Result<GaugeStats, String> {
@@ -113,22 +139,52 @@ fn compute_stats(sys: &mut System) -> GaugeStats {
         }
     }
 
-    let mut memory_bytes = 0u64;
-    let mut cpu_percent = 0f32;
+    let mut app_memory_bytes = 0u64;
+    let mut app_cpu_percent = 0f32;
+    let mut total_memory_bytes = 0u64;
+    let mut total_cpu_percent = 0f32;
     let mut process_count = 0u32;
+    // name -> (process_count, memory_bytes), for everything that isn't us.
+    let mut other_groups: HashMap<String, (u32, u64)> = HashMap::new();
 
     for pid in &tree {
         if let Some(process) = processes.get(pid) {
-            memory_bytes = memory_bytes.saturating_add(process.memory());
-            cpu_percent += process.cpu_usage();
+            let memory = process.memory();
+            let cpu = process.cpu_usage();
+
+            total_memory_bytes = total_memory_bytes.saturating_add(memory);
+            total_cpu_percent += cpu;
             process_count += 1;
+
+            if *pid == our_pid {
+                app_memory_bytes = memory;
+                app_cpu_percent = cpu;
+            } else {
+                let name = process.name().to_string_lossy().into_owned();
+                let entry = other_groups.entry(name).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(memory);
+            }
         }
     }
 
+    let mut other_processes: Vec<ProcessGroup> = other_groups
+        .into_iter()
+        .map(|(name, (process_count, memory_bytes))| ProcessGroup {
+            name,
+            process_count,
+            memory_bytes,
+        })
+        .collect();
+    other_processes.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
+
     GaugeStats {
-        memory_bytes,
-        cpu_percent,
+        app_memory_bytes,
+        app_cpu_percent,
+        total_memory_bytes,
+        total_cpu_percent,
         process_count,
+        other_processes,
     }
 }
 
@@ -164,8 +220,12 @@ mod tests {
         // should already be sane.
         let first = compute_stats(&mut sys);
         assert!(
-            first.memory_bytes > 0,
+            first.app_memory_bytes > 0,
             "our own process should report nonzero RSS"
+        );
+        assert!(
+            first.total_memory_bytes >= first.app_memory_bytes,
+            "total should never be less than our own process's share of it"
         );
         assert!(
             first.process_count >= 1,
@@ -175,10 +235,11 @@ mod tests {
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
 
         let second = compute_stats(&mut sys);
-        assert!(second.memory_bytes > 0);
+        assert!(second.app_memory_bytes > 0);
+        assert!(second.total_memory_bytes > 0);
         assert!(second.process_count >= 1);
         assert!(
-            second.cpu_percent >= 0.0,
+            second.total_cpu_percent >= 0.0,
             "cpu usage should never be negative"
         );
     }
@@ -186,9 +247,12 @@ mod tests {
     #[test]
     fn reject_if_empty_errors_on_zero_processes() {
         let empty = GaugeStats {
-            memory_bytes: 0,
-            cpu_percent: 0.0,
+            app_memory_bytes: 0,
+            app_cpu_percent: 0.0,
+            total_memory_bytes: 0,
+            total_cpu_percent: 0.0,
             process_count: 0,
+            other_processes: Vec::new(),
         };
         assert!(
             reject_if_empty(empty).is_err(),
@@ -199,11 +263,20 @@ mod tests {
     #[test]
     fn reject_if_empty_passes_through_real_stats() {
         let real = GaugeStats {
-            memory_bytes: 1234,
-            cpu_percent: 5.0,
+            app_memory_bytes: 1000,
+            app_cpu_percent: 2.0,
+            total_memory_bytes: 1234,
+            total_cpu_percent: 5.0,
             process_count: 2,
+            other_processes: vec![ProcessGroup {
+                name: "helper.exe".to_string(),
+                process_count: 1,
+                memory_bytes: 234,
+            }],
         };
         let result = reject_if_empty(real).expect("nonzero process_count should pass through");
-        assert_eq!(result.memory_bytes, 1234);
+        assert_eq!(result.total_memory_bytes, 1234);
+        assert_eq!(result.app_memory_bytes, 1000);
+        assert_eq!(result.other_processes.len(), 1);
     }
 }
