@@ -400,3 +400,454 @@ pub async fn send_conversation_message(
 
     Ok(Json(message))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::future::join_all;
+
+    /// Connects to the same database the app uses in development (see
+    /// `.env`), matching `main.rs`'s own startup. Every test using this
+    /// shares that database with manual testing and every other test, so
+    /// each test must create its own uniquely-named data and never mutate
+    /// or assert on rows it didn't create itself.
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    /// Inserts a throwaway user with a randomly-generated unique
+    /// username/email, so concurrent/test runs never collide. The password
+    /// hash is a dummy value: these users never log in.
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    /// Like `create_test_user`, but explicitly sets `patron_tier` to NULL
+    /// (rather than relying on the column's default) to prove the
+    /// `COALESCE(u.patron_tier, 'free')` in the conversation queries really
+    /// handles a null value, not just an unset one.
+    async fn create_test_user_with_null_patron_tier(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name, patron_tier) VALUES ($1, $2, $3, $4, NULL) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user with null patron_tier")
+    }
+
+    /// Deletes a test user by id. Relies on the `ON DELETE CASCADE` FKs from
+    /// `conversation_participants.user_id`, `messages.user_id`, and
+    /// `channel_reads.user_id` to clean up everything that user created, so
+    /// repeated test runs don't grow the shared dev database forever.
+    ///
+    /// Note: this does NOT delete the `conversations` row itself (that table
+    /// has no FK back to `users`), so a test that created a conversation must
+    /// also call `cleanup_test_conversation` for it.
+    ///
+    /// Best-effort / happy-path only: called at the end of each test's
+    /// function body, so a panicking `assert!` earlier in the test will skip
+    /// it and leave that test's rows behind. That's an acceptable tradeoff
+    /// for a non-blocking cleanup improvement; a panic-safe RAII guard would
+    /// add real complexity for comparatively little benefit here.
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    /// Deletes a test conversation by id. The `conversations` table has no
+    /// FK back to `users`, so `cleanup_test_user` alone leaves an empty
+    /// orphaned conversation row behind; call this too (after cleaning up
+    /// that conversation's test users) in any test that created one. By the
+    /// time this runs, `conversation_participants`/`messages`/
+    /// `channel_reads` rows for that conversation are already gone via the
+    /// user-cascade, so this plain delete has nothing left to cascade and is
+    /// safe to run afterward. Same best-effort/happy-path caveat as
+    /// `cleanup_test_user`.
+    async fn cleanup_test_conversation(db: &Database, conversation_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1").bind(conversation_id).execute(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn create_or_get_conversation_is_idempotent_both_orderings() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conv_ab = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("A->B create_or_get_conversation should succeed")
+        .0
+        .id;
+
+        let conv_ba = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Json(CreateConversationRequest { participant_id: user_a }),
+        )
+        .await
+        .expect("B->A create_or_get_conversation should succeed")
+        .0
+        .id;
+
+        assert_eq!(conv_ab, conv_ba, "both orderings should return the same conversation id");
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM conversations c
+            WHERE EXISTS(SELECT 1 FROM conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $1)
+              AND EXISTS(SELECT 1 FROM conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $2)
+            "#,
+        )
+        .bind(user_a)
+        .bind(user_b)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count query failed");
+        assert_eq!(count, 1, "exactly one conversation should exist for this pair of users");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conv_ab).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_or_get_conversation_is_race_safe_under_concurrency() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        const TASK_COUNT: usize = 20;
+        let tasks: Vec<_> = (0..TASK_COUNT)
+            .map(|i| {
+                let db = db.clone();
+                // Alternate direction to exercise the sorted-pair advisory lock
+                // regardless of who's "current user" vs "other user".
+                let (current, other) = if i % 2 == 0 { (user_a, user_b) } else { (user_b, user_a) };
+                tokio::spawn(async move {
+                    create_or_get_conversation(
+                        State(db),
+                        CurrentUser(current),
+                        Json(CreateConversationRequest { participant_id: other }),
+                    )
+                    .await
+                    .map(|Json(c)| c.id)
+                })
+            })
+            .collect();
+
+        let results: Vec<Uuid> = join_all(tasks)
+            .await
+            .into_iter()
+            .map(|join_result| join_result.expect("task panicked").expect("create_or_get_conversation failed"))
+            .collect();
+
+        assert_eq!(results.len(), TASK_COUNT);
+        let first = results[0];
+        assert!(results.iter().all(|id| *id == first), "every concurrent call should return the same conversation id, got: {results:?}");
+
+        let conversation_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM conversations c
+            WHERE EXISTS(SELECT 1 FROM conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $1)
+              AND EXISTS(SELECT 1 FROM conversation_participants p WHERE p.conversation_id = c.id AND p.user_id = $2)
+            "#,
+        )
+        .bind(user_a)
+        .bind(user_b)
+        .fetch_one(&db.pool)
+        .await
+        .expect("conversation count query failed");
+        assert_eq!(conversation_count, 1, "concurrent calls must not create more than one conversation");
+
+        let participant_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = $1",
+        )
+        .bind(first)
+        .fetch_one(&db.pool)
+        .await
+        .expect("participant count query failed");
+        assert_eq!(participant_count, 2, "the conversation must end up with exactly two participants");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, first).await;
+    }
+
+    #[tokio::test]
+    async fn create_or_get_conversation_rejects_self() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+
+        let result = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_a }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for self-conversation, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+    }
+
+    #[tokio::test]
+    async fn create_or_get_conversation_rejects_nonexistent_participant() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let bogus_participant = Uuid::new_v4();
+
+        let result = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: bogus_participant }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected AppError::NotFound for a nonexistent participant, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+    }
+
+    #[tokio::test]
+    async fn non_participant_is_forbidden_from_messages() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+        let user_c = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let read_result = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_c),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None }),
+        )
+        .await;
+        match read_result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden reading messages as a non-participant, got {other:?}"),
+        }
+
+        let send_result = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_c),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: "hello from an outsider".into(),
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+            }),
+        )
+        .await;
+        match send_result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden sending a message as a non-participant, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_user(&db, user_c).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    #[tokio::test]
+    async fn send_then_fetch_round_trip() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: "hello from A".into(),
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+            }),
+        )
+        .await
+        .expect("sending message failed")
+        .0;
+
+        assert_eq!(sent.content, "hello from A");
+        assert_eq!(sent.user_id, user_a);
+
+        let messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None }),
+        )
+        .await
+        .expect("fetching messages failed")
+        .0;
+
+        let found = messages.iter().find(|m| m.id == sent.id);
+        let found = found.expect("the message sent by A should appear in B's view of the conversation");
+        assert_eq!(found.content, "hello from A");
+        assert_eq!(found.user_id, user_a);
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    #[tokio::test]
+    async fn has_unread_cycles_correctly() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let _ = send_conversation_message(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: "ping".into(),
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+            }),
+        )
+        .await
+        .expect("sending message failed");
+
+        // B has an unread message from A.
+        let b_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_b))
+            .await
+            .expect("fetching B's conversations failed")
+            .0;
+        let b_view = b_conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .expect("B should see the conversation");
+        assert!(b_view.has_unread, "B should have an unread message right after A sends one");
+
+        // A's own list should never show unread for a message A sent themselves.
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+            .await
+            .expect("fetching A's conversations failed")
+            .0;
+        let a_view = a_conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .expect("A should see the conversation");
+        assert!(!a_view.has_unread, "A should never see unread for their own sent message");
+
+        // B reads the conversation (loading the latest page marks it read).
+        let _ = get_conversation_messages(
+            State(db.clone()),
+            CurrentUser(user_b),
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None }),
+        )
+        .await
+        .expect("fetching messages as B failed");
+
+        let b_conversations_after = get_user_conversations(State(db.clone()), CurrentUser(user_b))
+            .await
+            .expect("fetching B's conversations after read failed")
+            .0;
+        let b_view_after = b_conversations_after
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .expect("B should still see the conversation");
+        assert!(!b_view_after.has_unread, "B's unread flag should clear after loading messages");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    #[tokio::test]
+    async fn participant_patron_tier_defaults_to_free_when_null() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let patron_user = create_test_user_with_null_patron_tier(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: patron_user }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+            .await
+            .expect("fetching A's conversations failed")
+            .0;
+        let view = a_conversations
+            .iter()
+            .find(|c| c.participant_id == patron_user)
+            .expect("A should see the conversation with the null-patron-tier user");
+        assert_eq!(view.participant_patron_tier, "free", "a NULL patron_tier should surface as \"free\", not an error or missing field");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, patron_user).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+}
