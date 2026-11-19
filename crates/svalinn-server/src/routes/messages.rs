@@ -266,7 +266,30 @@ pub async fn create_message(
             let bytes = field.bytes().await.map_err(|e| multipart_error(e, MAX_ATTACHMENT_BYTES))?.to_vec();
             let size = bytes.len() as i64;
 
-            // Save file locally
+            // Save file locally.
+            //
+            // CodeQL flags `file_path` below as "uncontrolled data used in
+            // path expression" because the user-supplied `filename` feeds
+            // into it. This is a false positive, not a gap: none of the
+            // three pieces that make up `new_filename` let attacker input
+            // reach the filesystem path.
+            //   - `Uuid::new_v4()` is server-generated.
+            //   - `user_id` is a `Uuid` from the authenticated session
+            //     extractor, not client-shaped text -- its `Display` always
+            //     renders as a plain hex-dash UUID, so it can't carry a `/`
+            //     or `..`.
+            //   - `file_ext` is the *only* piece derived from the raw
+            //     `filename`, and it's passed through `safe_extension()`
+            //     (access.rs), which only returns the extension if it's
+            //     <=10 chars of plain ASCII alphanumerics -- anything else
+            //     (`.`, `/`, `..`, null bytes, ...) falls back to `"bin"`.
+            //     See `safe_extension`'s `rejects_path_tricks_and_missing_extensions`
+            //     test for this exact threat model.
+            // CodeQL's taint tracker doesn't recognize `safe_extension` as a
+            // sanitizer (it's hand-written, not a known library function),
+            // so it still flags the flow even though the allowlist breaks
+            // it. Dismissed on GitHub as a false positive -- keep this
+            // comment in sync if `safe_extension` or this call site changes.
             let file_ext = safe_extension(&filename, "bin");
             let new_filename = format!("msg_{}_{}.{}", Uuid::new_v4(), user_id, file_ext);
             let file_path = format!("uploads/{}", new_filename);
