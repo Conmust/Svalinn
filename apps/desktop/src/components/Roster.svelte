@@ -2,7 +2,9 @@
   import { onMount, onDestroy } from 'svelte';
   import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { wsClient } from '../lib/websocket';
+  import { fetchUserProfile, type UserProfile } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
+  import UserProfileModal from './UserProfileModal.svelte';
 
   export let serverId: string | null = null;
   export let currentUser: any = null;
@@ -21,6 +23,25 @@
   let members: Member[] = [];
   let loading = true;
   let myRank = 1;
+
+  // Viewing a member's profile (read-only; separate from the Manage dialog).
+  let viewingProfile: UserProfile | null = null;
+  let profileError = '';
+  // Guards against a slower earlier request clobbering a faster later one
+  // if someone clicks two different members in quick succession -- only the
+  // most recently issued request is allowed to apply its result.
+  let profileRequestId = 0;
+
+  async function openProfile(member: Member) {
+    const requestId = ++profileRequestId;
+    profileError = '';
+    try {
+      const profile = await fetchUserProfile(member.id);
+      if (requestId === profileRequestId) viewingProfile = profile;
+    } catch (err: any) {
+      if (requestId === profileRequestId) profileError = err.message || 'Failed to load profile';
+    }
+  }
 
   // owner > admin > moderator > member; you can only act on lower ranks.
   function rankOf(m: Member): number {
@@ -211,14 +232,21 @@
 
         <!-- Members in this status -->
         {#each group.members as member}
-          <div class="group flex items-center gap-3 px-2 py-2 rounded hover:bg-[rgba(0,255,0,0.05)] transition-colors ">
+          <div
+            class="group flex items-center gap-3 px-2 py-2 rounded hover:bg-[rgba(0,255,0,0.05)] transition-colors cursor-pointer"
+            role="button"
+            tabindex="0"
+            aria-label="View {member.username}'s profile"
+            on:click={() => openProfile(member)}
+            on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), openProfile(member))}
+          >
             <div class="relative">
               <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
                 {member.username[0].toUpperCase()}
               </div>
-              
+
               <!-- Status Indicator -->
-              <div 
+              <div
                 class="absolute bottom-0 right-0 w-3 h-3 border-2 border-[#0a0e0a] rounded-full"
                 style="background-color: {group.config.color}; box-shadow: {group.config.glow};"
               ></div>
@@ -238,7 +266,7 @@
                 {roleLabel(member)}
               </div>
               {#if canActOn(member)}
-                <button type="button" class="hidden group-hover:block group-focus-within:block text-[10px] px-1.5 py-0.5 border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black" aria-label="Manage {member.username}" on:click={() => openManage(member)}>Manage</button>
+                <button type="button" class="hidden group-hover:block group-focus-within:block text-[10px] px-1.5 py-0.5 border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black" aria-label="Manage {member.username}" on:click|stopPropagation={() => openManage(member)}>Manage</button>
               {:else}
                 <div class="hidden group-hover:block text-xs text-[#00aa00] capitalize terminal-glow">{roleLabel(member)}</div>
               {/if}
@@ -310,4 +338,11 @@
       </div>
     </div>
   {/if}
+
+  {#if profileError}
+    <div class="fixed bottom-2 right-2 z-[150] px-3 py-2 bg-black border border-red-500 text-red-500 text-xs">
+      {'>'} {profileError}
+    </div>
+  {/if}
+  <UserProfileModal user={viewingProfile} on:close={() => (viewingProfile = null)} />
 </aside>

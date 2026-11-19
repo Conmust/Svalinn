@@ -44,3 +44,28 @@ export async function fetchAllUsers(): Promise<PublicUser[]> {
 
   return response.json();
 }
+
+export const PATRON_TIERS = ['free', 'patron', 'guild', 'enterprise'] as const;
+export type PatronTier = (typeof PATRON_TIERS)[number];
+
+/**
+ * Self-service patron tier change. There's no payment processor wired up
+ * yet (see README's MVP scope) -- this really does let a user pick any
+ * tier for themselves with no billing check. It exists for honest testing
+ * and for self-hosters who want to badge accounts manually, not as a real
+ * paywall; don't read it as proof the app monetizes today.
+ */
+export async function updateMyPatronTier(tier: PatronTier): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/patron-tier`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ patron_tier: tier }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update patron tier');
+  }
+
+  return response.json();
+}

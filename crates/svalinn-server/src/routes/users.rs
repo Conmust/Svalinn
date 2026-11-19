@@ -244,6 +244,7 @@ pub struct UserProfile {
 
 pub async fn get_user_profile(
     State(db): State<Database>,
+    CurrentUser(_caller_id): CurrentUser,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserProfile>, AppError> {
     let user: Option<UserProfile> = sqlx::query_as(
@@ -685,6 +686,100 @@ mod tests {
         assert_eq!(patron_tier, "patron", "the database row should reflect the update");
 
         cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn self_service_update_patron_tier_changes_own_tier() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = update_patron_tier(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(UpdatePatronRequest { patron_tier: "guild".into() }),
+        )
+        .await
+        .expect("a user should be able to set their own patron tier");
+
+        assert_eq!(result.0.patron_tier, "guild");
+
+        let patron_tier: String =
+            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching the user's patron_tier failed");
+        assert_eq!(patron_tier, "guild", "the database row should reflect the self-service update");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn self_service_update_patron_tier_rejects_unknown_tier() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = update_patron_tier(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(UpdatePatronRequest { patron_tier: "super-ultra-vip".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an unknown tier, got {other:?}"),
+        }
+
+        let patron_tier: String =
+            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching the user's patron_tier failed");
+        assert_eq!(patron_tier, "free", "a rejected tier name must not change the stored value");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn self_service_update_patron_tier_cannot_target_another_user() {
+        // There's no `user_id` field on `UpdatePatronRequest` at all -- unlike
+        // `admin_update_patron_tier`, the self-service endpoint always acts on
+        // the caller's own `CurrentUser` id, so there's no request field that
+        // could let one user change another's tier. This test pins that
+        // shape down: if a `user_id` field is ever added to
+        // `UpdatePatronRequest`, this won't catch a regression, but changing
+        // who it updates without changing the type would fail to compile
+        // against the call in `update_patron_tier`'s body.
+        let db = test_db().await;
+        let caller = create_test_user(&db).await;
+        let other = create_test_user(&db).await;
+
+        let _ = update_patron_tier(
+            State(db.clone()),
+            CurrentUser(caller),
+            Json(UpdatePatronRequest { patron_tier: "patron".into() }),
+        )
+        .await
+        .expect("updating the caller's own tier should succeed");
+
+        let other_tier: String =
+            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(other).fetch_one(&db.pool).await.expect("fetching the other user's patron_tier failed");
+        assert_eq!(other_tier, "free", "updating the caller's tier must not affect a different user's row");
+
+        cleanup_test_user(&db, caller).await;
+        cleanup_test_user(&db, other).await;
+    }
+
+    #[tokio::test]
+    async fn get_user_profile_returns_expected_fields() {
+        let db = test_db().await;
+        let viewer = create_test_user(&db).await;
+        let target = create_test_user(&db).await;
+
+        let profile = get_user_profile(State(db.clone()), CurrentUser(viewer), Path(target))
+            .await
+            .expect("fetching an existing user's profile should succeed");
+
+        assert_eq!(profile.0.id, target);
+        assert_eq!(profile.0.patron_tier, Some("free".to_string()));
+        assert_eq!(profile.0.status, "offline");
+
+        cleanup_test_user(&db, viewer).await;
         cleanup_test_user(&db, target).await;
     }
 
