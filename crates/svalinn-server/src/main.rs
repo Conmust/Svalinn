@@ -133,6 +133,7 @@ async fn main() {
         .route("/api/v1/users/me/email", patch(routes::users::change_email))
         .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
+        .route("/api/v1/users/me/patron-tier", patch(routes::users::update_patron_tier))
         .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))
         .route("/api/v1/admin/patron-tier", patch(routes::users::admin_update_patron_tier))
 

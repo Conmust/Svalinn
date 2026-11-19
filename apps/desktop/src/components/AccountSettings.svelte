@@ -3,6 +3,8 @@
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
+  import { updateMyPatronTier, PATRON_TIERS, type PatronTier } from '../lib/users';
+  import PatronBadge from './PatronBadge.svelte';
   import { getMyDeviceId } from '../lib/crypto';
   import { deviceEncryptionReady, replaceActiveKeypair, restoreFromBackup, IncorrectPassphraseError } from '../lib/recovery';
   import { fetchKeyBackup, createOrReplaceKeyBackup, deleteKeyBackup, type KeyBackupRecord } from '../lib/recovery';
@@ -12,6 +14,31 @@
   let username = '';
   let email = '';
   let isSiteOwner = false;
+
+  // Patron tier (self-service -- see lib/users.ts's updateMyPatronTier doc
+  // comment: there's no billing integration, so this is a free pick, not
+  // a real purchase).
+  let patronTier: PatronTier = 'free';
+  let patronBusy = false;
+  let patronError = '';
+  let patronMessage = '';
+
+  async function selectPatronTier(tier: PatronTier) {
+    if (tier === patronTier || patronBusy) return;
+    patronError = patronMessage = '';
+    patronBusy = true;
+    try {
+      const updated = await updateMyPatronTier(tier);
+      patronTier = (updated.patron_tier as PatronTier) ?? 'free';
+      const user = getCurrentUser();
+      if (user) updateUserInStorage({ ...user, patron_tier: patronTier });
+      patronMessage = tier === 'free' ? 'Patron tier cleared.' : `Patron tier set to ${tier}.`;
+    } catch (err: any) {
+      patronError = err.message || 'Failed to update patron tier';
+    } finally {
+      patronBusy = false;
+    }
+  }
 
   // Devices (per-device E2EE keys)
   let devices: MyDevice[] = [];
@@ -240,6 +267,12 @@
       email = account.email;
       isSiteOwner = account.is_site_owner;
     }
+    // /me/account doesn't carry patron_tier -- /me (get_current_user) does.
+    const meRes = await apiFetch(`${apiBase()}/api/v1/users/me`);
+    if (meRes.ok) {
+      const me = await meRes.json();
+      if (PATRON_TIERS.includes(me.patron_tier)) patronTier = me.patron_tier;
+    }
     await loadDevices();
     await loadKeyBackup();
   });
@@ -326,6 +359,29 @@
         {#if isSiteOwner}
           <div class="inline-block mt-2 px-2 py-0.5 text-[10px] uppercase tracking-widest border border-[#ffaa00] text-[#ffaa00]">Site owner</div>
         {/if}
+      </section>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Patron tier</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          Svalinn doesn't have billing set up yet, so this is a free, self-service pick -- not a real purchase.
+          It only controls which badge shows next to your name.
+        </p>
+        <div class="grid grid-cols-2 gap-2">
+          {#each PATRON_TIERS as tier}
+            <button
+              type="button"
+              disabled={patronBusy}
+              class="flex items-center justify-center gap-1.5 py-2 border text-xs uppercase tracking-wider transition-colors disabled:opacity-50 {tier === patronTier ? 'border-[#00ff00] bg-[#00ff00]/10 text-[#00ff00]' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00]'}"
+              on:click={() => selectPatronTier(tier)}
+            >
+              {#if tier !== 'free'}<PatronBadge {tier} size="small" />{/if}
+              {tier}
+            </button>
+          {/each}
+        </div>
+        {#if patronError}<div class="text-xs text-red-500">{'>'} {patronError}</div>{/if}
+        {#if patronMessage}<div class="text-xs text-[#00ff00]">{'>'} {patronMessage}</div>{/if}
       </section>
 
       <form on:submit={changeEmail} class="space-y-3">
