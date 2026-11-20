@@ -35,7 +35,7 @@ pub async fn get_all_users(
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     let users: Vec<User> = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         FROM users
         WHERE banned_at IS NULL
         ORDER BY username ASC
@@ -61,7 +61,7 @@ pub async fn get_current_user(
 ) -> Result<Json<PublicUser>, AppError> {
     let user: User = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         FROM users
         WHERE id = $1
         "#,
@@ -90,7 +90,7 @@ pub async fn update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.patron_tier)
@@ -146,10 +146,68 @@ pub async fn update_avatar(
         UPDATE users
         SET avatar_url = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&avatar_url)
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateBadgeEmblemRequest {
+    /// One of the ids `crate::badges::allowed_emblems` returns for this
+    /// user's tier (or, for the site owner, any emblem including
+    /// `crate::badges::OWNER_EMBLEM`). `None`/omitted (or an empty string)
+    /// clears the selection back to that tier's default emblem.
+    #[serde(default)]
+    pub badge_emblem: Option<String>,
+}
+
+/// PATCH /api/v1/users/me/badge-emblem
+pub async fn update_badge_emblem(
+    State(db): State<Database>,
+    CurrentSession { user_id, session_id }: CurrentSession,
+    Json(payload): Json<UpdateBadgeEmblemRequest>,
+) -> Result<Json<PublicUser>, AppError> {
+    let requested = payload.badge_emblem.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let (patron_tier, is_site_owner): (String, bool) = sqlx::query_as(
+        "SELECT COALESCE(patron_tier, 'free'), COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let badge_emblem = match requested {
+        None => None,
+        Some(id) => {
+            let allowed = crate::badges::allowed_emblems(&patron_tier, is_site_owner);
+            if !allowed.contains(&id) {
+                return Err(AppError::BadRequest(
+                    "That emblem isn't available for your tier".into(),
+                ));
+            }
+            Some(id.to_string())
+        }
+    };
+
+    let user: User = sqlx::query_as(
+        r#"
+        UPDATE users
+        SET badge_emblem = $1
+        WHERE id = $2
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        "#,
+    )
+    .bind(&badge_emblem)
     .bind(user_id)
     .fetch_one(&db.pool)
     .await
@@ -188,7 +246,7 @@ pub async fn admin_update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.patron_tier)
@@ -219,7 +277,7 @@ pub async fn update_status(
         UPDATE users
         SET status = $1, is_online = $2, last_activity = CURRENT_TIMESTAMP
         WHERE id = $3
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.status)
@@ -275,7 +333,7 @@ pub async fn update_public_key(
         UPDATE users
         SET public_key = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(payload.public_key.trim())
@@ -314,6 +372,8 @@ pub struct UserProfile {
     /// param was given and the viewer is actually a member there -- NULL
     /// otherwise, including when no nickname is set.
     pub nickname: Option<String>,
+    pub badge_emblem: Option<String>,
+    pub is_site_owner: bool,
 }
 
 #[derive(Deserialize)]
@@ -341,7 +401,7 @@ pub async fn get_user_profile(
     let user: Option<UserProfile> = sqlx::query_as(
         r#"
         SELECT u.id, u.username, u.patron_tier, u.status, u.created_at, u.avatar_url,
-               sm.nickname
+               sm.nickname, u.badge_emblem, COALESCE(u.site_role = 'owner', false) AS is_site_owner
         FROM users u
         LEFT JOIN server_members sm ON sm.server_id = $2 AND sm.user_id = u.id
         WHERE u.id = $1
@@ -1305,6 +1365,150 @@ mod tests {
             .expect("listing users should succeed");
         let me_in_list = all.0.iter().find(|u| u.id == user).expect("self should be in the all-users list");
         assert!(me_in_list.avatar_url.as_deref().unwrap_or("").starts_with("/api/v1/files/pic.png"));
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    /// Sets a test user's `patron_tier` directly via SQL, bypassing
+    /// `update_patron_tier`'s own validation -- the badge-emblem tests only
+    /// care about having a user at a known tier, not about that endpoint.
+    async fn set_test_patron_tier(db: &Database, user_id: Uuid, tier: &str) {
+        sqlx::query("UPDATE users SET patron_tier = $1 WHERE id = $2")
+            .bind(tier)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to set test user's patron_tier");
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_accepts_an_emblem_from_the_users_own_tier() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "patron").await;
+
+        let result = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("starlight".into()) }),
+        )
+        .await
+        .expect("a patron picking a patron emblem should succeed");
+        assert_eq!(result.0.badge_emblem.as_deref(), Some("starlight"));
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_rejects_an_emblem_from_a_different_tier() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "patron").await;
+
+        // "ruby" is a guild emblem, not a patron one.
+        let result = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("ruby".into()) }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an emblem outside the user's tier, got {other:?}"),
+        }
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT badge_emblem FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching stored badge_emblem failed");
+        assert_eq!(stored, None, "a rejected emblem must not be stored");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_rejects_any_pick_for_a_free_tier_user() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await; // defaults to "free"
+
+        let result = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("crown".into()) }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "a free-tier user has no emblem picker");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_rejects_the_owner_rune_for_a_non_owner() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "guild").await;
+
+        let result = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("fehu_rune".into()) }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "the owner-exclusive rune must not be selectable by a non-owner, even at the guild tier"
+        );
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_lets_the_site_owner_pick_the_rune_or_any_other_emblem() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+        // The site owner flag is independent of patron_tier; leave it at the
+        // default "free" to prove the owner override doesn't depend on it.
+
+        let rune = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("fehu_rune".into()) }),
+        )
+        .await
+        .expect("the site owner should be able to pick the exclusive rune");
+        assert_eq!(rune.0.badge_emblem.as_deref(), Some("fehu_rune"));
+
+        let guild_pick = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("conqueror".into()) }),
+        )
+        .await
+        .expect("the site owner should also be able to pick a guild emblem despite being free-tier");
+        assert_eq!(guild_pick.0.badge_emblem.as_deref(), Some("conqueror"));
+
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn update_badge_emblem_clears_back_to_the_tier_default() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "patron").await;
+        let _ = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: Some("laurel".into()) }),
+        )
+        .await
+        .expect("setting an emblem should succeed");
+
+        let cleared = update_badge_emblem(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateBadgeEmblemRequest { badge_emblem: None }),
+        )
+        .await
+        .expect("clearing the emblem should succeed");
+        assert_eq!(cleared.0.badge_emblem, None);
 
         cleanup_test_user(&db, user).await;
     }

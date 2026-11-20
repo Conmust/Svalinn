@@ -26,5 +26,7 @@ pub struct ConversationWithParticipant {
     /// client-side rather than falling back to plaintext.
     pub participant_public_key: Option<String>,
     pub participant_avatar_url: Option<String>,
+    pub participant_badge_emblem: Option<String>,
+    pub participant_is_site_owner: bool,
     pub has_unread: bool,
 }

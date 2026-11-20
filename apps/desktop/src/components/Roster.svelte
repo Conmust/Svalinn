@@ -21,6 +21,7 @@
     is_site_owner: boolean;
     patron_tier: string;
     avatar_url?: string | null;
+    badge_emblem?: string | null;
   }
 
   /** What to actually show: the nickname set in this server, or the username. */
@@ -300,8 +301,8 @@
               <div class="text-sm font-medium text-[#00ff00] truncate terminal-glow">
                 {displayName(member)}
               </div>
-              {#if member.patron_tier && member.patron_tier !== 'free'}
-                <PatronBadge tier={member.patron_tier} size="small" />
+              {#if (member.patron_tier && member.patron_tier !== 'free') || member.is_site_owner}
+                <PatronBadge tier={member.patron_tier} emblem={member.badge_emblem} isSiteOwner={member.is_site_owner} size="small" />
               {/if}
               {#if member.id === currentUser?.id}
                 <button

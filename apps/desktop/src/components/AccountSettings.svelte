@@ -3,7 +3,7 @@
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
-  import { updateMyPatronTier, updateMyAvatar, PATRON_TIERS, type PatronTier } from '../lib/users';
+  import { updateMyPatronTier, updateMyAvatar, updateMyBadgeEmblem, allowedEmblems, PATRON_TIERS, type PatronTier } from '../lib/users';
   import { uploadFile } from '../lib/messages';
   import { selfAvatarUrl } from '../lib/selfProfile';
   import Avatar from './Avatar.svelte';
@@ -74,10 +74,34 @@
       const user = getCurrentUser();
       if (user) updateUserInStorage({ ...user, patron_tier: patronTier });
       patronMessage = tier === 'free' ? 'Patron tier cleared.' : `Patron tier set to ${tier}.`;
+      // Changing tier can invalidate the previously-picked emblem (it's no
+      // longer in the new tier's set), so re-fetch the server's view of it
+      // rather than assume it's still set.
+      badgeEmblem = updated.badge_emblem ?? null;
     } catch (err: any) {
       patronError = err.message || 'Failed to update patron tier';
     } finally {
       patronBusy = false;
+    }
+  }
+
+  // Badge emblem (which icon this tier's badge shows -- see PatronBadge.svelte)
+  let badgeEmblem: string | null = null;
+  let emblemBusy = false;
+  let emblemError = '';
+  $: emblemChoices = allowedEmblems(patronTier, isSiteOwner);
+
+  async function selectEmblem(id: string | null) {
+    if (id === badgeEmblem || emblemBusy) return;
+    emblemError = '';
+    emblemBusy = true;
+    try {
+      const updated = await updateMyBadgeEmblem(id);
+      badgeEmblem = updated.badge_emblem ?? null;
+    } catch (err: any) {
+      emblemError = err.message || 'Failed to update badge emblem';
+    } finally {
+      emblemBusy = false;
     }
   }
 
@@ -314,6 +338,7 @@
       const me = await meRes.json();
       if (PATRON_TIERS.includes(me.patron_tier)) patronTier = me.patron_tier;
       avatarUrl = me.avatar_url ?? null;
+      badgeEmblem = me.badge_emblem ?? null;
     }
     await loadDevices();
     await loadKeyBackup();
@@ -459,6 +484,38 @@
         {#if patronError}<div class="text-xs text-red-500">{'>'} {patronError}</div>{/if}
         {#if patronMessage}<div class="text-xs text-[#00ff00]">{'>'} {patronMessage}</div>{/if}
       </section>
+
+      {#if emblemChoices.length > 0}
+        <section class="space-y-3">
+          <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Badge emblem</h4>
+          <p class="text-[11px] text-[#00aa00]">
+            {isSiteOwner
+              ? 'As site owner you can use any emblem, including the owner-exclusive rune.'
+              : `Pick which emblem your ${patronTier} badge shows.`}
+          </p>
+          <div class="grid grid-cols-4 gap-2">
+            <button
+              type="button"
+              disabled={emblemBusy}
+              class="flex flex-col items-center justify-center gap-1 py-2 border text-[10px] uppercase tracking-wider transition-colors disabled:opacity-50 {badgeEmblem === null ? 'border-[#00ff00] bg-[#00ff00]/10 text-[#00ff00]' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00]'}"
+              on:click={() => selectEmblem(null)}
+            >
+              <span class="text-[9px]">Default</span>
+            </button>
+            {#each emblemChoices as id}
+              <button
+                type="button"
+                disabled={emblemBusy}
+                class="flex flex-col items-center justify-center gap-1 py-2 border text-[10px] uppercase tracking-wider transition-colors disabled:opacity-50 {badgeEmblem === id ? 'border-[#00ff00] bg-[#00ff00]/10 text-[#00ff00]' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00]'}"
+                on:click={() => selectEmblem(id)}
+              >
+                <PatronBadge tier={patronTier} emblem={id} isSiteOwner={false} size="medium" />
+              </button>
+            {/each}
+          </div>
+          {#if emblemError}<div class="text-xs text-red-500">{'>'} {emblemError}</div>{/if}
+        </section>
+      {/if}
 
       <form on:submit={changeEmail} class="space-y-3">
         <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Change email</h4>
