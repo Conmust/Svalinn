@@ -221,6 +221,7 @@
       <DMList
         activeConversation={activeConversation?.id ?? null}
         on:conversationSelected={handleConversationSelected}
+        on:logout={handleLogout}
       />
       {#if activeConversation}
         <DMChatArea
@@ -328,14 +329,3 @@
     </div>
   </div>
 {/if}
-
-<style>
-  :global(body) {
-    margin: 0;
-    padding: 0;
-    background-color: black;
-  }
-  .terminal-glow {
-    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
-  }
-</style>

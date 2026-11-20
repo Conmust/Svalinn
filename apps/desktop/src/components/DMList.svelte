@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, createEventDispatcher } from 'svelte';
-  import { getCurrentUser } from '../lib/auth';
+  import { getCurrentUser, logout } from '../lib/auth';
   import { fetchUserConversations, createConversation, type Conversation } from '../lib/conversations';
   import { fetchAllUsers, type PublicUser } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
@@ -70,6 +70,11 @@
     } finally {
       pickerLoading = false;
     }
+  }
+
+  function handleLogout() {
+    logout();
+    dispatch('logout');
   }
 
   async function pickUser(user: PublicUser) {
@@ -149,6 +154,31 @@
       {/each}
     {/if}
   </div>
+
+  <!-- User Footer (matches ChannelList's, so logout is reachable even with no servers joined) -->
+  <div class="p-3 border-t-2 border-[#00ff00] bg-black">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow flex-shrink-0">
+        {currentUser?.username?.[0]?.toUpperCase() ?? '?'}
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="text-xs text-[#00ff00] truncate terminal-glow">{currentUser?.username ?? 'Unknown'}</div>
+        <div class="text-[10px] text-[#00aa00] terminal-glow">Online</div>
+      </div>
+      <button
+        type="button"
+        class="w-7 h-7 flex-shrink-0 border border-[#00ff00] text-[#00ff00] flex items-center justify-center hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+        title="Logout"
+        aria-label="Logout"
+        on:click={handleLogout}
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v10" />
+        </svg>
+      </button>
+    </div>
+  </div>
 </aside>
 
 {#if showPicker}
@@ -207,14 +237,3 @@
     </div>
   </div>
 {/if}
-
-<style>
-  .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-  .custom-scrollbar::-webkit-scrollbar-track { background: #0a0e0a; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb { background: #00ff00; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #00aa00; }
-  .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #00ff00 #0a0e0a; }
-  .terminal-glow {
-    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
-  }
-</style>

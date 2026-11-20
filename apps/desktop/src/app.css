@@ -25,22 +25,35 @@ body {
   overflow: hidden;
 }
 
-/* Custom Scrollbar */
+/* Custom Scrollbar
+ * This is the single definition for every scrollable panel (channel list,
+ * DM list, chat history, roster, emoji/reaction pickers, etc). It used to
+ * also be redefined, identically, inside half a dozen components' own
+ * <style> blocks -- those local copies always won over this one (Svelte
+ * scopes component styles with a higher-specificity attribute selector),
+ * so this global rule was dead weight and a trap for anyone editing it
+ * expecting it to apply everywhere. Edit only here from now on. */
 .custom-scrollbar::-webkit-scrollbar {
-  width: 8px;
+  width: 6px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-track {
-  background: rgba(0, 255, 0, 0.05);
+  background: #0a0e0a;
+  border-radius: 3px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(0, 255, 0, 0.3);
-  border-radius: 4px;
+  background: #00ff00;
+  border-radius: 3px;
 }
 
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 255, 0, 0.5);
+  background: #00aa00;
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #00ff00 #0a0e0a;
 }
 
 /* Terminal CRT Scan-line Effect (applied globally) */
@@ -62,9 +75,13 @@ body::before {
   z-index: 9999;
 }
 
-/* Terminal Glow Effects */
+/* Terminal Glow Effects
+ * Same story as .custom-scrollbar above: several components redefined this
+ * locally with a tighter, dimmer glow (5px, 0.5 alpha) that silently shadowed
+ * this global rule everywhere it was used. Standardizing on that value here
+ * since it's the one actually seen in the running app. */
 .terminal-glow {
-  text-shadow: var(--terminal-glow);
+  text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
 }
 
 .terminal-box-glow {

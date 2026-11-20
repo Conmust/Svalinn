@@ -250,7 +250,7 @@
         <div class="relative group mb-1">
         <button
           type="button"
-          class="w-full text-left px-3 py-2 rounded hover:bg-[rgba(0,255,0,0.1)] transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)]' : channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : ''} {canManageChannels ? 'pr-14' : ''}"
+          class="w-full text-left px-3 py-2 rounded border-l-2 transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)] border-[#00ff00]' : 'border-transparent hover:bg-[rgba(0,255,0,0.1)] ' + (channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')} {canManageChannels ? 'pr-14' : ''}"
           aria-current={channel.id === activeChannel ? 'page' : undefined}
           on:click={() => handleChannelClick(channel)}
         >
@@ -261,7 +261,10 @@
           {/if}
 
           <div class="flex-1 min-w-0">
-            <div class="text-sm terminal-glow truncate {channel.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
+            <!-- This highlight is the only indicator of which channel is open
+                 (ChatArea's header no longer names it), so make "active"
+                 look as distinct as "unread", not just a faint tint. -->
+            <div class="text-sm terminal-glow truncate {channel.id === activeChannel || channel.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
               {channel.channel_type === 'voice' ? '🔊' : '#'} {channel.name}
             </div>
           </div>
@@ -279,22 +282,27 @@
 
   <!-- User Footer -->
   <div class="p-3 border-t-2 border-[#00ff00] bg-black">
-    <div class="flex items-center gap-2 mb-2">
-      <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow flex-shrink-0">
         {currentUser.username[0].toUpperCase()}
       </div>
       <div class="flex-1 min-w-0">
         <div class="text-xs text-[#00ff00] truncate terminal-glow">{currentUser.username}</div>
         <div class="text-[10px] text-[#00aa00] terminal-glow">Online</div>
       </div>
+      <button
+        type="button"
+        class="w-7 h-7 flex-shrink-0 border border-[#00ff00] text-[#00ff00] flex items-center justify-center hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+        title="Logout"
+        aria-label="Logout"
+        on:click={handleLogout}
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v10" />
+        </svg>
+      </button>
     </div>
-    <button
-      type="button"
-      class="w-full px-3 py-1.5 bg-black border border-[#00ff00] text-[#00ff00] text-xs hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
-      on:click={handleLogout}
-    >
-      Logout
-    </button>
   </div>
 
   <!-- Create Channel Modal -->
@@ -381,11 +389,3 @@
     />
   {/if}
 </aside>
-
-<style>
-  .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-  .custom-scrollbar::-webkit-scrollbar-track { background: #0a0e0a; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb { background: #00ff00; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #00aa00; }
-  .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #00ff00 #0a0e0a; }
-</style>

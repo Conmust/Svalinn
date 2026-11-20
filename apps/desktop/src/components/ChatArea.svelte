@@ -361,23 +361,24 @@
   }
 </script>
 
-<div class="flex-1 flex flex-col bg-black border-l-2 border-[#00ff00]">
+<div class="flex-1 min-w-0 flex flex-col bg-black border-l-2 border-[#00ff00]">
   <!-- Header -->
   <div class="h-12 border-b-2 border-[#00ff00] flex items-center px-4 gap-2">
-    <div class="flex-1">
-      <h3 class="text-sm font-bold text-[#00ff00] terminal-glow">
-        {'>'} Channel Chat
-      </h3>
-    </div>
+    <!-- Which channel this is now shows only via the highlighted row in the
+         channel list, not here -- this spacer just keeps the buttons below
+         pinned to the right edge like before. -->
+    <div class="flex-1"></div>
 
     {#if pinnedCount > 0}
       <button
         type="button"
-        class="px-3 py-1 border border-[#00ff00] text-xs transition-all terminal-glow {showPinnedOnly ? 'bg-[#00ff00] text-black' : 'text-[#00ff00] hover:bg-[#00ff00] hover:text-black'}"
-        title={showPinnedOnly ? 'Show all messages' : 'Show only pinned messages'}
+        class="w-7 h-7 flex-shrink-0 flex items-center justify-center border border-[#00ff00] text-xs transition-all terminal-glow {showPinnedOnly ? 'bg-[#00ff00] text-black' : 'text-[#00ff00] hover:bg-[#00ff00] hover:text-black'}"
+        title={showPinnedOnly ? 'Show all messages' : `Show only pinned messages (${pinnedCount})`}
+        aria-label={showPinnedOnly ? 'Show all messages' : `Show only pinned messages, ${pinnedCount} pinned`}
+        aria-pressed={showPinnedOnly}
         on:click={() => (showPinnedOnly = !showPinnedOnly)}
       >
-        📌 Pinned ({pinnedCount})
+        📌
       </button>
     {/if}
 
@@ -511,14 +512,3 @@
     on:cancel={() => (pendingDelete = null)}
   />
 {/if}
-
-<style>
-  .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-  .custom-scrollbar::-webkit-scrollbar-track { background: #0a0e0a; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb { background: #00ff00; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #00aa00; }
-  .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #00ff00 #0a0e0a; }
-  .terminal-glow {
-    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
-  }
-</style>

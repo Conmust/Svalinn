@@ -666,7 +666,7 @@
   }
 </script>
 
-<div class="flex-1 flex flex-col bg-black border-l-2 border-[#00ff00]">
+<div class="flex-1 min-w-0 flex flex-col bg-black border-l-2 border-[#00ff00]">
   <!-- Header -->
   <div class="h-12 border-b-2 border-[#00ff00] flex items-center px-4 gap-2">
     <div class="flex-1">
@@ -820,14 +820,3 @@
     </form>
   </div>
 </div>
-
-<style>
-  .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-  .custom-scrollbar::-webkit-scrollbar-track { background: #0a0e0a; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb { background: #00ff00; border-radius: 3px; }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #00aa00; }
-  .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #00ff00 #0a0e0a; }
-  .terminal-glow {
-    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
-  }
-</style>
