@@ -35,7 +35,7 @@ pub async fn get_all_users(
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     let users: Vec<User> = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         FROM users
         WHERE banned_at IS NULL
         ORDER BY username ASC
@@ -61,7 +61,7 @@ pub async fn get_current_user(
 ) -> Result<Json<PublicUser>, AppError> {
     let user: User = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         FROM users
         WHERE id = $1
         "#,
@@ -90,7 +90,7 @@ pub async fn update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.patron_tier)
@@ -146,7 +146,7 @@ pub async fn update_avatar(
         UPDATE users
         SET avatar_url = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&avatar_url)
@@ -204,7 +204,7 @@ pub async fn update_badge_emblem(
         UPDATE users
         SET badge_emblem = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&badge_emblem)
@@ -246,7 +246,7 @@ pub async fn admin_update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.patron_tier)
@@ -277,7 +277,7 @@ pub async fn update_status(
         UPDATE users
         SET status = $1, is_online = $2, last_activity = CURRENT_TIMESTAMP
         WHERE id = $3
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(&payload.status)
@@ -333,7 +333,7 @@ pub async fn update_public_key(
         UPDATE users
         SET public_key = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, COALESCE(site_role = 'owner', false) AS is_site_owner
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
         "#,
     )
     .bind(payload.public_key.trim())

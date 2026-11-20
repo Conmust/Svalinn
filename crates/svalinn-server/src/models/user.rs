@@ -28,9 +28,19 @@ pub struct User {
     /// "fehu_rune"), or NULL if they haven't picked one -- the client falls
     /// back to that tier's default emblem. See `crate::badges`.
     pub badge_emblem: Option<String>,
-    /// Whether this user is the site owner (`users.site_role = 'owner'`).
-    /// Unlocks every badge emblem, including the owner-exclusive rune.
-    pub is_site_owner: bool,
+    /// Raw `users.site_role` column ("owner" or NULL). Kept as the raw
+    /// column (rather than a computed `is_site_owner: bool`, as
+    /// `PublicUser` has) so this struct still matches plain `SELECT *` /
+    /// `RETURNING *` queries against `users` -- see e.g.
+    /// `routes::auth::register`/`login`, which construct a `User` that way
+    /// and have no `is_site_owner` column to select.
+    pub site_role: Option<String>,
+}
+
+impl User {
+    pub fn is_site_owner(&self) -> bool {
+        self.site_role.as_deref() == Some("owner")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +59,7 @@ pub struct PublicUser {
 
 impl From<User> for PublicUser {
     fn from(user: User) -> Self {
+        let is_site_owner = user.is_site_owner();
         Self {
             id: user.id,
             username: user.username,
@@ -59,7 +70,7 @@ impl From<User> for PublicUser {
             public_key: user.public_key,
             avatar_url: user.avatar_url,
             badge_emblem: user.badge_emblem,
-            is_site_owner: user.is_site_owner,
+            is_site_owner,
         }
     }
 }
