@@ -11,6 +11,8 @@ export interface UserProfile {
   /** This user's nickname in the server the profile was opened from, if any
    *  -- only populated when `fetchUserProfile` was called with a `serverId`. */
   nickname?: string | null;
+  badge_emblem?: string | null;
+  is_site_owner?: boolean;
 }
 
 /**
@@ -42,6 +44,8 @@ export interface PublicUser {
   bio?: string | null;
   public_key?: string | null;
   avatar_url?: string | null;
+  badge_emblem?: string | null;
+  is_site_owner?: boolean;
 }
 
 /** The logged-in user's own profile, with a freshly-signed `avatar_url`. */
@@ -111,6 +115,47 @@ export async function updateMyAvatar(avatarUrl: string | null): Promise<PublicUs
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
     throw new Error(errData.error || 'Failed to update avatar');
+  }
+
+  return response.json();
+}
+
+/** The 5 emblems a `patron`-tier user may pick from. */
+export const PATRON_EMBLEMS = ['crown', 'starlight', 'ember', 'wayfinder', 'laurel'] as const;
+/** The 10 emblems a `guild`-tier user may pick from. */
+export const GUILD_EMBLEMS = [
+  'aegis', 'blade', 'warbrand', 'bastion', 'anchor', 'storm', 'reaper', 'wolf', 'ruby', 'conqueror',
+] as const;
+/** Selectable only by the site owner. */
+export const OWNER_EMBLEM = 'fehu_rune';
+
+/**
+ * The emblem ids `patron_tier`/`isSiteOwner` may pick from. Mirrors the
+ * server's `crate::badges::allowed_emblems` -- the server re-validates
+ * regardless, this is just for building the picker UI.
+ */
+export function allowedEmblems(patronTier: string, isSiteOwner: boolean): string[] {
+  if (isSiteOwner) return [...PATRON_EMBLEMS, ...GUILD_EMBLEMS, OWNER_EMBLEM];
+  if (patronTier === 'patron') return [...PATRON_EMBLEMS];
+  if (patronTier === 'guild') return [...GUILD_EMBLEMS];
+  return [];
+}
+
+/**
+ * Sets or clears the caller's own badge emblem. `emblemId` must be one of
+ * `allowedEmblems(...)` for the caller's own tier, or `null` to clear back
+ * to that tier's default emblem.
+ */
+export async function updateMyBadgeEmblem(emblemId: string | null): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/badge-emblem`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ badge_emblem: emblemId }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update badge emblem');
   }
 
   return response.json();

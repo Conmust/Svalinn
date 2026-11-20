@@ -35,6 +35,7 @@ pub struct ServerMember {
     pub is_site_owner: bool,
     pub patron_tier: String,
     pub avatar_url: Option<String>,
+    pub badge_emblem: Option<String>,
 }
 
 pub async fn get_server_members(
@@ -57,7 +58,8 @@ pub async fn get_server_members(
                 s.owner_id = u.id AS is_owner,
                 COALESCE(u.site_role = 'owner', false) AS is_site_owner,
                 COALESCE(u.patron_tier, 'free') AS patron_tier,
-                u.avatar_url
+                u.avatar_url,
+                u.badge_emblem
             FROM server_members sm
             JOIN users u ON sm.user_id = u.id
             JOIN servers s ON s.id = sm.server_id

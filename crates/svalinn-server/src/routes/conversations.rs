@@ -28,6 +28,8 @@ const CONVERSATION_COLUMNS: &str = r#"
     COALESCE(u.patron_tier, 'free') AS participant_patron_tier,
     u.public_key AS participant_public_key,
     u.avatar_url AS participant_avatar_url,
+    u.badge_emblem AS participant_badge_emblem,
+    COALESCE(u.site_role = 'owner', false) AS participant_is_site_owner,
     EXISTS(
         SELECT 1 FROM messages m
         WHERE m.conversation_id = c.id

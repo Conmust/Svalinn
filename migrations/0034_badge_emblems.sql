@@ -1,0 +1,12 @@
+-- Lets a user pick which emblem their tier badge shows, instead of every
+-- member of a tier rendering the one fixed icon. NULL means "no selection
+-- yet" -- the client falls back to that tier's default emblem.
+--
+-- Validity of the stored value against the user's current tier (and the
+-- site-owner-exclusive "fehu_rune") is enforced in the application layer
+-- (see `svalinn_server::badges`), not a CHECK constraint, because the valid
+-- set depends on `patron_tier`/`site_role`, which this column doesn't know
+-- about and which can change independently afterwards (e.g. downgrading a
+-- tier doesn't retroactively clear an emblem picked while on a higher one --
+-- the server re-validates on next read/write instead).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS badge_emblem VARCHAR(32);

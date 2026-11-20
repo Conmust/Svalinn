@@ -153,8 +153,13 @@
             <div class="text-sm terminal-glow truncate {conversation.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
               {conversation.participant_username || 'Unknown User'}
             </div>
-            {#if conversation.participant_patron_tier && conversation.participant_patron_tier !== 'free'}
-              <PatronBadge tier={conversation.participant_patron_tier} size="small" />
+            {#if (conversation.participant_patron_tier && conversation.participant_patron_tier !== 'free') || conversation.participant_is_site_owner}
+              <PatronBadge
+                tier={conversation.participant_patron_tier}
+                emblem={conversation.participant_badge_emblem}
+                isSiteOwner={conversation.participant_is_site_owner}
+                size="small"
+              />
             {/if}
           </div>
         </button>
@@ -237,8 +242,8 @@
               </div>
               <div class="flex-1 min-w-0 flex items-center gap-1">
                 <div class="text-sm text-[#00ff00] truncate terminal-glow">{user.username}</div>
-                {#if user.patron_tier && user.patron_tier !== 'free'}
-                  <PatronBadge tier={user.patron_tier} size="small" />
+                {#if (user.patron_tier && user.patron_tier !== 'free') || user.is_site_owner}
+                  <PatronBadge tier={user.patron_tier} emblem={user.badge_emblem} isSiteOwner={!!user.is_site_owner} size="small" />
                 {/if}
               </div>
             </button>

@@ -1,4 +1,5 @@
 mod access;
+mod badges;
 mod db;
 mod errors;
 mod extractors;
@@ -140,6 +141,7 @@ async fn main() {
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
         .route("/api/v1/users/me/patron-tier", patch(routes::users::update_patron_tier))
         .route("/api/v1/users/me/avatar", patch(routes::users::update_avatar))
+        .route("/api/v1/users/me/badge-emblem", patch(routes::users::update_badge_emblem))
         .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))
         .route("/api/v1/admin/patron-tier", patch(routes::users::admin_update_patron_tier))
 

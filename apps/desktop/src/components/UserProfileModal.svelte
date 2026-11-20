@@ -82,8 +82,8 @@
         <!-- Nickname (server-context) & Patron Badge -->
         <div class="flex items-center gap-2 mb-2">
           <h2 class="text-xl font-bold text-[#00ff00] terminal-glow">{user.nickname || user.username}</h2>
-          {#if user.patron_tier && user.patron_tier !== 'free'}
-            <PatronBadge tier={user.patron_tier} size="medium" />
+          {#if (user.patron_tier && user.patron_tier !== 'free') || user.is_site_owner}
+            <PatronBadge tier={user.patron_tier} emblem={user.badge_emblem} isSiteOwner={!!user.is_site_owner} size="medium" />
           {/if}
         </div>
         {#if user.nickname}

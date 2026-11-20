@@ -24,6 +24,13 @@ pub struct User {
     /// external URL. Signed into a viewer-specific link before being sent
     /// to a client -- see `routes::users::sign_avatar`.
     pub avatar_url: Option<String>,
+    /// This user's chosen tier-badge emblem id (e.g. "crown", "ruby",
+    /// "fehu_rune"), or NULL if they haven't picked one -- the client falls
+    /// back to that tier's default emblem. See `crate::badges`.
+    pub badge_emblem: Option<String>,
+    /// Whether this user is the site owner (`users.site_role = 'owner'`).
+    /// Unlocks every badge emblem, including the owner-exclusive rune.
+    pub is_site_owner: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +43,8 @@ pub struct PublicUser {
     pub bio: Option<String>,
     pub public_key: Option<String>,
     pub avatar_url: Option<String>,
+    pub badge_emblem: Option<String>,
+    pub is_site_owner: bool,
 }
 
 impl From<User> for PublicUser {
@@ -49,6 +58,8 @@ impl From<User> for PublicUser {
             bio: user.bio,
             public_key: user.public_key,
             avatar_url: user.avatar_url,
+            badge_emblem: user.badge_emblem,
+            is_site_owner: user.is_site_owner,
         }
     }
 }

@@ -29,6 +29,8 @@ export interface Conversation {
    * be blocked client-side rather than falling back to plaintext. */
   participant_public_key?: string | null;
   participant_avatar_url?: string | null;
+  participant_badge_emblem?: string | null;
+  participant_is_site_owner: boolean;
   has_unread: boolean;
 }
 
