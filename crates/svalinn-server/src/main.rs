@@ -5,6 +5,7 @@ mod errors;
 mod extractors;
 mod files;
 mod models;
+mod permissions;
 mod presence;
 mod rate_limit;
 mod sessions;
@@ -152,6 +153,31 @@ async fn main() {
         .route(
             "/api/v1/channels/:channel_id/member-devices",
             get(routes::channels::get_channel_member_devices),
+        )
+
+        // --- Roles & Permissions Routes ---
+        .route(
+            "/api/v1/servers/:server_id/roles",
+            get(routes::roles::list_roles).post(routes::roles::create_role),
+        )
+        .route(
+            "/api/v1/servers/:server_id/roles/:role_id",
+            patch(routes::roles::update_role).delete(routes::roles::delete_role),
+        )
+        .route(
+            "/api/v1/servers/:server_id/members/:user_id/roles/:role_id",
+            axum::routing::put(routes::roles::assign_role).delete(routes::roles::unassign_role),
+        )
+        .route("/api/v1/servers/:server_id/permissions/me", get(routes::roles::my_server_permissions))
+        .route("/api/v1/channels/:channel_id/permissions/me", get(routes::roles::my_channel_permissions))
+        .route("/api/v1/channels/:channel_id/overwrites", get(routes::roles::list_channel_overwrites))
+        .route(
+            "/api/v1/channels/:channel_id/overwrites/role/:role_id",
+            axum::routing::put(routes::roles::set_role_overwrite).delete(routes::roles::delete_role_overwrite),
+        )
+        .route(
+            "/api/v1/channels/:channel_id/overwrites/member/:user_id",
+            axum::routing::put(routes::roles::set_member_overwrite).delete(routes::roles::delete_member_overwrite),
         )
 
         // --- Message Routes ---

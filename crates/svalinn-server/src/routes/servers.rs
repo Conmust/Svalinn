@@ -113,6 +113,23 @@ pub async fn create_server(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Every server needs its default ("@everyone") role for
+    // `permissions::resolve_server`/`resolve_channel` to grant anything
+    // at all to a plain member -- see migrations/0036 for the bits this
+    // mirrors for pre-existing servers.
+    sqlx::query(
+        "INSERT INTO roles (server_id, name, color, permissions, position, is_default) VALUES ($1, 'Member', '#99aab5', $2, 0, true)",
+    )
+    .bind(server_id)
+    .bind(crate::permissions::Permission::VIEW_CHANNEL.0
+        | crate::permissions::Permission::SEND_MESSAGES.0
+        | crate::permissions::Permission::CREATE_INVITE.0
+        | crate::permissions::Permission::ATTACH_FILES.0
+        | crate::permissions::Permission::ADD_REACTIONS.0)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
     tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
 
     let server: Server = sqlx::query_as(
