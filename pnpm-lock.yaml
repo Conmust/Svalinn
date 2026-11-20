@@ -221,6 +221,9 @@ importers:
       '@playwright/test':
         specifier: 1.63.0
         version: 1.63.0
+      libsodium-wrappers-sumo:
+        specifier: 0.7.15
+        version: 0.7.15
       pg:
         specifier: 8.13.1
         version: 8.13.1

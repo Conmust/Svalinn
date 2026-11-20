@@ -49,11 +49,17 @@ export function setServerUrl(input: string): string {
 
 /**
  * Full URL for a file link from the server. Uploaded files come as signed,
- * session-bound paths ("/api/v1/files/..."); external links are kept as they are.
+ * session-bound paths ("/api/v1/files/..."); external links are kept as
+ * they are. Also passed a locally-decrypted attachment's `blob:` object
+ * URL (see `ChatArea.svelte`/`DMChatArea.svelte`'s `ensureAttachmentDecrypted`,
+ * which substitutes it in place of `attachment_url` for an encrypted
+ * message) -- any URL that already has its own scheme (not just
+ * http/https) is left alone rather than getting `apiBase()` glued onto
+ * the front of it.
  */
 export function fileUrl(path: string | null | undefined): string {
   if (!path) return '';
-  return /^https?:\/\//i.test(path) ? path : `${apiBase()}${path}`;
+  return /^[a-z][a-z0-9+.-]*:/i.test(path) ? path : `${apiBase()}${path}`;
 }
 
 /** Refresh this long before the access token expires. */

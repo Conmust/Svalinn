@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import pg from 'pg';
 import { API_URL, DATABASE_URL, JWT_SECRET, ROOT, exe } from './config';
+import { genKeypair, encryptForRecipient, encryptFileForFanout, wrapFileKey, type TestDeviceKeypair } from './crypto';
 
 export const API = `${API_URL}/api/v1`;
 
@@ -26,6 +27,10 @@ export interface User {
   email: string;
   password: string;
   ip: string;
+  /** Lazily set the first time this user needs an encrypted channel/DM
+   * device -- see `ensureDevice`. Channel messages are mandatory
+   * end-to-end encrypted, so any test sending one needs this. */
+  device?: { id: string } & TestDeviceKeypair;
 }
 
 export interface Res<T = any> {
@@ -102,11 +107,79 @@ export async function join(owner: User, serverId: string, ...users: User[]) {
   }
 }
 
-export async function postMessage(user: User, channelId: string, content: string, file?: { name: string; type: string; data: Uint8Array | string }) {
-  const form = new FormData();
-  form.append('content', content);
-  if (file) form.append('file', new Blob([file.data], { type: file.type }), file.name);
-  return callForm(user, 'POST', `/channels/${channelId}/messages`, form);
+/** Registers an X25519 device keypair for `user` with the server, once --
+ * cached on `user.device`. Channel messages are mandatory end-to-end
+ * encrypted, so any test sending or decrypting one needs this. Mirrors
+ * `ensureDeviceKeypair` in `lib/crypto.ts`, minus the localStorage part
+ * (nothing here persists between test runs). */
+export async function ensureDevice(user: User): Promise<{ id: string } & TestDeviceKeypair> {
+  if (user.device) return user.device;
+  const keypair = await genKeypair();
+  const res = await call<{ id: string }>(user, 'POST', '/users/me/devices', {
+    public_key: keypair.publicKey,
+    device_label: 'e2e-test-device',
+  });
+  if (res.status !== 200) throw new Error(`failed to register a test device: ${res.status} ${JSON.stringify(res.body)}`);
+  user.device = { id: res.body.id, ...keypair };
+  return user.device;
+}
+
+/** Sends a channel message as `user`, end-to-end encrypted exactly the
+ * way the real client does (mandatory -- there is no plaintext channel
+ * send path anymore): registers `user`'s device if needed, fetches every
+ * current member's device from the channel's own member-devices endpoint,
+ * encrypts `content` once per device, and -- if `file` is given -- the
+ * file once with a fresh symmetric key wrapped per device. `content` is
+ * never sent to the server in the clear.
+ *
+ * Returns the same `{ status, body, headers }` shape as `call`, so
+ * existing assertions on the result keep working; a non-200 from the
+ * member-devices lookup (e.g. 403 for a non-member) is returned as-is,
+ * without attempting to encrypt or send anything. */
+export async function postMessage(
+  user: User,
+  channelId: string,
+  content: string,
+  file?: { name: string; type: string; data: Uint8Array | string }
+): Promise<Res> {
+  const device = await ensureDevice(user);
+  const devicesRes = await call<Array<{ device_id: string; public_key: string }>>(
+    user, 'GET', `/channels/${channelId}/member-devices`,
+  );
+  if (devicesRes.status !== 200) return devicesRes;
+  const devices = devicesRes.body;
+
+  const body: Record<string, unknown> = { sender_device_id: device.id };
+
+  if (file) {
+    const fileBytes = typeof file.data === 'string' ? new TextEncoder().encode(file.data) : file.data;
+    const { ciphertext: fileCiphertext, nonce: attachmentNonce, fileKey } = await encryptFileForFanout(fileBytes);
+    const uploadForm = new FormData();
+    uploadForm.append('file', new Blob([fileCiphertext], { type: 'application/octet-stream' }), file.name);
+    const uploaded = await callForm<{ url: string }>(user, 'POST', '/upload', uploadForm);
+    if (uploaded.status !== 200) return uploaded;
+
+    body.attachment_url = uploaded.body.url;
+    body.attachment_filename = file.name;
+    body.attachment_size = fileBytes.length;
+    body.attachment_mime_type = file.type;
+    body.attachment_nonce = attachmentNonce;
+    body.encrypted_for = await Promise.all(devices.map(async (d) => {
+      const { ciphertext, nonce } = await encryptForRecipient(content, d.public_key, device.privateKey);
+      const wrapped = await wrapFileKey(fileKey, d.public_key, device.privateKey);
+      return {
+        device_id: d.device_id, ciphertext, nonce,
+        attachment_key_ciphertext: wrapped.ciphertext, attachment_key_nonce: wrapped.nonce,
+      };
+    }));
+  } else {
+    body.encrypted_for = await Promise.all(devices.map(async (d) => {
+      const { ciphertext, nonce } = await encryptForRecipient(content, d.public_key, device.privateKey);
+      return { device_id: d.device_id, ciphertext, nonce };
+    }));
+  }
+
+  return call(user, 'POST', `/channels/${channelId}/messages`, body);
 }
 
 /** An open WebSocket that records events and how it closed. */

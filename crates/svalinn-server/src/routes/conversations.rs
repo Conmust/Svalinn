@@ -302,7 +302,7 @@ pub struct HistoryQuery {
 /// - `None`: every row for those messages, across every recipient device
 ///   of both participants (used when building the WebSocket broadcast
 ///   payload -- see `ConversationMessage::recipients` for why).
-async fn fetch_recipients_for_messages(
+pub(crate) async fn fetch_recipients_for_messages(
     db: &Database,
     message_ids: &[Uuid],
     device_id_filter: Option<Uuid>,
@@ -502,20 +502,20 @@ const MAX_CONTENT_CHARS: usize = 4000;
 /// appends (16,016 bytes), base64-encoded at ~4/3 expansion (~21,355
 /// chars) -- rounded up with real headroom so a legitimate max-length
 /// message is never at risk of rejection.
-const MAX_FANOUT_CIPHERTEXT_B64_CHARS: usize = 24_000;
+pub(crate) const MAX_FANOUT_CIPHERTEXT_B64_CHARS: usize = 24_000;
 
 /// Longest per-recipient nonce accepted in a fan-out send's
 /// `encrypted_for`. The client always base64-encodes a fixed-size
 /// `crypto_box_NONCEBYTES` (24-byte) nonce, which is always exactly 32
 /// base64 chars -- no headroom needed since this isn't an estimate.
-const MAX_FANOUT_NONCE_B64_CHARS: usize = 32;
+pub(crate) const MAX_FANOUT_NONCE_B64_CHARS: usize = 32;
 
 /// Longest per-recipient wrapped attachment key accepted. The wrapped
 /// value is a `crypto_box_easy` ciphertext of a fixed 32-byte
 /// `crypto_secretbox` key: 32 + 16 (Poly1305 MAC) = 48 bytes, base64 ->
 /// exactly 64 chars. Rounded up with headroom, same style as
 /// `MAX_FANOUT_CIPHERTEXT_B64_CHARS` above.
-const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 100;
+pub(crate) const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 100;
 
 /// GET /api/v1/conversations/:id/participant-devices
 ///

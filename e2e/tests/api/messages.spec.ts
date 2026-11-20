@@ -22,22 +22,40 @@ test('history loads a page at a time back to the first message', async () => {
   expect((await call(u, 'GET', `/channels/${channel.id}/messages?before=${channel.server_id}`)).status).toBe(404);
 });
 
-test('authors can edit their messages; everyone sees it live', async () => {
+// Channel messages are now mandatory end-to-end encrypted, and (same as
+// DMs, which never supported editing at all) an encrypted message can't
+// be edited -- re-encrypting it would mean re-deriving the recipient set,
+// which risks handing a member who joined later the content of a message
+// that predates them (see `messages.rs::edit_message`). Editing still
+// works for legacy plaintext history (pre-dating server-level E2EE),
+// which is exercised here against a directly-inserted plaintext row,
+// mirroring the "history loads a page at a time" test above.
+test('authors can edit a legacy plaintext message; everyone sees it live', async () => {
   const owner = await register('own');
   const member = await register('mem');
   const { server, channel } = await createServer(owner);
   await join(owner, server.id, member);
-  const msg = (await postMessage(member, channel.id, 'typo')).body;
+  const [{ id: msgId }] = await sql(
+    `INSERT INTO messages (channel_id, user_id, content) VALUES ($1, $2, 'typo') RETURNING id`,
+    [channel.id, member.user.id],
+  );
   const ws = await openSocket(owner);
 
-  expect((await call(owner, 'PATCH', `/messages/${msg.id}`, { content: 'hijack' })).status).toBe(403);
-  expect((await call(member, 'PATCH', `/messages/${msg.id}`, { content: '  ' })).status).toBe(400);
-  expect((await call(member, 'PATCH', `/messages/${msg.id}`, { content: 'x'.repeat(4001) })).status).toBe(400);
-  expect((await call(member, 'PATCH', `/messages/${msg.id}`, { content: 'fixed' })).status).toBe(200);
+  expect((await call(owner, 'PATCH', `/messages/${msgId}`, { content: 'hijack' })).status).toBe(403);
+  expect((await call(member, 'PATCH', `/messages/${msgId}`, { content: '  ' })).status).toBe(400);
+  expect((await call(member, 'PATCH', `/messages/${msgId}`, { content: 'x'.repeat(4001) })).status).toBe(400);
+  expect((await call(member, 'PATCH', `/messages/${msgId}`, { content: 'fixed' })).status).toBe(200);
 
-  const event = await ws.waitFor((e) => e.type === 'message_updated' && e.payload.id === msg.id);
+  const event = await ws.waitFor((e) => e.type === 'message_updated' && e.payload.id === msgId);
   expect(event.payload).toMatchObject({ content: 'fixed', is_edited: true });
   ws.close();
+});
+
+test('editing a real (always-encrypted) channel message is rejected', async () => {
+  const owner = await register('own');
+  const { channel } = await createServer(owner);
+  const msg = (await postMessage(owner, channel.id, 'typo')).body;
+  expect((await call(owner, 'PATCH', `/messages/${msg.id}`, { content: 'fixed' })).status).toBe(400);
 });
 
 test('pin, lock, hide, react and delete follow their rules', async () => {
