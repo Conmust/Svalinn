@@ -4,6 +4,7 @@
   import { wsClient } from '../lib/websocket';
   import { fetchUserProfile, setMyNickname, adminSetNickname, type UserProfile } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
+  import BetaBadge from './BetaBadge.svelte';
   import UserProfileModal from './UserProfileModal.svelte';
   import Avatar from './Avatar.svelte';
 
@@ -22,6 +23,7 @@
     patron_tier: string;
     avatar_url?: string | null;
     badge_emblem?: string | null;
+    has_beta_badge?: boolean;
   }
 
   /** What to actually show: the nickname set in this server, or the username. */
@@ -303,6 +305,9 @@
               </div>
               {#if (member.patron_tier && member.patron_tier !== 'free') || member.is_site_owner}
                 <PatronBadge tier={member.patron_tier} emblem={member.badge_emblem} isSiteOwner={member.is_site_owner} size="small" />
+              {/if}
+              {#if member.has_beta_badge}
+                <BetaBadge size="small" />
               {/if}
               {#if member.id === currentUser?.id}
                 <button

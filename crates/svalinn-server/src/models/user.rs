@@ -35,6 +35,12 @@ pub struct User {
     /// `routes::auth::register`/`login`, which construct a `User` that way
     /// and have no `is_site_owner` column to select.
     pub site_role: Option<String>,
+    /// Owner-granted badge, independent of `patron_tier`/`site_role` --
+    /// a real non-nullable `NOT NULL DEFAULT false` column (see
+    /// `migrations/0035_beta_badge.sql`), so unlike `site_role` it's safe
+    /// to keep as a plain field here: every `SELECT */RETURNING *` against
+    /// `users` always returns it.
+    pub has_beta_badge: bool,
 }
 
 impl User {
@@ -55,6 +61,7 @@ pub struct PublicUser {
     pub avatar_url: Option<String>,
     pub badge_emblem: Option<String>,
     pub is_site_owner: bool,
+    pub has_beta_badge: bool,
 }
 
 impl From<User> for PublicUser {
@@ -71,6 +78,7 @@ impl From<User> for PublicUser {
             avatar_url: user.avatar_url,
             badge_emblem: user.badge_emblem,
             is_site_owner,
+            has_beta_badge: user.has_beta_badge,
         }
     }
 }

@@ -1,12 +1,34 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import type { UserProfile } from '../lib/users';
+  import { setUserBetaBadge } from '../lib/users';
+  import { getCurrentUser } from '../lib/auth';
   import PatronBadge from './PatronBadge.svelte';
+  import BetaBadge from './BetaBadge.svelte';
   import Avatar from './Avatar.svelte';
 
   export let user: UserProfile | null = null;
 
   const dispatch = createEventDispatcher();
+
+  const viewerIsSiteOwner = !!getCurrentUser()?.is_site_owner;
+  let betaBadgeBusy = false;
+  let betaBadgeError = '';
+
+  async function toggleBetaBadge() {
+    if (!user || betaBadgeBusy) return;
+    betaBadgeError = '';
+    betaBadgeBusy = true;
+    const next = !user.has_beta_badge;
+    try {
+      const updated = await setUserBetaBadge(user.id, next);
+      user = { ...user, has_beta_badge: updated.has_beta_badge };
+    } catch (err: any) {
+      betaBadgeError = err.message || 'Failed to update the Beta badge';
+    } finally {
+      betaBadgeBusy = false;
+    }
+  }
 
   const statusConfig = {
     online: { color: '#00ff00', glow: '0 0 8px #00ff00', label: 'Online' },
@@ -85,6 +107,9 @@
           {#if (user.patron_tier && user.patron_tier !== 'free') || user.is_site_owner}
             <PatronBadge tier={user.patron_tier} emblem={user.badge_emblem} isSiteOwner={!!user.is_site_owner} size="medium" />
           {/if}
+          {#if user.has_beta_badge}
+            <BetaBadge size="medium" />
+          {/if}
         </div>
         {#if user.nickname}
           <div class="text-xs text-[#00aa00] -mt-2 mb-2 terminal-glow">@{user.username}</div>
@@ -106,6 +131,20 @@
             <span class="text-xs text-[#00ff00]">{formatDate(user.created_at)}</span>
           </div>
         </div>
+
+        {#if viewerIsSiteOwner}
+          <div class="w-full border-t border-[#00aa00]/30 pt-4 mt-3">
+            <button
+              type="button"
+              disabled={betaBadgeBusy}
+              class="w-full py-2 border text-xs uppercase tracking-wider transition-colors disabled:opacity-50 {user.has_beta_badge ? 'border-[#ff2db8] text-[#ff2db8] hover:bg-[#ff2db8]/10' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00] hover:text-[#00ff00]'}"
+              on:click={toggleBetaBadge}
+            >
+              {betaBadgeBusy ? 'Updating...' : user.has_beta_badge ? 'Revoke Beta badge' : 'Grant Beta badge'}
+            </button>
+            {#if betaBadgeError}<div class="text-xs text-red-500 mt-1">{'>'} {betaBadgeError}</div>{/if}
+          </div>
+        {/if}
       </div>
     </div>
   </div>

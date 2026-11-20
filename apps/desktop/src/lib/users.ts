@@ -13,6 +13,8 @@ export interface UserProfile {
   nickname?: string | null;
   badge_emblem?: string | null;
   is_site_owner?: boolean;
+  /** Owner-granted, independent of patron_tier -- see `updateUserBetaBadge`. */
+  has_beta_badge?: boolean;
 }
 
 /**
@@ -46,6 +48,7 @@ export interface PublicUser {
   avatar_url?: string | null;
   badge_emblem?: string | null;
   is_site_owner?: boolean;
+  has_beta_badge?: boolean;
 }
 
 /** The logged-in user's own profile, with a freshly-signed `avatar_url`. */
@@ -156,6 +159,26 @@ export async function updateMyBadgeEmblem(emblemId: string | null): Promise<Publ
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
     throw new Error(errData.error || 'Failed to update badge emblem');
+  }
+
+  return response.json();
+}
+
+/**
+ * Site-owner-only: grants or revokes the Beta badge on any user, from their
+ * profile. Independent of that user's patron tier -- see
+ * `routes::users::admin_set_beta_badge` server-side.
+ */
+export async function setUserBetaBadge(userId: string, hasBetaBadge: boolean): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/admin/beta-badge`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, has_beta_badge: hasBetaBadge }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update the Beta badge');
   }
 
   return response.json();

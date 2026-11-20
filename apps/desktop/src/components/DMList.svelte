@@ -5,6 +5,7 @@
   import { fetchAllUsers, fetchMyProfile, type PublicUser } from '../lib/users';
   import { selfAvatarUrl } from '../lib/selfProfile';
   import PatronBadge from './PatronBadge.svelte';
+  import BetaBadge from './BetaBadge.svelte';
   import Avatar from './Avatar.svelte';
 
   export let activeConversation: string | null = null;
@@ -161,6 +162,9 @@
                 size="small"
               />
             {/if}
+            {#if conversation.participant_has_beta_badge}
+              <BetaBadge size="small" />
+            {/if}
           </div>
         </button>
       {/each}
@@ -244,6 +248,9 @@
                 <div class="text-sm text-[#00ff00] truncate terminal-glow">{user.username}</div>
                 {#if (user.patron_tier && user.patron_tier !== 'free') || user.is_site_owner}
                   <PatronBadge tier={user.patron_tier} emblem={user.badge_emblem} isSiteOwner={!!user.is_site_owner} size="small" />
+                {/if}
+                {#if user.has_beta_badge}
+                  <BetaBadge size="small" />
                 {/if}
               </div>
             </button>

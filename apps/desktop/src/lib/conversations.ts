@@ -31,6 +31,7 @@ export interface Conversation {
   participant_avatar_url?: string | null;
   participant_badge_emblem?: string | null;
   participant_is_site_owner: boolean;
+  participant_has_beta_badge: boolean;
   has_unread: boolean;
 }
 
