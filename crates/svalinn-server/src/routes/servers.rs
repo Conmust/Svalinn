@@ -28,7 +28,7 @@ pub struct UpdateServerRequest {
 
 // ---------- RESPONSE STRUCTS ----------
 
-#[derive(Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow)]
 pub struct Server {
     pub id: Uuid,
     pub name: String,
@@ -74,6 +74,20 @@ pub async fn create_server(
 ) -> Result<Json<Server>, AppError> {
     if payload.name.trim().is_empty() {
         return Err(AppError::BadRequest("Server name cannot be empty".into()));
+    }
+
+    let (patron_tier, is_site_owner): (String, bool) = sqlx::query_as(
+        "SELECT patron_tier, COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if !crate::tiers::can_create_server(&patron_tier, is_site_owner) {
+        return Err(AppError::Forbidden(
+            "Guild tier or higher is required to create a server".into(),
+        ));
     }
 
     let server_id = Uuid::new_v4();
@@ -244,4 +258,159 @@ pub async fn delete_server(
         ));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    async fn create_test_site_owner(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name, site_role) VALUES ($1, $2, $3, $4, 'owner') RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test Owner {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test site owner")
+    }
+
+    async fn set_test_patron_tier(db: &Database, user_id: Uuid, tier: &str) {
+        sqlx::query("UPDATE users SET patron_tier = $1 WHERE id = $2")
+            .bind(tier)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to set test user's patron_tier");
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn free_tier_cannot_create_a_server() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = create_server(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(CreateServerRequest { name: "Nope".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden for a free-tier user, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn patron_tier_cannot_create_a_server() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "patron").await;
+
+        let result = create_server(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(CreateServerRequest { name: "Still nope".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden for a patron-tier user, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn guild_tier_can_create_a_server() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "guild").await;
+
+        let result = create_server(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(CreateServerRequest { name: "Guild server".into() }),
+        )
+        .await
+        .expect("a guild-tier user should be able to create a server");
+
+        assert_eq!(result.0.name, "Guild server");
+        assert_eq!(result.0.owner_id, user);
+
+        cleanup_test_server(&db, result.0.id).await;
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn enterprise_tier_can_create_a_server() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        set_test_patron_tier(&db, user, "enterprise").await;
+
+        let result = create_server(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(CreateServerRequest { name: "Enterprise server".into() }),
+        )
+        .await
+        .expect("an enterprise-tier user should be able to create a server");
+
+        cleanup_test_server(&db, result.0.id).await;
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn site_owner_can_create_a_server_regardless_of_tier() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+        // Site owner defaults to 'free' patron_tier -- the bypass must not
+        // depend on also being guild-tier.
+
+        let result = create_server(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(CreateServerRequest { name: "Owner server".into() }),
+        )
+        .await
+        .expect("the site owner should be able to create a server regardless of tier");
+
+        cleanup_test_server(&db, result.0.id).await;
+        cleanup_test_user(&db, owner).await;
+    }
 }

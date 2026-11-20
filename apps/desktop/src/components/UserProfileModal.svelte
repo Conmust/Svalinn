@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
-  import type { UserProfile } from '../lib/users';
-  import { setUserBetaBadge } from '../lib/users';
+  import type { UserProfile, PatronTier } from '../lib/users';
+  import { setUserBetaBadge, adminSetPatronTier, PATRON_TIERS } from '../lib/users';
   import { getCurrentUser } from '../lib/auth';
   import PatronBadge from './PatronBadge.svelte';
   import BetaBadge from './BetaBadge.svelte';
@@ -27,6 +27,26 @@
       betaBadgeError = err.message || 'Failed to update the Beta badge';
     } finally {
       betaBadgeBusy = false;
+    }
+  }
+
+  // Patron tier -- there's no billing integration yet, so until there is,
+  // this admin control (not the user themselves) is how an account actually
+  // reaches patron/guild/enterprise. See lib/users.ts's adminSetPatronTier.
+  let patronTierBusy = false;
+  let patronTierError = '';
+
+  async function setPatronTier(tier: PatronTier) {
+    if (!user || patronTierBusy || tier === (user.patron_tier ?? 'free')) return;
+    patronTierError = '';
+    patronTierBusy = true;
+    try {
+      const updated = await adminSetPatronTier(user.id, tier);
+      user = { ...user, patron_tier: updated.patron_tier, badge_emblem: updated.badge_emblem };
+    } catch (err: any) {
+      patronTierError = err.message || 'Failed to update patron tier';
+    } finally {
+      patronTierBusy = false;
     }
   }
 
@@ -133,6 +153,23 @@
         </div>
 
         {#if viewerIsSiteOwner}
+          <div class="w-full border-t border-[#00aa00]/30 pt-4 mt-3 space-y-1.5 text-left">
+            <span class="text-xs text-[#00aa00] uppercase tracking-wider">Patron tier</span>
+            <div class="grid grid-cols-2 gap-2">
+              {#each PATRON_TIERS as tier}
+                <button
+                  type="button"
+                  disabled={patronTierBusy}
+                  class="py-1.5 border text-xs uppercase tracking-wider transition-colors disabled:opacity-50 {tier === (user.patron_tier ?? 'free') ? 'border-[#00ff00] bg-[#00ff00]/10 text-[#00ff00]' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00]'}"
+                  on:click={() => setPatronTier(tier)}
+                >
+                  {tier}
+                </button>
+              {/each}
+            </div>
+            {#if patronTierError}<div class="text-xs text-red-500 mt-1">{'>'} {patronTierError}</div>{/if}
+          </div>
+
           <div class="w-full border-t border-[#00aa00]/30 pt-4 mt-3">
             <button
               type="button"

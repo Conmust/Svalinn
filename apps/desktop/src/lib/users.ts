@@ -13,7 +13,7 @@ export interface UserProfile {
   nickname?: string | null;
   badge_emblem?: string | null;
   is_site_owner?: boolean;
-  /** Owner-granted, independent of patron_tier -- see `updateUserBetaBadge`. */
+  /** Owner-granted, independent of patron_tier -- see `setUserBetaBadge`. */
   has_beta_badge?: boolean;
 }
 
@@ -81,17 +81,16 @@ export const PATRON_TIERS = ['free', 'patron', 'guild', 'enterprise'] as const;
 export type PatronTier = (typeof PATRON_TIERS)[number];
 
 /**
- * Self-service patron tier change. There's no payment processor wired up
- * yet (see README's MVP scope) -- this really does let a user pick any
- * tier for themselves with no billing check. It exists for honest testing
- * and for self-hosters who want to badge accounts manually, not as a real
- * paywall; don't read it as proof the app monetizes today.
+ * Site-owner-only: sets any user's patron tier, from their profile. There's
+ * no payment processor wired up yet (see README's MVP scope), so until one
+ * exists this is how an account actually reaches patron/guild/enterprise --
+ * see `routes::users::admin_update_patron_tier` server-side.
  */
-export async function updateMyPatronTier(tier: PatronTier): Promise<PublicUser> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/me/patron-tier`, {
+export async function adminSetPatronTier(userId: string, tier: PatronTier): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/admin/patron-tier`, {
     method: 'PATCH',
     headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ patron_tier: tier }),
+    body: JSON.stringify({ user_id: userId, patron_tier: tier }),
   });
 
   if (!response.ok) {

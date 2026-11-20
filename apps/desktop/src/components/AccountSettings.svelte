@@ -3,7 +3,7 @@
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
-  import { updateMyPatronTier, updateMyAvatar, updateMyBadgeEmblem, allowedEmblems, PATRON_TIERS, type PatronTier } from '../lib/users';
+  import { updateMyAvatar, updateMyBadgeEmblem, allowedEmblems, PATRON_TIERS, type PatronTier } from '../lib/users';
   import { uploadFile } from '../lib/messages';
   import { selfAvatarUrl } from '../lib/selfProfile';
   import Avatar from './Avatar.svelte';
@@ -56,34 +56,10 @@
     }
   }
 
-  // Patron tier (self-service -- see lib/users.ts's updateMyPatronTier doc
-  // comment: there's no billing integration, so this is a free pick, not
-  // a real purchase).
+  // Patron tier -- read-only here. There's no billing integration yet, so
+  // until there is, the site owner grants tier changes from a user's
+  // profile (see UserProfileModal.svelte), not the user themselves.
   let patronTier: PatronTier = 'free';
-  let patronBusy = false;
-  let patronError = '';
-  let patronMessage = '';
-
-  async function selectPatronTier(tier: PatronTier) {
-    if (tier === patronTier || patronBusy) return;
-    patronError = patronMessage = '';
-    patronBusy = true;
-    try {
-      const updated = await updateMyPatronTier(tier);
-      patronTier = (updated.patron_tier as PatronTier) ?? 'free';
-      const user = getCurrentUser();
-      if (user) updateUserInStorage({ ...user, patron_tier: patronTier });
-      patronMessage = tier === 'free' ? 'Patron tier cleared.' : `Patron tier set to ${tier}.`;
-      // Changing tier can invalidate the previously-picked emblem (it's no
-      // longer in the new tier's set), so re-fetch the server's view of it
-      // rather than assume it's still set.
-      badgeEmblem = updated.badge_emblem ?? null;
-    } catch (err: any) {
-      patronError = err.message || 'Failed to update patron tier';
-    } finally {
-      patronBusy = false;
-    }
-  }
 
   // Badge emblem (which icon this tier's badge shows -- see PatronBadge.svelte)
   let badgeEmblem: string | null = null;
@@ -465,24 +441,13 @@
       <section class="space-y-3">
         <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Patron tier</h4>
         <p class="text-[11px] text-[#00aa00]">
-          Svalinn doesn't have billing set up yet, so this is a free, self-service pick -- not a real purchase.
-          It only controls which badge shows next to your name.
+          Svalinn doesn't have billing set up yet, so tier changes aren't self-service -- the site owner
+          grants them. Guild tier and above is required to create a server.
         </p>
-        <div class="grid grid-cols-2 gap-2">
-          {#each PATRON_TIERS as tier}
-            <button
-              type="button"
-              disabled={patronBusy}
-              class="flex items-center justify-center gap-1.5 py-2 border text-xs uppercase tracking-wider transition-colors disabled:opacity-50 {tier === patronTier ? 'border-[#00ff00] bg-[#00ff00]/10 text-[#00ff00]' : 'border-[#00aa00]/50 text-[#00aa00] hover:border-[#00ff00]'}"
-              on:click={() => selectPatronTier(tier)}
-            >
-              {#if tier !== 'free'}<PatronBadge {tier} size="small" />{/if}
-              {tier}
-            </button>
-          {/each}
+        <div class="flex items-center gap-2 py-2 px-3 border border-[#00aa00]/50">
+          {#if patronTier !== 'free'}<PatronBadge tier={patronTier} size="small" />{/if}
+          <span class="text-xs uppercase tracking-wider text-[#00ff00]">{patronTier}</span>
         </div>
-        {#if patronError}<div class="text-xs text-red-500">{'>'} {patronError}</div>{/if}
-        {#if patronMessage}<div class="text-xs text-[#00ff00]">{'>'} {patronMessage}</div>{/if}
       </section>
 
       {#if emblemChoices.length > 0}
