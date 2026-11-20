@@ -15,7 +15,9 @@ use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
 use crate::models::message::BroadcastMessage;
-use crate::permissions::{bits_from_names, resolve_channel, resolve_server, Bits, Permission, Permissions};
+use crate::permissions::{
+    bits_from_names, is_unconditional_owner, resolve_channel, resolve_server, Bits, Permission, Permissions,
+};
 
 #[derive(Serialize, FromRow)]
 pub struct Role {
@@ -82,49 +84,72 @@ async fn actor_max_role_position(db: &Database, server_id: Uuid, user_id: Uuid) 
     Ok(max.unwrap_or(-1))
 }
 
-/// Same semantics as `permissions::is_unconditional_owner` -- duplicated
-/// here (rather than made `pub(crate)` there) only because it's a
-/// one-line private helper either way; kept in sync by the same doc note.
-async fn is_unconditional_owner(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<bool, AppError> {
-    let row: Option<(Uuid, bool)> = sqlx::query_as(
-        r#"
-        SELECT s.owner_id, COALESCE(u.site_role = 'owner', false)
-        FROM server_members sm
-        JOIN servers s ON s.id = sm.server_id
-        JOIN users u ON u.id = sm.user_id
-        WHERE sm.server_id = $1 AND sm.user_id = $2
-        "#,
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(row.map(|(owner_id, is_site_owner)| is_site_owner || owner_id == user_id).unwrap_or(false))
+/// The owner bypass plus the actor's resolved server permissions,
+/// fetched together once per request. Every handler below needs both
+/// "do they hold this permission" and "what exactly can they grant" from
+/// the same resolution -- fetching it twice (or re-deriving `is_owner`
+/// separately) was the duplication that used to make this file easy to
+/// get subtly wrong (and, before a review caught it, actually did: see
+/// the overwrite endpoints' history).
+async fn actor_context(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<(bool, Permissions), AppError> {
+    if is_unconditional_owner(db, server_id, user_id).await? {
+        return Ok((true, Permissions::ALL));
+    }
+    Ok((false, resolve_server(db, server_id, user_id).await?))
 }
 
-/// Requires `MANAGE_ROLES` and, unless the actor is this server's owner
-/// (or the site owner), that `role_position` is strictly below the
-/// actor's own highest role -- so managing roles never lets someone
-/// reach or exceed their own rank.
+/// Rejects `bits` the actor doesn't themselves hold (owners always pass)
+/// -- the "can't grant a permission you don't have yourself" rule shared
+/// by role creation/editing and channel overwrites.
+fn reject_ungranted_bits(is_owner: bool, actor_perms: Permissions, bits: Bits) -> Result<(), AppError> {
+    if is_owner || bits & !actor_perms.0 == 0 {
+        return Ok(());
+    }
+    Err(AppError::BadRequest("You can't grant a permission you don't have yourself".into()))
+}
+
+/// `position` must rank below the actor's own highest role, unless
+/// they're the unconditional owner -- the hierarchy guard that keeps
+/// `MANAGE_ROLES` (directly, or via `MANAGE_CHANNELS` on channel
+/// overwrites) from reaching or exceeding the actor's own rank, shared
+/// by role management and channel overwrites.
+async fn require_below_actor_rank(
+    db: &Database,
+    server_id: Uuid,
+    user_id: Uuid,
+    is_owner: bool,
+    position: i32,
+    error: &str,
+) -> Result<(), AppError> {
+    if is_owner {
+        return Ok(());
+    }
+    let actor_max = actor_max_role_position(db, server_id, user_id).await?;
+    if position >= actor_max {
+        return Err(AppError::Forbidden(error.into()));
+    }
+    Ok(())
+}
+
+/// Requires `MANAGE_ROLES` and that `role_position` ranks below the
+/// actor's own highest role -- `is_owner`/`actor_perms` are the caller's
+/// already-fetched `actor_context`, so this makes no DB call of its own
+/// beyond the rank check.
 async fn require_role_management(
     db: &Database,
     server_id: Uuid,
     user_id: Uuid,
+    is_owner: bool,
+    actor_perms: Permissions,
     role_position: i32,
 ) -> Result<(), AppError> {
-    if is_unconditional_owner(db, server_id, user_id).await? {
+    if is_owner {
         return Ok(());
     }
-    let perms = resolve_server(db, server_id, user_id).await?;
-    if !perms.has(Permission::MANAGE_ROLES) {
+    if !actor_perms.has(Permission::MANAGE_ROLES) {
         return Err(AppError::Forbidden("You don't have the manage_roles permission in this server".into()));
     }
-    let actor_max = actor_max_role_position(db, server_id, user_id).await?;
-    if role_position >= actor_max {
-        return Err(AppError::Forbidden("You can only manage roles ranked below your own".into()));
-    }
-    Ok(())
+    require_below_actor_rank(db, server_id, user_id, is_owner, role_position, "You can only manage roles ranked below your own").await
 }
 
 /// GET /api/v1/servers/:server_id/roles
@@ -163,12 +188,9 @@ pub async fn create_role(
     Path(server_id): Path<Uuid>,
     Json(payload): Json<CreateRoleRequest>,
 ) -> Result<Json<RoleResponse>, AppError> {
-    let is_owner = is_unconditional_owner(&db, server_id, user_id).await?;
-    if !is_owner {
-        let perms = resolve_server(&db, server_id, user_id).await?;
-        if !perms.has(Permission::MANAGE_ROLES) {
-            return Err(AppError::Forbidden("You don't have the manage_roles permission in this server".into()));
-        }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, user_id).await?;
+    if !is_owner && !actor_perms.has(Permission::MANAGE_ROLES) {
+        return Err(AppError::Forbidden("You don't have the manage_roles permission in this server".into()));
     }
 
     let name = payload.name.trim();
@@ -176,12 +198,7 @@ pub async fn create_role(
         return Err(AppError::BadRequest("Role name must be 1-50 characters".into()));
     }
     let bits = bits_from_names(&payload.permissions)?;
-    if !is_owner {
-        let actor_perms = resolve_server(&db, server_id, user_id).await?;
-        if bits & !actor_perms.0 != 0 {
-            return Err(AppError::BadRequest("You can't grant a permission you don't have yourself".into()));
-        }
-    }
+    reject_ungranted_bits(is_owner, actor_perms, bits)?;
 
     let next_position: i32 =
         sqlx::query_scalar("SELECT COALESCE(MAX(position), -1) + 1 FROM roles WHERE server_id = $1")
@@ -242,10 +259,8 @@ pub async fn update_role(
         return Err(AppError::NotFound("Role not found".into()));
     };
 
-    let is_owner = is_unconditional_owner(&db, server_id, user_id).await?;
-    if !is_owner {
-        require_role_management(&db, server_id, user_id, existing.position).await?;
-    }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, user_id).await?;
+    require_role_management(&db, server_id, user_id, is_owner, actor_perms, existing.position).await?;
 
     let name = match &payload.name {
         Some(n) => {
@@ -261,12 +276,7 @@ pub async fn update_role(
     let bits = match &payload.permissions {
         Some(names) => {
             let bits = bits_from_names(names)?;
-            if !is_owner {
-                let actor_perms = resolve_server(&db, server_id, user_id).await?;
-                if bits & !actor_perms.0 != 0 {
-                    return Err(AppError::BadRequest("You can't grant a permission you don't have yourself".into()));
-                }
-            }
+            reject_ungranted_bits(is_owner, actor_perms, bits)?;
             bits
         }
         None => existing.permission_bits,
@@ -276,12 +286,7 @@ pub async fn update_role(
         // everyone regardless of ordering) and kept fixed at 0.
         Some(_) if existing.is_default => existing.position,
         Some(p) => {
-            if !is_owner {
-                let actor_max = actor_max_role_position(&db, server_id, user_id).await?;
-                if p >= actor_max {
-                    return Err(AppError::Forbidden("You can't move a role to or above your own rank".into()));
-                }
-            }
+            require_below_actor_rank(&db, server_id, user_id, is_owner, p, "You can't move a role to or above your own rank").await?;
             p
         }
         None => existing.position,
@@ -332,9 +337,8 @@ pub async fn delete_role(
     if is_default {
         return Err(AppError::BadRequest("The default role can't be deleted".into()));
     }
-    if !is_unconditional_owner(&db, server_id, user_id).await? {
-        require_role_management(&db, server_id, user_id, position).await?;
-    }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, user_id).await?;
+    require_role_management(&db, server_id, user_id, is_owner, actor_perms, position).await?;
 
     sqlx::query("DELETE FROM roles WHERE id = $1 AND server_id = $2")
         .bind(role_id)
@@ -368,9 +372,8 @@ pub async fn assign_role(
     Path((server_id, target, role_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, AppError> {
     let position = role_position(&db, server_id, role_id).await?;
-    if !is_unconditional_owner(&db, server_id, actor).await? {
-        require_role_management(&db, server_id, actor, position).await?;
-    }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, actor).await?;
+    require_role_management(&db, server_id, actor, is_owner, actor_perms, position).await?;
     if require_member(&db, server_id, target).await.is_err() {
         return Err(AppError::NotFound("That user isn't a member of this server".into()));
     }
@@ -398,9 +401,8 @@ pub async fn unassign_role(
     Path((server_id, target, role_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, AppError> {
     let position = role_position(&db, server_id, role_id).await?;
-    if !is_unconditional_owner(&db, server_id, actor).await? {
-        require_role_management(&db, server_id, actor, position).await?;
-    }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, actor).await?;
+    require_role_management(&db, server_id, actor, is_owner, actor_perms, position).await?;
 
     sqlx::query("DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2 AND role_id = $3")
         .bind(server_id)
@@ -474,11 +476,9 @@ pub async fn list_channel_overwrites(
     Path(channel_id): Path<Uuid>,
 ) -> Result<Json<ChannelOverwritesResponse>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
-    if !is_unconditional_owner(&db, server_id, user_id).await? {
-        let perms = resolve_server(&db, server_id, user_id).await?;
-        if !perms.has(Permission::MANAGE_CHANNELS) && !perms.has(Permission::MANAGE_ROLES) {
-            return Err(AppError::Forbidden("You don't have permission to view this channel's overwrites".into()));
-        }
+    let (is_owner, actor_perms) = actor_context(&db, server_id, user_id).await?;
+    if !is_owner && !actor_perms.has(Permission::MANAGE_CHANNELS) && !actor_perms.has(Permission::MANAGE_ROLES) {
+        return Err(AppError::Forbidden("You don't have permission to view this channel's overwrites".into()));
     }
 
     let role_rows: Vec<(Uuid, Bits, Bits)> =
@@ -508,15 +508,17 @@ pub struct SetOverwriteRequest {
     pub deny: Vec<String>,
 }
 
-async fn require_channel_overwrite_management(db: &Database, channel_id: Uuid, user_id: Uuid) -> Result<Uuid, AppError> {
+async fn require_channel_overwrite_management(
+    db: &Database,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<(Uuid, bool, Permissions), AppError> {
     let server_id = channel_server_id(db, channel_id).await?;
-    if !is_unconditional_owner(db, server_id, user_id).await? {
-        let perms = resolve_server(db, server_id, user_id).await?;
-        if !perms.has(Permission::MANAGE_CHANNELS) && !perms.has(Permission::MANAGE_ROLES) {
-            return Err(AppError::Forbidden("You don't have permission to manage this channel's overwrites".into()));
-        }
+    let (is_owner, actor_perms) = actor_context(db, server_id, user_id).await?;
+    if !is_owner && !actor_perms.has(Permission::MANAGE_CHANNELS) && !actor_perms.has(Permission::MANAGE_ROLES) {
+        return Err(AppError::Forbidden("You don't have permission to manage this channel's overwrites".into()));
     }
-    Ok(server_id)
+    Ok((server_id, is_owner, actor_perms))
 }
 
 fn validate_overwrite(allow: &[String], deny: &[String]) -> Result<(Bits, Bits), AppError> {
@@ -525,40 +527,7 @@ fn validate_overwrite(allow: &[String], deny: &[String]) -> Result<(Bits, Bits),
     Ok((allow_bits, deny_bits))
 }
 
-/// Rejects `allow` bits the actor doesn't themselves hold in this server --
-/// mirrors `create_role`'s "can't grant a permission you don't have"
-/// rule. Without this, `MANAGE_CHANNELS` alone (which is deliberately a
-/// low bar -- see `channels.rs`) would let anyone overwrite their way to
-/// `administrator`, or any other bit, in one channel.
-async fn reject_ungranted_allow(db: &Database, server_id: Uuid, user_id: Uuid, allow: Bits) -> Result<(), AppError> {
-    if is_unconditional_owner(db, server_id, user_id).await? {
-        return Ok(());
-    }
-    let actor_perms = resolve_server(db, server_id, user_id).await?;
-    if allow & !actor_perms.0 != 0 {
-        return Err(AppError::BadRequest("You can't allow a permission you don't have yourself".into()));
-    }
-    Ok(())
-}
-
-/// Rejects an overwrite whose target (a role, or a member via their own
-/// highest role) is ranked at or above the actor's own highest role --
-/// the same hierarchy guard `require_role_management` applies to editing
-/// a role directly, extended here so `MANAGE_CHANNELS` alone can't be
-/// used to silence (deny) or elevate (allow) a role or member who
-/// outranks the actor.
-async fn require_outranks(db: &Database, server_id: Uuid, user_id: Uuid, target_position: i32) -> Result<(), AppError> {
-    if is_unconditional_owner(db, server_id, user_id).await? {
-        return Ok(());
-    }
-    let actor_max = actor_max_role_position(db, server_id, user_id).await?;
-    if target_position >= actor_max {
-        return Err(AppError::Forbidden(
-            "You can only set overwrites for a role or member ranked below your own".into(),
-        ));
-    }
-    Ok(())
-}
+const OVERWRITE_RANK_ERROR: &str = "You can only set overwrites for a role or member ranked below your own";
 
 /// PUT /api/v1/channels/:channel_id/overwrites/role/:role_id
 pub async fn set_role_overwrite(
@@ -567,11 +536,11 @@ pub async fn set_role_overwrite(
     Path((channel_id, role_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<SetOverwriteRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let server_id = require_channel_overwrite_management(&db, channel_id, user_id).await?;
+    let (server_id, is_owner, actor_perms) = require_channel_overwrite_management(&db, channel_id, user_id).await?;
     let target_position = role_position(&db, server_id, role_id).await?; // 404s if the role isn't on this server
-    require_outranks(&db, server_id, user_id, target_position).await?;
+    require_below_actor_rank(&db, server_id, user_id, is_owner, target_position, OVERWRITE_RANK_ERROR).await?;
     let (allow, deny) = validate_overwrite(&payload.allow, &payload.deny)?;
-    reject_ungranted_allow(&db, server_id, user_id, allow).await?;
+    reject_ungranted_bits(is_owner, actor_perms, allow)?;
 
     sqlx::query(
         r#"
@@ -596,9 +565,9 @@ pub async fn delete_role_overwrite(
     CurrentUser(user_id): CurrentUser,
     Path((channel_id, role_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let server_id = require_channel_overwrite_management(&db, channel_id, user_id).await?;
+    let (server_id, is_owner, _) = require_channel_overwrite_management(&db, channel_id, user_id).await?;
     let target_position = role_position(&db, server_id, role_id).await?;
-    require_outranks(&db, server_id, user_id, target_position).await?;
+    require_below_actor_rank(&db, server_id, user_id, is_owner, target_position, OVERWRITE_RANK_ERROR).await?;
     sqlx::query("DELETE FROM channel_role_overwrites WHERE channel_id = $1 AND role_id = $2")
         .bind(channel_id)
         .bind(role_id)
@@ -615,7 +584,7 @@ pub async fn set_member_overwrite(
     Path((channel_id, target)): Path<(Uuid, Uuid)>,
     Json(payload): Json<SetOverwriteRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let server_id = require_channel_overwrite_management(&db, channel_id, user_id).await?;
+    let (server_id, is_owner, actor_perms) = require_channel_overwrite_management(&db, channel_id, user_id).await?;
     if require_member(&db, server_id, target).await.is_err() {
         return Err(AppError::NotFound("That user isn't a member of this server".into()));
     }
@@ -624,9 +593,9 @@ pub async fn set_member_overwrite(
     // does for the actor. A target with no custom roles ranks at -1,
     // i.e. below everyone, same as `require_role_management`'s baseline.
     let target_position = actor_max_role_position(&db, server_id, target).await?;
-    require_outranks(&db, server_id, user_id, target_position).await?;
+    require_below_actor_rank(&db, server_id, user_id, is_owner, target_position, OVERWRITE_RANK_ERROR).await?;
     let (allow, deny) = validate_overwrite(&payload.allow, &payload.deny)?;
-    reject_ungranted_allow(&db, server_id, user_id, allow).await?;
+    reject_ungranted_bits(is_owner, actor_perms, allow)?;
 
     sqlx::query(
         r#"
@@ -651,9 +620,9 @@ pub async fn delete_member_overwrite(
     CurrentUser(user_id): CurrentUser,
     Path((channel_id, target)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let server_id = require_channel_overwrite_management(&db, channel_id, user_id).await?;
+    let (server_id, is_owner, _) = require_channel_overwrite_management(&db, channel_id, user_id).await?;
     let target_position = actor_max_role_position(&db, server_id, target).await?;
-    require_outranks(&db, server_id, user_id, target_position).await?;
+    require_below_actor_rank(&db, server_id, user_id, is_owner, target_position, OVERWRITE_RANK_ERROR).await?;
     sqlx::query("DELETE FROM channel_member_overwrites WHERE channel_id = $1 AND user_id = $2")
         .bind(channel_id)
         .bind(target)
