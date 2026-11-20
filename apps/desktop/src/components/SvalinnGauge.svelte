@@ -92,24 +92,37 @@
   }
 </script>
 
-<button
-  type="button"
-  class="fixed bottom-2 left-2 z-[150] px-2 py-1 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono hover:border-[#00ff00] transition-colors"
-  on:click={() => (expanded = !expanded)}
-  title="Svalinn Gauge -- click for details"
->
-  {#if unavailable}
-    [ -- ]
-  {:else if appMemoryMb === null}
-    [ measuring... ]
-  {:else}
-    [ {appMemoryMb.toFixed(0)} MB | {(appCpuPercent ?? 0).toFixed(1)}% CPU ]
-  {/if}
-</button>
+<!--
+  Floats top-center over the whole window, pinned to the viewport rather
+  than to either chat panel's header -- it's the same badge whether a
+  channel, a DM, or nothing is open, and it doesn't shift when the roster
+  opens/closes or the window resizes. This is also where each chat panel's
+  header used to print a channel/DM name; that's gone now (ChatArea's,
+  anyway -- see its header comment) in favor of the channel list's own
+  highlight, which freed up this spot.
+  The expanded detail panel drops straight down from the badge
+  (`top-full`), so it stays anchored to the badge instead of a second
+  hardcoded position.
+-->
+<div class="fixed top-2 left-1/2 -translate-x-1/2 z-[150]">
+  <button
+    type="button"
+    class="px-2 py-1 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono hover:border-[#00ff00] transition-colors"
+    on:click={() => (expanded = !expanded)}
+    title="Svalinn Gauge -- click for details"
+  >
+    {#if unavailable}
+      [ -- ]
+    {:else if appMemoryMb === null}
+      [ measuring... ]
+    {:else}
+      [ {appMemoryMb.toFixed(0)} MB | {(appCpuPercent ?? 0).toFixed(1)}% CPU ]
+    {/if}
+  </button>
 
-{#if expanded}
+  {#if expanded}
   <div
-    class="fixed bottom-10 left-2 z-[150] p-3 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono w-64 space-y-2"
+    class="absolute top-full left-1/2 -translate-x-1/2 mt-2 p-3 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono w-64 max-w-[90vw] space-y-2"
   >
     {#if unavailable}
       <div class="text-[#ffaa00]">Gauge unavailable in this environment.</div>
@@ -157,4 +170,5 @@
       {/if}
     {/if}
   </div>
-{/if}
+  {/if}
+</div>

@@ -99,20 +99,4 @@
   .animate-pulse-once {
     animation: pulse-once 0.15s ease-out;
   }
-
-  /* Terminal-themed scrollbar for the picker */
-  .custom-scrollbar::-webkit-scrollbar {
-    width: 6px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-track {
-    background: #0a0e0a;
-    border-radius: 3px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: #00ff00;
-    border-radius: 3px;
-  }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: #00aa00;
-  }
 </style>

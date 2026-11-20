@@ -244,9 +244,3 @@
   {/if}
 </div>
 {/if}
-
-<style>
-  .terminal-glow {
-    text-shadow: 0 0 5px rgba(0, 255, 0, 0.5);
-  }
-</style>
