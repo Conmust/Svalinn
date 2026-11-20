@@ -6,6 +6,9 @@ export interface Message {
   channel_id: string;
   user_id: string;
   username: string;
+  /** This author's nickname in this message's server, if they have one set. */
+  nickname?: string | null;
+  avatar_url?: string | null;
   patron_tier?: string;
   content: string;
   created_at: string;

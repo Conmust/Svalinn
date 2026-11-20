@@ -2,8 +2,10 @@
   import { onMount, createEventDispatcher } from 'svelte';
   import { getCurrentUser, logout } from '../lib/auth';
   import { fetchUserConversations, createConversation, type Conversation } from '../lib/conversations';
-  import { fetchAllUsers, type PublicUser } from '../lib/users';
+  import { fetchAllUsers, fetchMyProfile, type PublicUser } from '../lib/users';
+  import { selfAvatarUrl } from '../lib/selfProfile';
   import PatronBadge from './PatronBadge.svelte';
+  import Avatar from './Avatar.svelte';
 
   export let activeConversation: string | null = null;
 
@@ -29,6 +31,9 @@
 
   onMount(() => {
     loadConversations();
+    // Seeds the self-avatar store with a freshly-signed URL -- a cached
+    // one from an earlier login would have an expired signature.
+    fetchMyProfile().then(p => selfAvatarUrl.set(p.avatar_url ?? null)).catch(() => {});
   });
 
   export async function loadConversations() {
@@ -125,9 +130,11 @@
         >
           <!-- Avatar with Status -->
           <div class="relative flex-shrink-0">
-            <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
-              {conversation.participant_username?.[0]?.toUpperCase() || '?'}
-            </div>
+            <Avatar
+              url={conversation.participant_avatar_url}
+              label={conversation.participant_username || '?'}
+              className="w-8 h-8 border-2 border-[#00ff00] font-bold text-sm terminal-glow"
+            />
             <div
               class="absolute bottom-0 right-0 w-3 h-3 border-2 border-[#0a0e0a] rounded-full"
               style={getStatusStyle(conversation.participant_status)}
@@ -158,9 +165,11 @@
   <!-- User Footer (matches ChannelList's, so logout is reachable even with no servers joined) -->
   <div class="p-3 border-t-2 border-[#00ff00] bg-black">
     <div class="flex items-center gap-2">
-      <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow flex-shrink-0">
-        {currentUser?.username?.[0]?.toUpperCase() ?? '?'}
-      </div>
+      <Avatar
+        url={$selfAvatarUrl}
+        label={currentUser?.username ?? '?'}
+        className="w-8 h-8 border-2 border-[#00ff00] font-bold text-sm terminal-glow"
+      />
       <div class="flex-1 min-w-0">
         <div class="text-xs text-[#00ff00] truncate terminal-glow">{currentUser?.username ?? 'Unknown'}</div>
         <div class="text-[10px] text-[#00aa00] terminal-glow">Online</div>
@@ -216,9 +225,11 @@
               on:click={() => pickUser(user)}
             >
               <div class="relative flex-shrink-0">
-                <div class="w-7 h-7 border-2 border-[#00ff00] flex items-center justify-center font-bold text-xs terminal-glow">
-                  {user.username[0].toUpperCase()}
-                </div>
+                <Avatar
+                  url={user.avatar_url}
+                  label={user.username}
+                  className="w-7 h-7 border-2 border-[#00ff00] font-bold text-xs terminal-glow"
+                />
                 <div
                   class="absolute bottom-0 right-0 w-2.5 h-2.5 border-2 border-black rounded-full"
                   style={getStatusStyle(user.status)}

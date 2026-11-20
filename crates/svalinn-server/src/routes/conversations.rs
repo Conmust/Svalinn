@@ -27,6 +27,7 @@ const CONVERSATION_COLUMNS: &str = r#"
     u.status AS participant_status,
     COALESCE(u.patron_tier, 'free') AS participant_patron_tier,
     u.public_key AS participant_public_key,
+    u.avatar_url AS participant_avatar_url,
     EXISTS(
         SELECT 1 FROM messages m
         WHERE m.conversation_id = c.id
@@ -83,9 +84,9 @@ async fn require_participant(db: &Database, conversation_id: Uuid, user_id: Uuid
 /// (conversations with no messages yet sort last).
 pub async fn get_user_conversations(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
 ) -> Result<Json<Vec<ConversationWithParticipant>>, AppError> {
-    let conversations: Vec<ConversationWithParticipant> = sqlx::query_as(&format!(
+    let mut conversations: Vec<ConversationWithParticipant> = sqlx::query_as(&format!(
         r#"
         SELECT {CONVERSATION_COLUMNS}
         {CONVERSATION_JOIN}
@@ -103,6 +104,9 @@ pub async fn get_user_conversations(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    for c in &mut conversations {
+        sign_opt(&mut c.participant_avatar_url, user_id, session_id);
+    }
     Ok(Json(conversations))
 }
 
@@ -117,7 +121,7 @@ pub struct CreateConversationRequest {
 /// and `participant_id`.
 pub async fn create_or_get_conversation(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Json(payload): Json<CreateConversationRequest>,
 ) -> Result<Json<ConversationWithParticipant>, AppError> {
     let other_user_id = payload.participant_id;
@@ -192,7 +196,8 @@ pub async fn create_or_get_conversation(
 
     tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
 
-    let conversation = fetch_conversation(&db, conversation_id, user_id).await?;
+    let mut conversation = fetch_conversation(&db, conversation_id, user_id).await?;
+    sign_opt(&mut conversation.participant_avatar_url, user_id, session_id);
     Ok(Json(conversation))
 }
 
@@ -994,7 +999,7 @@ mod tests {
 
         let conv_ab = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1004,7 +1009,7 @@ mod tests {
 
         let conv_ba = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_a }),
         )
         .await
@@ -1049,7 +1054,7 @@ mod tests {
                 tokio::spawn(async move {
                     create_or_get_conversation(
                         State(db),
-                        CurrentUser(current),
+                        CurrentSession { user_id: current, session_id: Uuid::new_v4() },
                         Json(CreateConversationRequest { participant_id: other }),
                     )
                     .await
@@ -1103,7 +1108,7 @@ mod tests {
 
         let result = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_a }),
         )
         .await;
@@ -1124,7 +1129,7 @@ mod tests {
 
         let result = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: bogus_participant }),
         )
         .await;
@@ -1146,7 +1151,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1203,7 +1208,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1263,7 +1268,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1292,7 +1297,7 @@ mod tests {
         .expect("sending message failed");
 
         // B has an unread message from A.
-        let b_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_b))
+        let b_conversations = get_user_conversations(State(db.clone()), CurrentSession { user_id: user_b, session_id: Uuid::new_v4() })
             .await
             .expect("fetching B's conversations failed")
             .0;
@@ -1303,7 +1308,7 @@ mod tests {
         assert!(b_view.has_unread, "B should have an unread message right after A sends one");
 
         // A's own list should never show unread for a message A sent themselves.
-        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentSession { user_id: user_a, session_id: Uuid::new_v4() })
             .await
             .expect("fetching A's conversations failed")
             .0;
@@ -1323,7 +1328,7 @@ mod tests {
         .await
         .expect("fetching messages as B failed");
 
-        let b_conversations_after = get_user_conversations(State(db.clone()), CurrentUser(user_b))
+        let b_conversations_after = get_user_conversations(State(db.clone()), CurrentSession { user_id: user_b, session_id: Uuid::new_v4() })
             .await
             .expect("fetching B's conversations after read failed")
             .0;
@@ -1346,7 +1351,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: patron_user }),
         )
         .await
@@ -1354,7 +1359,7 @@ mod tests {
         .0
         .id;
 
-        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentSession { user_id: user_a, session_id: Uuid::new_v4() })
             .await
             .expect("fetching A's conversations failed")
             .0;
@@ -1381,7 +1386,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1449,7 +1454,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1512,7 +1517,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1520,7 +1525,7 @@ mod tests {
         .0
         .id;
 
-        let a_conversations = get_user_conversations(State(db.clone()), CurrentUser(user_a))
+        let a_conversations = get_user_conversations(State(db.clone()), CurrentSession { user_id: user_a, session_id: Uuid::new_v4() })
             .await
             .expect("fetching A's conversations failed")
             .0;
@@ -1593,7 +1598,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1719,7 +1724,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1806,7 +1811,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1871,7 +1876,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1926,7 +1931,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -1963,7 +1968,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2026,7 +2031,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2091,7 +2096,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2171,7 +2176,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2224,7 +2229,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2279,7 +2284,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2347,7 +2352,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2408,7 +2413,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2457,7 +2462,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2523,7 +2528,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await
@@ -2595,7 +2600,7 @@ mod tests {
 
         let conversation_id = create_or_get_conversation(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Json(CreateConversationRequest { participant_id: user_b }),
         )
         .await

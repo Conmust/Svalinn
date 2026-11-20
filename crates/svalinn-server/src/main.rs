@@ -85,6 +85,11 @@ async fn main() {
             "/api/v1/servers/:server_id/members/:user_id/role",
             patch(routes::members::set_member_role),
         )
+        .route("/api/v1/servers/:server_id/nickname", patch(routes::members::set_my_nickname))
+        .route(
+            "/api/v1/servers/:server_id/members/:user_id/nickname",
+            patch(routes::members::admin_set_nickname),
+        )
         .route(
             "/api/v1/channels/:channel_id",
             patch(routes::channels::rename_channel).delete(routes::channels::delete_channel),
@@ -134,6 +139,7 @@ async fn main() {
         .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
         .route("/api/v1/users/me/patron-tier", patch(routes::users::update_patron_tier))
+        .route("/api/v1/users/me/avatar", patch(routes::users::update_avatar))
         .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))
         .route("/api/v1/admin/patron-tier", patch(routes::users::admin_update_patron_tier))
 

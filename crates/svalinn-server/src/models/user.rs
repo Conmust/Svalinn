@@ -20,6 +20,10 @@ pub struct User {
     /// logged in on an E2EE-aware client -- the normal state for most
     /// existing accounts.
     pub public_key: Option<String>,
+    /// Stored `/uploads/...` path to the user's profile picture, or an
+    /// external URL. Signed into a viewer-specific link before being sent
+    /// to a client -- see `routes::users::sign_avatar`.
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +35,7 @@ pub struct PublicUser {
     pub patron_tier: String,
     pub bio: Option<String>,
     pub public_key: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 impl From<User> for PublicUser {
@@ -43,6 +48,7 @@ impl From<User> for PublicUser {
             patron_tier: user.patron_tier,
             bio: user.bio,
             public_key: user.public_key,
+            avatar_url: user.avatar_url,
         }
     }
 }

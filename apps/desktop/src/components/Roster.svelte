@@ -2,9 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { wsClient } from '../lib/websocket';
-  import { fetchUserProfile, type UserProfile } from '../lib/users';
+  import { fetchUserProfile, setMyNickname, adminSetNickname, type UserProfile } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
   import UserProfileModal from './UserProfileModal.svelte';
+  import Avatar from './Avatar.svelte';
 
   export let serverId: string | null = null;
   export let currentUser: any = null;
@@ -12,12 +13,19 @@
   interface Member {
     id: string;
     username: string;
+    nickname: string | null;
     is_online: boolean;
     status: string;
     role: string;
     is_owner: boolean;
     is_site_owner: boolean;
     patron_tier: string;
+    avatar_url?: string | null;
+  }
+
+  /** What to actually show: the nickname set in this server, or the username. */
+  function displayName(m: Member): string {
+    return m.nickname || m.username;
   }
 
   let members: Member[] = [];
@@ -36,7 +44,7 @@
     const requestId = ++profileRequestId;
     profileError = '';
     try {
-      const profile = await fetchUserProfile(member.id);
+      const profile = await fetchUserProfile(member.id, serverId ?? undefined);
       if (requestId === profileRequestId) viewingProfile = profile;
     } catch (err: any) {
       if (requestId === profileRequestId) profileError = err.message || 'Failed to load profile';
@@ -79,6 +87,40 @@
     mode = 'menu';
     newRole = member.role === 'owner' ? 'admin' : member.role;
     banReason = transferPassword = actionError = '';
+  }
+
+  // Nickname editor: reused for both self-service (any member, their own
+  // nickname) and the admin-override case (opened from the Manage dialog).
+  let nicknameTarget: Member | null = null;
+  let nicknameValue = '';
+  let nicknameError = '';
+  let nicknameBusy = false;
+
+  function openNicknameEditor(member: Member) {
+    managing = null;
+    nicknameTarget = member;
+    nicknameValue = member.nickname ?? '';
+    nicknameError = '';
+  }
+
+  async function saveNickname() {
+    if (!nicknameTarget || !serverId) return;
+    const target = nicknameTarget;
+    const isSelf = target.id === currentUser?.id;
+    nicknameBusy = true;
+    nicknameError = '';
+    try {
+      const trimmed = nicknameValue.trim() || null;
+      const result = isSelf
+        ? await setMyNickname(serverId, trimmed)
+        : await adminSetNickname(serverId, target.id, trimmed);
+      members = members.map(m => (m.id === target.id ? { ...m, nickname: result } : m));
+      nicknameTarget = null;
+    } catch (err: any) {
+      nicknameError = err.message || 'Failed to update nickname';
+    } finally {
+      nicknameBusy = false;
+    }
   }
 
   async function act(request: () => Promise<Response>, onSuccess: () => void) {
@@ -241,9 +283,11 @@
             on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), openProfile(member))}
           >
             <div class="relative">
-              <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow">
-                {member.username[0].toUpperCase()}
-              </div>
+              <Avatar
+                url={member.avatar_url}
+                label={member.username}
+                className="w-8 h-8 border-2 border-[#00ff00] font-bold text-sm terminal-glow"
+              />
 
               <!-- Status Indicator -->
               <div
@@ -254,10 +298,18 @@
 
             <div class="flex-1 min-w-0 flex items-center gap-1">
               <div class="text-sm font-medium text-[#00ff00] truncate terminal-glow">
-                {member.username}
+                {displayName(member)}
               </div>
               {#if member.patron_tier && member.patron_tier !== 'free'}
                 <PatronBadge tier={member.patron_tier} size="small" />
+              {/if}
+              {#if member.id === currentUser?.id}
+                <button
+                  type="button"
+                  class="hidden group-hover:inline text-[10px] text-[#00aa00] hover:text-[#00ff00] underline flex-shrink-0"
+                  aria-label="Set your nickname in this server"
+                  on:click|stopPropagation={() => openNicknameEditor(member)}
+                >✎</button>
               {/if}
             </div>
 
@@ -298,6 +350,11 @@
               <button type="button" disabled={actionBusy || newRole === m.role} class="px-3 py-1.5 bg-[#00ff00] text-black text-sm font-bold disabled:opacity-40" on:click={saveRole}>Save role</button>
             </div>
           {/if}
+          {#if canChangeRoles}
+            <button type="button" class="w-full py-2 border border-[#00aa00] text-[#00aa00] text-sm hover:bg-[#00aa00]/10" on:click={() => openNicknameEditor(m)}>
+              Set nickname{m.nickname ? ` (currently "${m.nickname}")` : ''}
+            </button>
+          {/if}
           <div class="grid grid-cols-2 gap-2">
             <button type="button" class="py-2 border border-[#ffaa00] text-[#ffaa00] text-sm hover:bg-[#ffaa00] hover:text-black" on:click={() => (mode = 'kick')}>Kick</button>
             <button type="button" class="py-2 border border-red-500 text-red-500 text-sm hover:bg-red-500 hover:text-black" on:click={() => (mode = 'ban')}>Ban</button>
@@ -334,6 +391,40 @@
           {:else if mode === 'transfer'}
             <button type="button" disabled={actionBusy || !transferPassword} class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black disabled:opacity-50" on:click={transfer}>Transfer</button>
           {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if nicknameTarget}
+    {@const isSelf = nicknameTarget.id === currentUser?.id}
+    <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="nickname-title">
+      <div class="w-[380px] max-w-[92vw] bg-black border-2 border-[#00ff00] p-6 space-y-4">
+        <h3 id="nickname-title" class="font-bold uppercase tracking-widest text-sm text-[#00ff00]">
+          {'>'} {isSelf ? 'Your nickname here' : `${nicknameTarget.username}'s nickname`}
+        </h3>
+        <p class="text-[11px] text-[#00aa00]">
+          {isSelf
+            ? 'Shown in this server instead of your username -- channel messages, the member list, and your profile here. Leave it blank to just use your username.'
+            : `Sets how ${nicknameTarget.username} is shown in this server. Leave it blank to clear it back to their username.`}
+        </p>
+        <div>
+          <label for="nickname-input" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Nickname</label>
+          <input
+            id="nickname-input"
+            bind:value={nicknameValue}
+            maxlength="64"
+            placeholder={nicknameTarget.username}
+            class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none"
+            on:keydown={(e) => e.key === 'Enter' && saveNickname()}
+          />
+        </div>
+        {#if nicknameError}<div class="text-xs text-red-500">{'>'} {nicknameError}</div>{/if}
+        <div class="flex gap-2">
+          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm hover:bg-[#00aa00]/10" disabled={nicknameBusy} on:click={() => (nicknameTarget = null)}>Cancel</button>
+          <button type="button" class="flex-1 py-2 bg-[#00ff00] text-black font-bold text-sm disabled:opacity-50" disabled={nicknameBusy} on:click={saveNickname}>
+            {nicknameBusy ? 'Saving...' : 'Save'}
+          </button>
         </div>
       </div>
     </div>

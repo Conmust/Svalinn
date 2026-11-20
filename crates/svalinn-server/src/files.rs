@@ -39,7 +39,7 @@ const ROUTE_PREFIX: &str = "/api/v1/files/";
 const UPLOAD_DIR: &str = "uploads";
 
 /// JSON keys whose values may hold file paths (see `sign_json`).
-const FILE_KEYS: [&str; 3] = ["attachment_url", "url", "icon_url"];
+const FILE_KEYS: [&str; 4] = ["attachment_url", "url", "icon_url", "avatar_url"];
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -132,6 +132,37 @@ pub fn stored_path(url: &str) -> String {
     }
 }
 
+/// Whether `url` (as normalized by `stored_path`) is one of our own
+/// `/uploads/...` paths, as opposed to an external URL kept as-is.
+pub fn is_stored_path(url: &str) -> bool {
+    url.starts_with(STORED_PREFIX) && valid_name(&url[STORED_PREFIX.len()..])
+}
+
+/// Whether `stored` (a `/uploads/...` path, as normalized by `stored_path`)
+/// is already in use as a channel/DM attachment, a custom emoji, or a
+/// server icon. Used to stop `routes::users::update_avatar` from pointing a
+/// user's (globally-visible) avatar at a file they only know the name of
+/// because they're a legitimate recipient of it elsewhere (e.g. a private
+/// DM attachment) -- without this check, setting it as an avatar would make
+/// `serve_file`'s avatar-visibility branch expose it to every user, not just
+/// the people it was originally shared with.
+pub async fn is_file_used_elsewhere(db: &Database, stored: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM messages WHERE attachment_url = $1
+            UNION
+            SELECT 1 FROM custom_emojis WHERE url = $1
+            UNION
+            SELECT 1 FROM servers WHERE icon_url = $1
+        )
+        "#,
+    )
+    .bind(stored)
+    .fetch_one(&db.pool)
+    .await
+}
+
 /// Deletes uploaded files given their stored `/uploads/...` paths. Missing
 /// files and anything that isn't an upload path are skipped.
 pub async fn remove_stored_files(paths: &[String]) {
@@ -184,7 +215,13 @@ pub async fn serve_file(
     // attachments, custom emojis, server icons) OR a participant of the DM
     // conversation it belongs to (DM attachments -- added alongside
     // encrypted DM attachments; applies to legacy plaintext DM attachments
-    // too, which had no access check covering them at all before this).
+    // too, which had no access check covering them at all before this) OR
+    // the file is someone's profile picture, which (like a username) is
+    // visible to any logged-in user regardless of shared servers/DMs --
+    // the "+ New Message" picker already lists every user site-wide by
+    // username, so gating avatars the way attachments are gated would just
+    // mean some of those listed people show a broken image instead of
+    // actually hiding anything.
     let allowed: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS(
@@ -201,6 +238,8 @@ pub async fn serve_file(
             SELECT 1 FROM conversation_participants cp
             JOIN messages m ON m.conversation_id = cp.conversation_id
             WHERE cp.user_id = $2 AND m.attachment_url = $1
+        ) OR EXISTS(
+            SELECT 1 FROM users WHERE avatar_url = $1
         )
         "#,
     )
