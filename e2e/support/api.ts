@@ -83,6 +83,11 @@ export async function login(email: string, password: string, ip = randomIp()): P
 
 /** A server with one channel "general", owned by `owner`. */
 export async function createServer(owner: User, name = uniq('srv')) {
+  // Server creation now requires guild tier or higher, and there's no
+  // self-service way to get there anymore (tier changes are site-owner-only,
+  // granted from a user's profile in the app) -- so test setup needs the
+  // same direct-DB escape hatch `sql()` already exists for.
+  await sql('UPDATE users SET patron_tier = $1 WHERE id = $2', ['guild', owner.user.id]);
   const server = (await call(owner, 'POST', '/servers', { name })).body;
   const channel = (await call(owner, 'POST', `/servers/${server.id}/channels`, { name: 'general' })).body;
   return { server, channel };
