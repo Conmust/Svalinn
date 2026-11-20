@@ -116,3 +116,23 @@ export async function fetchParticipantDevices(conversationId: string): Promise<P
   }
   return response.json();
 }
+
+/** Lists every registered device of every CURRENT member of a channel's
+ * server -- what a client needs before composing an encrypted channel
+ * send: encrypt once per device in this list (the sending device
+ * included, same as `fetchParticipantDevices`). Unlike a DM's fixed pair,
+ * this set can be large and grows or shrinks as members join or leave --
+ * it's fetched fresh per channel rather than cached. */
+export async function fetchChannelMemberDevices(channelId: string): Promise<ParticipantDevice[]> {
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/channels/${channelId}/member-devices`, {
+      headers: getAuthHeaders(),
+    }),
+    DEVICE_NETWORK_TIMEOUT_MS,
+    'Timed out fetching this channel\'s member devices.'
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch channel member devices');
+  }
+  return response.json();
+}

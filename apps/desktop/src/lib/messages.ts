@@ -1,5 +1,24 @@
 import { getAuthHeaders, apiFetch, apiBase } from './api';
+import { withTimeout } from './timeout';
 
+// Mirrors `conversations.ts`'s identically-named constant: message history
+// pages can carry a lot of data (and, for a send, one ciphertext per
+// recipient device), so this gets more headroom than a small fixed-shape
+// device lookup.
+const CHANNEL_MESSAGE_NETWORK_TIMEOUT_MS = 15_000;
+
+/** One recipient device's ciphertext within a channel message's fan-out --
+ * a `message_recipients` row. `sender_public_key` is the SENDING device's
+ * public key, which `decryptFromSender` needs alongside this device's own
+ * private key. Mirrors `conversations.ts`'s `MessageRecipientEntry`. */
+export interface MessageRecipientEntry {
+  device_id: string;
+  ciphertext: string;
+  nonce: string;
+  sender_public_key: string;
+  attachment_key_ciphertext?: string | null;
+  attachment_key_nonce?: string | null;
+}
 
 export interface Message {
   id: string;
@@ -10,7 +29,11 @@ export interface Message {
   nickname?: string | null;
   avatar_url?: string | null;
   patron_tier?: string;
-  content: string;
+  /** Plaintext content, or `null` for a per-device fan-out encrypted
+   * message -- its ciphertext is in `recipients` instead. Channel
+   * messages have no legacy single-device-era encrypted path: a message
+   * with `is_encrypted` true always has `content` null. */
+  content: string | null;
   created_at: string;
   is_edited: boolean;
   updated_at: string | null;
@@ -22,6 +45,20 @@ export interface Message {
   attachment_filename?: string | null;
   attachment_size?: number | null;
   attachment_mime_type?: string | null;
+  /** Base64 `crypto_secretbox` nonce for the encrypted attachment blob at
+   * `attachment_url`. `null`/absent when there's no attachment, or it's
+   * plaintext pre-E2EE history. */
+  attachment_nonce?: string | null;
+  /** Whether this message went through the per-device fan-out send path.
+   * False for all history that predates server-level E2EE. */
+  is_encrypted: boolean;
+  /** Unused for channel messages -- always null/absent. */
+  nonce?: string | null;
+  /** Per-device ciphertext for a fan-out message. From the history-fetch
+   * endpoint, at most one entry -- this device's own, if any ("sent
+   * before this device was added" when empty). From a WebSocket
+   * `new_message` event, every recipient device's entry. */
+  recipients?: MessageRecipientEntry[];
   is_hidden?: boolean;
   reactions?: Reaction[];
 }
@@ -39,6 +76,124 @@ export interface UploadedFile {
   mime_type: string;
 }
 
+export interface GetChannelMessagesOptions {
+  limit?: number;
+  before?: string;
+  /** This device's own id (from `ensureDeviceKeypair`/`getMyDeviceId`).
+   * Required to get back any fan-out message's ciphertext at all --
+   * omitting it is indistinguishable, server-side, from an unrecognized
+   * device id, so every such message comes back with no ciphertext. */
+  deviceId?: string | null;
+}
+
+/** GET /api/v1/channels/:channel_id/messages?before=&limit=&device_id= */
+export async function fetchChannelMessages(
+  channelId: string,
+  options: GetChannelMessagesOptions = {}
+): Promise<Message[]> {
+  const params = new URLSearchParams();
+  if (options.limit) params.append('limit', options.limit.toString());
+  if (options.before) params.append('before', options.before);
+  if (options.deviceId) params.append('device_id', options.deviceId);
+
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/channels/${channelId}/messages?${params}`, {
+      headers: getAuthHeaders(),
+    }),
+    CHANNEL_MESSAGE_NETWORK_TIMEOUT_MS,
+    'Timed out loading messages.'
+  );
+
+  if (!response.ok) throw new Error('Failed to fetch messages');
+  return response.json();
+}
+
+export interface SendChannelMessageOptions {
+  /** One ciphertext per recipient device -- must cover EXACTLY every
+   * currently-registered device of every current member of this channel's
+   * server, including the sender's own sending device. Channel messages
+   * have no plaintext or legacy single-device send path: this is always
+   * required and non-empty. */
+  encryptedFor: Array<{
+    deviceId: string;
+    ciphertext: string;
+    nonce: string;
+    /** This recipient device's wrapped copy of the attachment's symmetric
+     * key (see `lib/crypto.ts`'s `wrapFileKey`). Required for every entry
+     * when `attachmentNonce` is set; must be omitted otherwise. */
+    attachmentKeyCiphertext?: string;
+    attachmentKeyNonce?: string;
+  }>;
+  /** The id of THIS device (the one that did the encrypting), so the
+   * server can resolve and record its public key on every
+   * `message_recipients` row. */
+  senderDeviceId: string;
+  /** Base64 `crypto_secretbox` nonce for the encrypted attachment blob
+   * passed as `attachment` below. Only meaningful alongside an
+   * `attachment`. */
+  attachmentNonce?: string;
+}
+
+/** Thrown by `sendChannelMessage` on a non-OK response. Carries the HTTP
+ * status and the server's own `{ "error": ... }` message so callers can
+ * tell a stale-device-list rejection (400, naming a bad `device_id`) apart
+ * from any other failure. Mirrors `conversations.ts`'s
+ * `SendDirectMessageError`. */
+export class SendChannelMessageError extends Error {
+  status: number;
+  serverMessage: string | null;
+  constructor(status: number, serverMessage: string | null) {
+    super(serverMessage ?? 'Failed to send message');
+    this.name = 'SendChannelMessageError';
+    this.status = status;
+    this.serverMessage = serverMessage;
+  }
+}
+
+/** POST /api/v1/channels/:channel_id/messages -- always encrypted; see
+ * `SendChannelMessageOptions`. */
+export async function sendChannelMessage(
+  channelId: string,
+  attachment: UploadedFile | null,
+  options: SendChannelMessageOptions
+): Promise<Message> {
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({
+        attachment_url: attachment?.url || null,
+        attachment_filename: attachment?.filename || null,
+        attachment_size: attachment?.size || null,
+        attachment_mime_type: attachment?.mime_type || null,
+        attachment_nonce: options.attachmentNonce ?? null,
+        encrypted_for: options.encryptedFor.map((r) => ({
+          device_id: r.deviceId,
+          ciphertext: r.ciphertext,
+          nonce: r.nonce,
+          attachment_key_ciphertext: r.attachmentKeyCiphertext ?? null,
+          attachment_key_nonce: r.attachmentKeyNonce ?? null,
+        })),
+        sender_device_id: options.senderDeviceId,
+      }),
+    }),
+    CHANNEL_MESSAGE_NETWORK_TIMEOUT_MS,
+    'Timed out sending message.'
+  );
+
+  if (!response.ok) {
+    let serverMessage: string | null = null;
+    try {
+      const body = await response.json();
+      if (body && typeof body.error === 'string') serverMessage = body.error;
+    } catch {
+      // Body wasn't JSON (or was empty) -- fall back to no server message.
+    }
+    throw new SendChannelMessageError(response.status, serverMessage);
+  }
+  return response.json();
+}
+
 /** Sends a request and returns the JSON body, throwing the server's error message on failure. */
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const response = await apiFetch(`${apiBase()}${path}`, {
@@ -52,57 +207,6 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     const err = await response.json().catch(() => ({}));
     throw new Error(err.error || `Request failed (${response.status})`);
   }
-  return response.json();
-}
-
-export interface GetMessagesOptions {
-  limit?: number;
-  before?: string;
-}
-
-export async function fetchMessages(channelId: string, options: GetMessagesOptions = {}): Promise<Message[]> {
-  const params = new URLSearchParams();
-  if (options.limit) params.append('limit', options.limit.toString());
-  if (options.before) params.append('before', options.before);
-
-  const response = await apiFetch(`${apiBase()}/api/v1/messages/${channelId}?${params}`, {
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) throw new Error('Failed to fetch messages');
-  return response.json();
-}
-
-export async function sendMessage(
-  channelId: string,
-  content: string,
-  attachment?: UploadedFile | null
-): Promise<Message> {
-  const response = await apiFetch(`${apiBase()}/api/v1/messages`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({
-      channel_id: channelId,
-      content,
-      attachment_url: attachment?.url || null,
-      attachment_filename: attachment?.filename || null,
-      attachment_size: attachment?.size || null,
-      attachment_mime_type: attachment?.mime_type || null,
-    }),
-  });
-
-  if (!response.ok) throw new Error('Failed to send message');
-  return response.json();
-}
-
-export async function editMessage(messageId: string, content: string): Promise<Message> {
-  const response = await apiFetch(`${apiBase()}/api/v1/messages/${messageId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ content }),
-  });
-
-  if (!response.ok) throw new Error('Failed to edit message');
   return response.json();
 }
 
@@ -185,30 +289,6 @@ export async function removeReaction(messageId: string, emoji: string): Promise<
     `/api/v1/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`,
   );
   return res.reactions;
-}
-
-export async function searchMessages(options: {
-  q: string;
-  channelId?: string;
-  conversationId?: string;
-  limit?: number;
-}): Promise<Message[]> {
-  const params = new URLSearchParams();
-  params.append('q', options.q);
-  if (options.channelId) params.append('channel_id', options.channelId);
-  if (options.conversationId) params.append('conversation_id', options.conversationId);
-  if (options.limit) params.append('limit', options.limit.toString());
-
-  const response = await apiFetch(`${apiBase()}/api/v1/search?${params}`, {
-    headers: getAuthHeaders(),
-  });
-
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.error || 'Search failed');
-  }
-
-  return response.json();
 }
 
 export async function banUser(userId: string, reason?: string): Promise<{ success: boolean; messages_deleted: number }> {

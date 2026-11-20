@@ -149,7 +149,11 @@ async fn main() {
         // --- Channel Routes ---
         .route("/api/v1/servers/:server_id/channels", get(routes::channels::get_server_channels))
         .route("/api/v1/servers/:server_id/channels", post(routes::channels::create_channel))
-        
+        .route(
+            "/api/v1/channels/:channel_id/member-devices",
+            get(routes::channels::get_channel_member_devices),
+        )
+
         // --- Message Routes ---
         .route(
             "/api/v1/channels/:channel_id/messages",

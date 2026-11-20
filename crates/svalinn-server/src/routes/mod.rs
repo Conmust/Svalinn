@@ -6,7 +6,6 @@ pub mod members;
 pub mod messages;
 pub mod moderation;
 pub mod reactions;
-pub mod search;
 pub mod servers;
 pub mod users;
 pub mod ws;

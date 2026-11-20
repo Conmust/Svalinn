@@ -1,19 +1,24 @@
+use std::collections::HashSet;
+
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{Path, Query, State},
     Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::access::{
-    channel_server_id, is_moderator, multipart_error, require_member, safe_extension, MAX_ATTACHMENT_BYTES,
-};
+use crate::access::{channel_server_id, is_moderator, require_member};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::{CurrentSession, CurrentUser};
 use crate::files::sign_opt;
+use crate::models::device::{EncryptedRecipient, MessageRecipientPayload};
 use crate::models::message::BroadcastMessage;
+use crate::routes::conversations::{
+    fetch_recipients_for_messages, MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS, MAX_FANOUT_CIPHERTEXT_B64_CHARS,
+    MAX_FANOUT_NONCE_B64_CHARS,
+};
 
 /// One emoji's reactions on a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,25 +38,48 @@ pub struct Message {
     /// -- resolved live (like `username`), so renaming updates history too.
     pub nickname: Option<String>,
     pub avatar_url: Option<String>,
-    pub content: String,
+    /// Plaintext content, or `None` for a per-device fan-out encrypted
+    /// message -- its ciphertext is in `recipients` instead. Unlike DMs,
+    /// channel messages have no legacy single-device-era encrypted path:
+    /// `is_encrypted` true always means `content` is `None` here.
+    pub content: Option<String>,
     pub attachment_url: Option<String>,
     pub attachment_filename: Option<String>,
     pub attachment_mime_type: Option<String>,
     pub attachment_size: Option<i64>,
+    /// Base64 `crypto_secretbox` nonce for the encrypted attachment blob at
+    /// `attachment_url`. `None` when there's no attachment or it's
+    /// plaintext (pre-E2EE) history.
+    pub attachment_nonce: Option<String>,
     pub is_edited: bool,
+    /// Whether this message went through the per-device fan-out send path.
+    /// False for all history that predates server-level E2EE.
+    pub is_encrypted: bool,
+    /// Unused for channel messages (no legacy single-device path exists
+    /// here) -- always `None`. Kept so `Message` can share `MESSAGE_COLUMNS`
+    /// with the generic `messages` table columns without a mismatch.
+    pub nonce: Option<String>,
     pub is_locked: bool,
     pub is_pinned: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Whether the *requesting* user has hidden this message.
     pub is_hidden: bool,
     pub reactions: sqlx::types::Json<Vec<ReactionSummary>>,
+    /// Per-device ciphertext for a fan-out message. Populated manually
+    /// after the main `SELECT` (see `fetch_recipients_for_messages`), never
+    /// a DB column itself. From the history-fetch endpoint, at most one
+    /// entry -- this device's own, if any. From the broadcast/create-
+    /// response path, every recipient device's entry.
+    #[sqlx(skip)]
+    pub recipients: Vec<MessageRecipientPayload>,
 }
 
 /// Columns for `Message`. `$1` must be the requesting user's id.
 const MESSAGE_COLUMNS: &str = r#"
     m.id, m.channel_id, m.user_id, u.username, sm.nickname, u.avatar_url, m.content,
-    m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
+    m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size, m.attachment_nonce,
     COALESCE(m.is_edited, false) AS is_edited,
+    m.is_encrypted, m.nonce,
     COALESCE(m.is_locked, false) AS is_locked,
     COALESCE(m.is_pinned, false) AS is_pinned,
     m.created_at,
@@ -73,7 +101,7 @@ const MESSAGE_COLUMNS: &str = r#"
 "#;
 
 async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Result<Message, AppError> {
-    sqlx::query_as(&format!(
+    let mut message: Message = sqlx::query_as(&format!(
         r#"
         SELECT {MESSAGE_COLUMNS}
         FROM messages m
@@ -88,7 +116,18 @@ async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Resu
     .fetch_optional(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Message not found".into()))
+    .ok_or_else(|| AppError::NotFound("Message not found".into()))?;
+
+    // Every recipient device's entry, not just the viewer's own -- used
+    // both for the create-response and for the WebSocket broadcast
+    // payload, where each connected client filters down to its own device
+    // client-side (see `ws.rs`). The history-fetch endpoint below uses a
+    // narrower, per-device filter instead.
+    let recipients_by_message = fetch_recipients_for_messages(db, &[message.id], None).await?;
+    if let Some(entries) = recipients_by_message.get(&message.id) {
+        message.recipients = entries.clone();
+    }
+    Ok(message)
 }
 
 /// Author, server, lock state and the current user's role for a channel message.
@@ -98,13 +137,14 @@ struct MessageContext {
     author_id: Uuid,
     server_id: Uuid,
     is_locked: bool,
+    is_encrypted: bool,
     role: String,
 }
 
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, Uuid, bool, bool)> = sqlx::query_as(
         r#"
-        SELECT m.user_id, c.server_id, COALESCE(m.is_locked, false)
+        SELECT m.user_id, c.server_id, COALESCE(m.is_locked, false), m.is_encrypted
         FROM messages m JOIN channels c ON m.channel_id = c.id
         WHERE m.id = $1 AND c.server_id IS NOT NULL
         "#,
@@ -114,11 +154,11 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (author_id, server_id, is_locked) =
+    let (author_id, server_id, is_locked, is_encrypted) =
         row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
     let role = require_member(db, server_id, user_id).await?;
 
-    Ok(MessageContext { author_id, server_id, is_locked, role })
+    Ok(MessageContext { author_id, server_id, is_locked, is_encrypted, role })
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -145,6 +185,12 @@ pub struct HistoryQuery {
     /// Load messages older than this message. Omit for the latest page.
     pub before: Option<Uuid>,
     pub limit: Option<i64>,
+    /// This device's own id, needed to get back any fan-out message's
+    /// ciphertext at all -- omitting it (or passing a device id that isn't
+    /// the caller's own) is indistinguishable from an unrecognized device,
+    /// so every such message comes back with no ciphertext. Mirrors
+    /// `conversations::HistoryQuery`.
+    pub device_id: Option<Uuid>,
 }
 
 /// GET /api/v1/channels/:channel_id/messages?before=<message_id>&limit=50
@@ -165,7 +211,7 @@ pub async fn get_channel_messages(
 
     // Page by (created_at, id) so messages with the same timestamp are
     // neither skipped nor repeated.
-    let messages: Vec<Message> = if let Some(before) = query.before {
+    let mut messages: Vec<Message> = if let Some(before) = query.before {
         let cursor: Option<chrono::DateTime<chrono::Utc>> =
             sqlx::query_scalar("SELECT created_at FROM messages WHERE id = $1 AND channel_id = $2")
                 .bind(before)
@@ -222,8 +268,39 @@ pub async fn get_channel_messages(
         .map_err(|e| AppError::Database(e.to_string()))?
     };
 
+    // A client that never set up per-device keys (or just hasn't told us
+    // which device it is) must never see ANY device's ciphertext for a
+    // fan-out message -- not even by accident via a NULL-matches-anything
+    // filter bug. `Uuid::nil()` is never a real device id, so filtering by
+    // it deterministically yields zero rows.
+    //
+    // `device_id` is caller-supplied and otherwise unverified: without
+    // confirming it's actually one of the caller's OWN registered devices,
+    // a member could pass another member's device_id and receive that
+    // device's per-device ciphertext/nonce instead of their own. Mirrors
+    // `conversations::get_conversation_messages`'s identical check.
+    let device_filter = match query.device_id {
+        Some(id) => {
+            let owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device_keys WHERE id = $1 AND user_id = $2)")
+                    .bind(id)
+                    .bind(user_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            if owned { id } else { Uuid::nil() }
+        }
+        None => Uuid::nil(),
+    };
+    let message_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
+    let recipients_by_message = fetch_recipients_for_messages(&db, &message_ids, Some(device_filter)).await?;
+    for m in &mut messages {
+        if let Some(entries) = recipients_by_message.get(&m.id) {
+            m.recipients = entries.clone();
+        }
+    }
+
     if query.before.is_some() {
-        let mut messages = messages;
         for m in &mut messages {
             sign_opt(&mut m.attachment_url, user_id, session_id);
             sign_opt(&mut m.avatar_url, user_id, session_id);
@@ -247,7 +324,6 @@ pub async fn get_channel_messages(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let mut messages = messages;
     for m in &mut messages {
         sign_opt(&mut m.attachment_url, user_id, session_id);
         sign_opt(&mut m.avatar_url, user_id, session_id);
@@ -255,99 +331,226 @@ pub async fn get_channel_messages(
     Ok(Json(messages))
 }
 
+/// Request body for `POST /api/v1/channels/:channel_id/messages`.
+///
+/// Channel messages are mandatory end-to-end encrypted: there is no
+/// plaintext send path and no legacy single-device path either (unlike
+/// DMs, which still support both for backward compatibility with history
+/// that predates per-device fan-out -- channels never had that history to
+/// preserve, so this cuts over cleanly). An attachment, if any, must
+/// already be uploaded as its encrypted ciphertext blob via the generic
+/// `POST /api/v1/upload` endpoint (same as the DM flow) before this is
+/// called -- this endpoint only ever stores a reference to it.
+#[derive(Deserialize)]
+pub struct SendChannelMessageRequest {
+    pub attachment_url: Option<String>,
+    pub attachment_filename: Option<String>,
+    pub attachment_size: Option<i64>,
+    pub attachment_mime_type: Option<String>,
+    /// Base64 `crypto_secretbox` nonce for the encrypted attachment blob at
+    /// `attachment_url`. Required (and must be non-empty) when
+    /// `attachment_url` is set; must be absent otherwise.
+    pub attachment_nonce: Option<String>,
+    /// One ciphertext per recipient device -- must cover EXACTLY every
+    /// currently-registered device of every current member of this
+    /// channel's server, including the sender's own sending device. See
+    /// the completeness check below.
+    pub encrypted_for: Vec<EncryptedRecipient>,
+    /// The id of THIS device (the one that did the encrypting), so the
+    /// server can resolve and record its public key on every
+    /// `message_recipients` row -- recipients need the sender's public
+    /// key to decrypt, not their own.
+    pub sender_device_id: Uuid,
+}
+
 /// POST /api/v1/channels/:channel_id/messages
+///
+/// Validates that `encrypted_for` covers every currently-registered device
+/// of every current member of this channel's server exactly -- no more, no
+/// less -- then inserts the `messages` row and every `message_recipients`
+/// row in one transaction: either all of it lands, or none of it does.
+/// Mirrors `conversations::send_fanout_message`, scoped to `server_members`
+/// instead of a fixed two-person `conversation_participants`.
+///
+/// A member who joins this server after a message is sent never gets a
+/// row here for it -- there is no re-share/history-backfill ceremony, by
+/// design. A member who leaves (or is removed) simply isn't in the
+/// completeness check for any message sent after they're gone.
 pub async fn create_message(
     State(db): State<Database>,
     CurrentSession { user_id, session_id }: CurrentSession,
     Path(channel_id): Path<Uuid>,
-    mut multipart: Multipart,
+    Json(payload): Json<SendChannelMessageRequest>,
 ) -> Result<Json<Message>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
 
-    let mut content = String::new();
-    let mut attachment_url: Option<String> = None;
-    let mut attachment_filename: Option<String> = None;
-    let mut attachment_mime_type: Option<String> = None;
-    let mut attachment_size: Option<i64> = None;
+    if payload.encrypted_for.is_empty() {
+        return Err(AppError::BadRequest(
+            "encrypted_for is required: channel messages are always encrypted".into(),
+        ));
+    }
 
-    // Parse multipart form data
-    while let Some(field) = multipart.next_field().await.map_err(|e| multipart_error(e, MAX_ATTACHMENT_BYTES))? {
-        let name = field.name().unwrap_or("").to_string();
+    // An attachment is encrypted iff `attachment_url` is set: then every
+    // recipient MUST carry a wrapped copy of the file key, and the message
+    // needs the shared blob's nonce. With no attachment, neither applies --
+    // reject a mismatched client payload outright rather than silently
+    // ignoring stray fields.
+    let has_attachment = payload.attachment_url.is_some();
+    if has_attachment && payload.attachment_nonce.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::BadRequest("attachment_nonce is required when attachment_url is set".into()));
+    }
+    if !has_attachment && payload.attachment_nonce.is_some() {
+        return Err(AppError::BadRequest("attachment_nonce must not be set without attachment_url".into()));
+    }
 
-        if name == "content" {
-            content = field.text().await.unwrap_or_default();
-        } else if name == "file" {
-            let filename = field.file_name().unwrap_or("file").to_string();
-            let mime_type = field.content_type().unwrap_or("application/octet-stream").to_string();
-            let bytes = field.bytes().await.map_err(|e| multipart_error(e, MAX_ATTACHMENT_BYTES))?.to_vec();
-            let size = bytes.len() as i64;
-
-            // Save file locally.
-            //
-            // CodeQL flags `file_path` below as "uncontrolled data used in
-            // path expression" because the user-supplied `filename` feeds
-            // into it. This is a false positive, not a gap: none of the
-            // three pieces that make up `new_filename` let attacker input
-            // reach the filesystem path.
-            //   - `Uuid::new_v4()` is server-generated.
-            //   - `user_id` is a `Uuid` from the authenticated session
-            //     extractor, not client-shaped text -- its `Display` always
-            //     renders as a plain hex-dash UUID, so it can't carry a `/`
-            //     or `..`.
-            //   - `file_ext` is the *only* piece derived from the raw
-            //     `filename`, and it's passed through `safe_extension()`
-            //     (access.rs), which only returns the extension if it's
-            //     <=10 chars of plain ASCII alphanumerics -- anything else
-            //     (`.`, `/`, `..`, null bytes, ...) falls back to `"bin"`.
-            //     See `safe_extension`'s `rejects_path_tricks_and_missing_extensions`
-            //     test for this exact threat model.
-            // CodeQL's taint tracker doesn't recognize `safe_extension` as a
-            // sanitizer (it's hand-written, not a known library function),
-            // so it still flags the flow even though the allowlist breaks
-            // it. Dismissed on GitHub as a false positive -- keep this
-            // comment in sync if `safe_extension` or this call site changes.
-            let file_ext = safe_extension(&filename, "bin");
-            let new_filename = format!("msg_{}_{}.{}", Uuid::new_v4(), user_id, file_ext);
-            let file_path = format!("uploads/{}", new_filename);
-
-            tokio::fs::create_dir_all("uploads").await.map_err(|e| AppError::Internal(e.to_string()))?;
-            tokio::fs::write(&file_path, bytes).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-            attachment_url = Some(format!("/uploads/{}", new_filename));
-            attachment_filename = Some(filename);
-            attachment_mime_type = Some(mime_type);
-            attachment_size = Some(size);
+    for r in &payload.encrypted_for {
+        if r.ciphertext.trim().is_empty() || r.nonce.trim().is_empty() {
+            return Err(AppError::BadRequest("ciphertext and nonce are required for every entry in encrypted_for".into()));
+        }
+        if r.ciphertext.len() > MAX_FANOUT_CIPHERTEXT_B64_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "ciphertext in encrypted_for can be at most {MAX_FANOUT_CIPHERTEXT_B64_CHARS} characters"
+            )));
+        }
+        if r.nonce.len() > MAX_FANOUT_NONCE_B64_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "nonce in encrypted_for can be at most {MAX_FANOUT_NONCE_B64_CHARS} characters"
+            )));
+        }
+        let key_ct = r.attachment_key_ciphertext.as_deref().unwrap_or("").trim();
+        let key_nonce = r.attachment_key_nonce.as_deref().unwrap_or("").trim();
+        if has_attachment {
+            if key_ct.is_empty() || key_nonce.is_empty() {
+                return Err(AppError::BadRequest(
+                    "attachment_key_ciphertext and attachment_key_nonce are required for every entry in encrypted_for when attachment_url is set".into(),
+                ));
+            }
+            if key_ct.len() > MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_ciphertext in encrypted_for can be at most {MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS} characters"
+                )));
+            }
+            if key_nonce.len() > MAX_FANOUT_NONCE_B64_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_nonce in encrypted_for can be at most {MAX_FANOUT_NONCE_B64_CHARS} characters"
+                )));
+            }
+        } else if !key_ct.is_empty() || !key_nonce.is_empty() {
+            return Err(AppError::BadRequest(
+                "attachment_key_ciphertext/attachment_key_nonce must not be set without attachment_url".into(),
+            ));
         }
     }
 
-    if content.chars().count() > MAX_CONTENT_CHARS {
-        return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
+    let device_ids: Vec<Uuid> = payload.encrypted_for.iter().map(|r| r.device_id).collect();
+    let mut seen = HashSet::new();
+    for id in &device_ids {
+        if !seen.insert(*id) {
+            return Err(AppError::BadRequest("encrypted_for contains the same device_id more than once".into()));
+        }
     }
-    if content.trim().is_empty() && attachment_url.is_none() {
-        return Err(AppError::BadRequest("Message cannot be empty".into()));
+
+    let mut tx = db.pool.begin().await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Read inside the transaction (not via `db.pool` beforehand) so this
+    // is genuinely the same consistent snapshot the completeness check
+    // below claims to use, rather than a membership list that could have
+    // gone stale by the time the transaction actually started.
+    let member_ids: Vec<Uuid> = sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+        .bind(server_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let sender_public_key: Option<String> =
+        sqlx::query_scalar("SELECT public_key FROM device_keys WHERE id = $1 AND user_id = $2")
+            .bind(payload.sender_device_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let sender_public_key = sender_public_key
+        .ok_or_else(|| AppError::BadRequest("sender_device_id must be one of your own registered devices".into()))?;
+
+    // Every recipient device must belong to device_keys owned by a CURRENT
+    // member of this server -- otherwise reject the whole send rather than
+    // partially deliver it.
+    let valid_device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_keys WHERE id = ANY($1) AND user_id = ANY($2)")
+            .bind(&device_ids)
+            .bind(&member_ids)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if valid_device_count as usize != device_ids.len() {
+        return Err(AppError::BadRequest(
+            "encrypted_for contains a device_id that doesn't belong to a current member of this server".into(),
+        ));
+    }
+
+    // `encrypted_for` must cover every currently-registered device of
+    // every current server member, INCLUDING the sender's own sending
+    // device -- read inside the same transaction as the rest of this
+    // function's checks so it sees a consistent device/membership list; a
+    // device or membership change racing this transaction is an existing
+    // acceptable race, not a new one.
+    let registered_device_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM device_keys WHERE user_id = ANY($1)")
+        .bind(&member_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let required_device_ids: HashSet<Uuid> = registered_device_ids.into_iter().collect();
+    if required_device_ids != seen {
+        let missing: Vec<Uuid> = required_device_ids.difference(&seen).copied().collect();
+        return Err(AppError::BadRequest(format!(
+            "encrypted_for must contain exactly every currently-registered device of every current server member (including the sender's own sending device); missing: {missing:?}"
+        )));
     }
 
     let msg_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
+        r#"
+        INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, attachment_nonce, is_encrypted, nonce)
+        VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, true, NULL)
+        RETURNING id
+        "#,
     )
     .bind(channel_id)
     .bind(user_id)
-    .bind(&content)
-    .bind(&attachment_url)
-    .bind(&attachment_filename)
-    .bind(&attachment_mime_type)
-    .bind(attachment_size)
-    .fetch_one(&db.pool)
+    .bind(&payload.attachment_url)
+    .bind(&payload.attachment_filename)
+    .bind(&payload.attachment_mime_type)
+    .bind(payload.attachment_size)
+    .bind(&payload.attachment_nonce)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    for r in &payload.encrypted_for {
+        sqlx::query(
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(msg_id)
+        .bind(r.device_id)
+        .bind(&r.ciphertext)
+        .bind(&r.nonce)
+        .bind(&sender_public_key)
+        .bind(&r.attachment_key_ciphertext)
+        .bind(&r.attachment_key_nonce)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
+    tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
+
     let mut message = fetch_message(&db, msg_id, user_id).await?;
 
-    // Broadcast the stored path; each recipient's connection signs it for them.
-    let payload = serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?;
-    broadcast(&db, "new_message", payload, server_id);
+    // Broadcast every recipient's ciphertext; each connected client filters
+    // down to its own device (and signs the stored attachment path for
+    // itself) client-side.
+    let broadcast_payload = serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?;
+    broadcast(&db, "new_message", broadcast_payload, server_id);
 
     sign_opt(&mut message.attachment_url, user_id, session_id);
     sign_opt(&mut message.avatar_url, user_id, session_id);
@@ -524,6 +727,20 @@ pub async fn edit_message(
     if ctx.author_id != user_id {
         return Err(AppError::Forbidden("You can only edit your own messages".into()));
     }
+    // Editing would mean re-encrypting for every current member's device,
+    // but that recipient set may have grown since the original send -- and
+    // re-fanning-out to it would hand a NEW member the (edited) content of
+    // a message that predates them joining, violating the same "no history
+    // for new joiners" invariant the original send enforces. Rather than
+    // re-deriving a narrower "only the original recipients" completeness
+    // check here (DMs don't support editing either -- see
+    // `conversations.rs`), editing an encrypted message is simply not
+    // supported: delete and resend instead.
+    if ctx.is_encrypted {
+        return Err(AppError::BadRequest(
+            "Encrypted messages can't be edited -- delete and resend instead".into(),
+        ));
+    }
     if payload.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(AppError::BadRequest(format!("Messages can be at most {MAX_CONTENT_CHARS} characters")));
     }
@@ -547,4 +764,333 @@ pub async fn edit_message(
     let update = serde_json::json!({ "id": message_id, "content": payload.content, "is_edited": true });
     broadcast(&db, "message_updated", update.clone(), ctx.server_id);
     Ok(Json(update))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::devices::{register_device, RegisterDeviceRequest};
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    /// Creates a server with `owner_id` as its owning member.
+    async fn create_test_server(db: &Database, owner_id: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(server_id)
+            .bind(owner_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert owner membership");
+        server_id
+    }
+
+    async fn add_server_member(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+    }
+
+    async fn create_test_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'text') RETURNING id")
+            .bind(server_id)
+            .bind(format!("general-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test channel")
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    fn fake_public_key(byte: u8) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [byte; 32])
+    }
+
+    async fn register_test_device(db: &Database, user_id: Uuid, byte: u8) -> Uuid {
+        register_device(
+            State(db.clone()),
+            CurrentUser(user_id),
+            Json(RegisterDeviceRequest { public_key: fake_public_key(byte), device_label: format!("device-{byte}") }),
+        )
+        .await
+        .expect("registering a test device should succeed")
+        .0
+        .id
+    }
+
+    fn fake_recipient(device_id: Uuid) -> EncryptedRecipient {
+        EncryptedRecipient {
+            device_id,
+            ciphertext: "ciphertext".into(),
+            nonce: "nonce".into(),
+            attachment_key_ciphertext: None,
+            attachment_key_nonce: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_send_round_trips_through_history_fetch() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 1).await;
+
+        let created = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(device)],
+                sender_device_id: device,
+            }),
+        )
+        .await
+        .expect("a complete fan-out send should succeed")
+        .0;
+
+        assert!(created.content.is_none(), "a fan-out message must not store shared plaintext content");
+        assert!(created.is_encrypted);
+        assert_eq!(created.recipients.len(), 1);
+        assert_eq!(created.recipients[0].device_id, device);
+        assert_eq!(created.recipients[0].ciphertext, "ciphertext");
+
+        let history = get_channel_messages(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(device) }),
+        )
+        .await
+        .expect("fetching channel history should succeed")
+        .0;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].recipients.len(), 1, "the history endpoint should return this device's own ciphertext");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn fanout_rejects_incomplete_device_coverage() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let other = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 2).await;
+        let _other_device = register_test_device(&db, other, 3).await;
+        add_server_member(&db, server, other).await;
+
+        // Only the sender's own device is covered -- the other member's
+        // device is missing from `encrypted_for`.
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device)],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for incomplete device coverage, got {other:?}"),
+        }
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, other).await;
+    }
+
+    #[tokio::test]
+    async fn fanout_rejects_a_device_that_does_not_belong_to_a_current_member() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 4).await;
+        // Not added to the server -- this device belongs to a non-member.
+        let outsider_device = register_test_device(&db, outsider, 5).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device), fake_recipient(outsider_device)],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a non-member's device, got {other:?}"),
+        }
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, outsider).await;
+    }
+
+    /// The single most important invariant behind this feature: a member
+    /// who joins a channel's server AFTER a message was sent must never
+    /// be able to decrypt it -- no re-share/backfill ceremony. Verifies
+    /// this holds with no special-case code: the new member's device
+    /// simply never gets a `message_recipients` row for the earlier
+    /// message, because the completeness check was computed against
+    /// server membership as it stood at send time.
+    #[tokio::test]
+    async fn a_member_who_joins_later_gets_no_recipient_row_for_an_earlier_message() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let newcomer = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 6).await;
+
+        // Sent while `newcomer` is not yet a member.
+        let created = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device)],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await
+        .expect("send before the newcomer joins should succeed")
+        .0;
+
+        // Newcomer joins and registers a device AFTER the message exists.
+        add_server_member(&db, server, newcomer).await;
+        let newcomer_device = register_test_device(&db, newcomer, 7).await;
+
+        let recipient_device_ids: Vec<Uuid> =
+            sqlx::query_scalar("SELECT device_id FROM message_recipients WHERE message_id = $1")
+                .bind(created.id)
+                .fetch_all(&db.pool)
+                .await
+                .expect("failed to query message_recipients");
+        assert_eq!(recipient_device_ids, vec![owner_device], "no row must exist for the newcomer's device");
+        assert!(!recipient_device_ids.contains(&newcomer_device));
+
+        // And the newcomer's own history fetch confirms it: no ciphertext
+        // for this message on their device.
+        let history = get_channel_messages(
+            State(db.clone()),
+            CurrentSession { user_id: newcomer, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(newcomer_device) }),
+        )
+        .await
+        .expect("the newcomer should still be able to list channel history")
+        .0;
+        let same_message = history.iter().find(|m| m.id == created.id).expect("the message should still be listed");
+        assert!(same_message.recipients.is_empty(), "the newcomer's device must get no ciphertext for this message");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, newcomer).await;
+    }
+
+    #[tokio::test]
+    async fn editing_an_encrypted_channel_message_is_rejected() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 8).await;
+
+        let created = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(device)],
+                sender_device_id: device,
+            }),
+        )
+        .await
+        .expect("send should succeed")
+        .0;
+
+        let result = edit_message(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(created.id),
+            Json(EditMessageRequest { content: "edited".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest when editing an encrypted message, got {other:?}"),
+        }
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
 }

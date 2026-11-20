@@ -31,7 +31,7 @@
   let editor: HTMLTextAreaElement;
 
   async function startEdit() {
-    draft = message.content;
+    draft = message.content ?? '';
     editing = true;
     await tick();
     editor?.focus();
@@ -224,7 +224,7 @@
         on:openchange={(e) => (pickerOpen = e.detail)}
         on:select={(e) => dispatch('toggleReaction', { messageId: message.id, emoji: e.detail })}
       />
-      {#if isOwn}
+      {#if isOwn && !message.is_encrypted}
         <button type="button" class={toolButton} title="Edit your message" on:click={startEdit}>Edit</button>
       {/if}
       {#if canModerate}

@@ -11,6 +11,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
-    "pg": "8.13.1"
+    "pg": "8.13.1",
+    "libsodium-wrappers-sumo": "0.7.15"
   }
 }

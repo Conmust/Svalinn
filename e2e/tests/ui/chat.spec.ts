@@ -50,7 +50,12 @@ test('image attachments display for everyone', async ({ browser }) => {
     const img = page.locator('img[alt$="green.png"]');
     await expect(img).toBeVisible();
     await expect.poll(() => img.evaluate((i: HTMLImageElement) => i.naturalWidth)).toBeGreaterThan(0);
-    expect(await img.getAttribute('src')).toContain('/api/v1/files/');
+    // Channel attachments are mandatory end-to-end encrypted now: the
+    // server only ever serves the ciphertext blob, so what's rendered is
+    // a `blob:` URL built from the bytes decrypted client-side (see
+    // `ensureAttachmentDecrypted` in `ChatArea.svelte`), not the signed
+    // `/api/v1/files/...` server link directly.
+    expect(await img.getAttribute('src')).toContain('blob:');
   }
 });
 
@@ -65,19 +70,18 @@ test('the emoji button inserts at the cursor', async ({ browser }) => {
   await expect(page.getByText('Insert Emoji')).toHaveCount(0);
 });
 
-test('editing shows live, marked as edited', async ({ browser }) => {
-  const { ownerPage, memberPage } = await twoMembers(browser);
-  await sendMessage(memberPage, 'first line');
-  await sendMessage(memberPage, 'second line'); // a follow-up message, without a name header
+// Channel messages are mandatory end-to-end encrypted now, and (same as
+// DMs, which never supported editing) an encrypted message can't be
+// edited, since re-encrypting it for the current member set on edit would
+// risk handing a later-joining member content from before they joined.
+// The app hides the Edit button entirely for an encrypted message --
+// delete and resend is the supported path instead.
+test('a sent (always-encrypted) message has no edit option', async ({ browser }) => {
+  const { memberPage } = await twoMembers(browser);
+  await sendMessage(memberPage, 'second line');
   const row = messageRow(memberPage, 'second line');
   await row.hover();
-  await row.getByRole('button', { name: 'Edit', exact: true }).click();
-  await memberPage.getByLabel('Edit message').fill('second line, fixed');
-  await memberPage.keyboard.press('Enter');
-
-  const ownerRow = messageRow(ownerPage, 'second line, fixed');
-  await expect(ownerRow).toBeVisible();
-  await expect(ownerRow.getByText('(edited)')).toBeVisible();
+  await expect(row.getByRole('button', { name: 'Edit', exact: true })).toHaveCount(0);
 });
 
 test('reactions, pins and locks from the message toolbar', async ({ browser }) => {

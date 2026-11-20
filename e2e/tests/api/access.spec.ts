@@ -1,9 +1,10 @@
 import { test, expect } from '@playwright/test';
 import { API_URL } from '../../support/config';
 import {
-  admin, call, callForm, createServer, join, jwtPayload, login, nowSeconds, openSocket, post, postMessage,
-  register, signFileLink, sql,
+  admin, call, callForm, createServer, ensureDevice, join, jwtPayload, login, nowSeconds, openSocket, post,
+  postMessage, register, signFileLink, sql,
 } from '../../support/api';
+import { decryptFromSender } from '../../support/crypto';
 
 const PNG = Uint8Array.from(Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489', 'hex'));
 const fetchFile = (link: string, headers: Record<string, string> = {}) => fetch(API_URL + link, { headers });
@@ -28,11 +29,17 @@ test('outsiders get no live events from a server', async () => {
   const outsider = await register('out');
   const { server, channel } = await createServer(owner);
   await join(owner, server.id, member);
+  // Channel messages are mandatory end-to-end encrypted, so `member` needs
+  // a registered device to be included in the fan-out at all.
+  await ensureDevice(member);
 
   const [memberWs, outsiderWs] = await Promise.all([openSocket(member), openSocket(outsider)]);
   await postMessage(owner, channel.id, 'secret plans');
   const event = await memberWs.waitFor((e) => e.type === 'new_message');
-  expect(event.payload.content).toBe('secret plans');
+  const mine = event.payload.recipients.find((r: any) => r.device_id === member.device!.id);
+  expect(mine).toBeTruthy();
+  const decrypted = await decryptFromSender(mine.ciphertext, mine.nonce, mine.sender_public_key, member.device!.privateKey);
+  expect(decrypted).toBe('secret plans');
   await new Promise((r) => setTimeout(r, 300));
   expect(outsiderWs.events.filter((e) => e.type === 'new_message')).toHaveLength(0);
   memberWs.close();
@@ -60,7 +67,11 @@ test.describe('uploads', () => {
     const { channel } = await createServer(owner);
     const res = await postMessage(owner, channel.id, 'x', { name: 'x./../../evil', type: 'text/plain', data: 'x' });
     const stored = (await sql(`SELECT attachment_url FROM messages WHERE id = $1`, [res.body.id]))[0].attachment_url;
-    expect(stored).toMatch(/^\/uploads\/msg_[0-9a-f-]+_[0-9a-f-]+\.bin$/);
+    // The attachment now goes through the generic `/api/v1/upload` endpoint
+    // (same one DMs use), which names files `<uuid>.<ext>` -- no `msg_`
+    // prefix. The path-traversal protection itself (`safe_extension`
+    // falling back to `.bin` for an unsafe name) is unchanged.
+    expect(stored).toMatch(/^\/uploads\/[0-9a-f-]+\.bin$/);
   });
 });
 
@@ -131,17 +142,21 @@ test.describe('file links', () => {
   test('uploaded web pages download instead of running; video supports seeking', async () => {
     const owner = await register('own');
     const { channel } = await createServer(owner);
-    await postMessage(owner, channel.id, 'page', { name: 'x.html', type: 'text/html', data: '<script>alert(1)</script>' });
-    await postMessage(owner, channel.id, 'clip', { name: 'clip.mp4', type: 'video/mp4', data: new Uint8Array(100_000) });
-    const msgs = (await call(owner, 'GET', `/channels/${channel.id}/messages`)).body;
+    // `content` is now ciphertext server-side, so these are identified by
+    // the message object `postMessage` returns directly rather than by
+    // filtering a fetched list on plaintext `content`.
+    const page = (await postMessage(owner, channel.id, 'page', { name: 'x.html', type: 'text/html', data: '<script>alert(1)</script>' })).body;
+    const clip = (await postMessage(owner, channel.id, 'clip', { name: 'clip.mp4', type: 'video/mp4', data: new Uint8Array(100_000) })).body;
 
-    const html = await fetchFile(msgs.find((m: any) => m.content === 'page').attachment_url);
+    const html = await fetchFile(page.attachment_url);
     expect(html.headers.get('content-disposition')).toBe('attachment');
     expect(html.headers.get('content-security-policy')).toBe('sandbox');
 
-    const video = await fetchFile(msgs.find((m: any) => m.content === 'clip').attachment_url, { Range: 'bytes=0-999' });
+    const video = await fetchFile(clip.attachment_url, { Range: 'bytes=0-999' });
     expect(video.status).toBe(206);
-    expect(video.headers.get('content-range')).toBe('bytes 0-999/100000');
+    // The stored blob is the encrypted attachment, which is 16 bytes
+    // (crypto_secretbox's MAC) larger than the original plaintext.
+    expect(video.headers.get('content-range')).toBe('bytes 0-999/100016');
   });
 
   test('live events carry links signed for each recipient', async () => {

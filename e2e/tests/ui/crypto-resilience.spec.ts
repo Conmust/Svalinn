@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { call, createServer, join, register, sql } from '../../support/api';
-import { openAs, openChannel, pageErrors, sendMessage } from '../../support/ui';
+import { openChannel, pageErrors } from '../../support/ui';
 
 /**
  * Forcibly breaks this device's E2EE setup for `page`, the same way a
@@ -23,7 +23,14 @@ async function breakDeviceRegistration(page: Page) {
 }
 
 test.describe('the app stays usable when the E2EE subsystem is broken', () => {
-  test('non-DM features keep working, the DM panel degrades to a clear error, and sending stays hard-blocked', async ({ browser }) => {
+  // Channel messages are now mandatory end-to-end encrypted too (not just
+  // DMs), so a broken device-registration setup hard-blocks sending in
+  // BOTH the channel panel and the DM panel -- there's no "non-E2EE
+  // messaging" fallback left to exercise. What still has to survive is
+  // navigation and the rest of the UI around the broken panels: no crash,
+  // and both panels degrade to a clear, specific error rather than
+  // silently sending plaintext.
+  test('both channel and DM panels degrade to a clear error, and sending stays hard-blocked everywhere', async ({ browser }) => {
     const a = await register('cra');
     const b = await register('crb');
     const { server } = await createServer(a);
@@ -58,17 +65,23 @@ test.describe('the app stays usable when the E2EE subsystem is broken', () => {
     await aPage.goto('/');
     await aPage.getByTitle('Account settings').waitFor();
 
-    // --- (a) Everything that doesn't depend on E2EE keeps working -------
+    // --- (a) The channel panel shows a clear, specific error -- no crash,
+    // and sending there is hard-blocked too -----------------------------
     await openChannel(aPage, server.name);
-    await sendMessage(aPage, 'business as usual');
-    await expect(aPage.getByText('business as usual')).toBeVisible();
+    const channelPanel = aPage.locator('.messages-container');
+    await expect(channelPanel.getByRole('alert')).toBeVisible({ timeout: 20_000 });
+    await expect(channelPanel.getByRole('alert')).toContainText('Encrypted messaging is currently unavailable');
+    await expect(channelPanel.getByRole('alert')).toContainText(/failed to register this device/i);
+    await expect(aPage.getByPlaceholder('Encrypted messaging unavailable')).toBeDisabled();
+    await expect(aPage.getByRole('button', { name: 'Send' })).toBeDisabled();
 
-    // Navigating away from and back to a server still works normally.
+    // Navigating away from and back to a server still works normally --
+    // this is a panel-local failure, not a whole-app crash.
     await aPage.getByTitle('Direct Messages').click();
     await openChannel(aPage, server.name);
     await expect(aPage.getByText('# general', { exact: true })).toBeVisible();
 
-    // --- (b) The DM panel shows a clear, specific error -- no crash -----
+    // --- (b) The DM panel shows the same clear, specific error ---------
     await aPage.getByTitle('Direct Messages').click();
     await aPage.getByText(b.user.username, { exact: false }).first().click();
 
