@@ -806,7 +806,7 @@
       <input
         bind:value={newMessage}
         type="text"
-        class="flex-1 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)] disabled:opacity-50"
+        class="flex-1 min-w-0 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)] disabled:opacity-50"
         placeholder={canSend ? 'Type a message...' : 'Encrypted messaging unavailable'}
         disabled={sending || !canSend}
       />
