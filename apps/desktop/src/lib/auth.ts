@@ -7,6 +7,7 @@ export interface User {
   patron_tier?: string;
   status?: string;
   avatar_url?: string | null;
+  is_site_owner?: boolean;
 }
 
 export function getCurrentUser(): User | null {

@@ -35,7 +35,7 @@ pub async fn get_all_users(
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     let users: Vec<User> = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         FROM users
         WHERE banned_at IS NULL
         ORDER BY username ASC
@@ -61,7 +61,7 @@ pub async fn get_current_user(
 ) -> Result<Json<PublicUser>, AppError> {
     let user: User = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         FROM users
         WHERE id = $1
         "#,
@@ -90,7 +90,7 @@ pub async fn update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(&payload.patron_tier)
@@ -146,7 +146,7 @@ pub async fn update_avatar(
         UPDATE users
         SET avatar_url = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(&avatar_url)
@@ -204,7 +204,7 @@ pub async fn update_badge_emblem(
         UPDATE users
         SET badge_emblem = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(&badge_emblem)
@@ -246,7 +246,7 @@ pub async fn admin_update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(&payload.patron_tier)
@@ -254,6 +254,57 @@ pub async fn admin_update_patron_tier(
     .fetch_one(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
+}
+
+#[derive(Deserialize)]
+pub struct AdminSetBetaBadgeRequest {
+    pub user_id: Uuid,
+    pub has_beta_badge: bool,
+}
+
+/// PATCH /api/v1/admin/beta-badge — site owners only.
+///
+/// Grants or revokes the owner-exclusive Beta badge on any account. This is
+/// independent of `patron_tier`/`badge_emblem` -- it's a separate badge
+/// shown alongside the tier badge (see `PatronBadge.svelte`'s sibling
+/// `BetaBadge.svelte`), not a replacement for it, and the target can be at
+/// any tier, including the caller's own account.
+pub async fn admin_set_beta_badge(
+    State(db): State<Database>,
+    CurrentSession { user_id, session_id }: CurrentSession,
+    Json(payload): Json<AdminSetBetaBadgeRequest>,
+) -> Result<Json<PublicUser>, AppError> {
+    let is_site_owner: bool = sqlx::query_scalar(
+        "SELECT COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if !is_site_owner {
+        return Err(AppError::Forbidden(
+            "Only site owners can grant or revoke the Beta badge".into(),
+        ));
+    }
+
+    let user: User = sqlx::query_as(
+        r#"
+        UPDATE users
+        SET has_beta_badge = $1
+        WHERE id = $2
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
+        "#,
+    )
+    .bind(payload.has_beta_badge)
+    .bind(payload.user_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("User not found".into()))?;
 
     let mut public_user = PublicUser::from(user);
     sign_opt(&mut public_user.avatar_url, user_id, session_id);
@@ -277,7 +328,7 @@ pub async fn update_status(
         UPDATE users
         SET status = $1, is_online = $2, last_activity = CURRENT_TIMESTAMP
         WHERE id = $3
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(&payload.status)
@@ -333,7 +384,7 @@ pub async fn update_public_key(
         UPDATE users
         SET public_key = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
         "#,
     )
     .bind(payload.public_key.trim())
@@ -374,6 +425,7 @@ pub struct UserProfile {
     pub nickname: Option<String>,
     pub badge_emblem: Option<String>,
     pub is_site_owner: bool,
+    pub has_beta_badge: bool,
 }
 
 #[derive(Deserialize)]
@@ -401,7 +453,7 @@ pub async fn get_user_profile(
     let user: Option<UserProfile> = sqlx::query_as(
         r#"
         SELECT u.id, u.username, u.patron_tier, u.status, u.created_at, u.avatar_url,
-               sm.nickname, u.badge_emblem, COALESCE(u.site_role = 'owner', false) AS is_site_owner
+               sm.nickname, u.badge_emblem, COALESCE(u.site_role = 'owner', false) AS is_site_owner, u.has_beta_badge
         FROM users u
         LEFT JOIN server_members sm ON sm.server_id = $2 AND sm.user_id = u.id
         WHERE u.id = $1
@@ -1511,5 +1563,95 @@ mod tests {
         assert_eq!(cleared.0.badge_emblem, None);
 
         cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn admin_set_beta_badge_rejects_a_non_owner() {
+        let db = test_db().await;
+        let caller = create_test_user(&db).await;
+        let target = create_test_user(&db).await;
+
+        let result = admin_set_beta_badge(
+            State(db.clone()),
+            CurrentSession { user_id: caller, session_id: Uuid::new_v4() },
+            Json(AdminSetBetaBadgeRequest { user_id: target, has_beta_badge: true }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))), "only the site owner may grant the Beta badge");
+
+        let stored: bool =
+            sqlx::query_scalar("SELECT has_beta_badge FROM users WHERE id = $1").bind(target).fetch_one(&db.pool).await.expect("fetching target's has_beta_badge failed");
+        assert!(!stored, "a forbidden call must not grant the badge");
+
+        cleanup_test_user(&db, caller).await;
+        cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn admin_set_beta_badge_lets_the_site_owner_grant_and_revoke_on_any_target() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+        let target = create_test_user(&db).await;
+
+        let granted = admin_set_beta_badge(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(AdminSetBetaBadgeRequest { user_id: target, has_beta_badge: true }),
+        )
+        .await
+        .expect("the site owner granting the badge should succeed");
+        assert!(granted.0.has_beta_badge);
+
+        let stored: bool =
+            sqlx::query_scalar("SELECT has_beta_badge FROM users WHERE id = $1").bind(target).fetch_one(&db.pool).await.expect("fetching target's has_beta_badge failed");
+        assert!(stored, "the database row should reflect the grant");
+
+        let revoked = admin_set_beta_badge(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(AdminSetBetaBadgeRequest { user_id: target, has_beta_badge: false }),
+        )
+        .await
+        .expect("the site owner revoking the badge should succeed");
+        assert!(!revoked.0.has_beta_badge);
+
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn admin_set_beta_badge_works_regardless_of_the_targets_patron_tier() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+        let target = create_test_user(&db).await; // defaults to "free"
+
+        let result = admin_set_beta_badge(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(AdminSetBetaBadgeRequest { user_id: target, has_beta_badge: true }),
+        )
+        .await
+        .expect("granting the badge to a free-tier user should succeed");
+        assert!(result.0.has_beta_badge, "the Beta badge is independent of patron_tier");
+        assert_eq!(result.0.patron_tier, "free", "granting the badge must not change the target's tier");
+
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, target).await;
+    }
+
+    #[tokio::test]
+    async fn admin_set_beta_badge_rejects_a_nonexistent_target() {
+        let db = test_db().await;
+        let owner = create_test_site_owner(&db).await;
+
+        let result = admin_set_beta_badge(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Json(AdminSetBetaBadgeRequest { user_id: Uuid::new_v4(), has_beta_badge: true }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::NotFound(_))));
+
+        cleanup_test_user(&db, owner).await;
     }
 }
