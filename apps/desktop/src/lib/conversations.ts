@@ -69,6 +69,11 @@ export interface MessageRecipientEntry {
   ciphertext: string;
   nonce: string;
   sender_public_key: string;
+  /** This device's own wrapped copy of the message's attachment symmetric
+   * key (see `lib/crypto.ts`'s `wrapFileKey`/`unwrapFileKey`), when the
+   * message has an encrypted attachment. `null`/absent otherwise. */
+  attachment_key_ciphertext?: string | null;
+  attachment_key_nonce?: string | null;
 }
 
 /** A direct message, as returned by the conversation message endpoints. */
@@ -87,6 +92,10 @@ export interface ConversationMessage {
   attachment_filename?: string | null;
   attachment_size?: number | null;
   attachment_mime_type?: string | null;
+  /** Base64 `crypto_secretbox` nonce for the encrypted attachment blob at
+   * `attachment_url`. `null`/absent when there's no attachment, or it's
+   * plaintext/legacy. */
+  attachment_nonce?: string | null;
   is_edited: boolean;
   /** Whether this message is encrypted, either the legacy single-device
    * way or the new fan-out way. False for all pre-E2EE history. */
@@ -149,12 +158,27 @@ export interface SendDirectMessageOptions {
    * When set (and non-empty), this takes over the whole send -- `content`
    * is ignored and the message is stored with no shared ciphertext at all,
    * only these per-device entries. */
-  encryptedFor?: Array<{ deviceId: string; ciphertext: string; nonce: string }>;
+  encryptedFor?: Array<{
+    deviceId: string;
+    ciphertext: string;
+    nonce: string;
+    /** This recipient device's wrapped copy of the attachment's symmetric
+     * key (see `lib/crypto.ts`'s `wrapFileKey`). Required for every entry
+     * when `attachmentNonce` is set; must be omitted otherwise. */
+    attachmentKeyCiphertext?: string;
+    attachmentKeyNonce?: string;
+  }>;
   /** Required alongside `encryptedFor`: the id of THIS device (the one
    * that did the encrypting), so the server can resolve and record its
    * public key on every `message_recipients` row -- recipients need the
    * sender's public key to decrypt, not their own. */
   senderDeviceId?: string;
+  /** Base64 `crypto_secretbox` nonce for the encrypted attachment blob
+   * passed as `attachment` below. Only meaningful (and only sent)
+   * alongside `encryptedFor` -- the legacy single-device path has no way
+   * to carry a per-device wrapped key, so it never supports encrypted
+   * attachments. */
+  attachmentNonce?: string;
 }
 
 /** Thrown by `sendDirectMessage` on a non-OK response. Carries the HTTP
@@ -193,10 +217,17 @@ export async function sendDirectMessage(
         attachment_filename: attachment?.filename || null,
         attachment_size: attachment?.size || null,
         attachment_mime_type: attachment?.mime_type || null,
+        attachment_nonce: usingFanout ? options.attachmentNonce ?? null : null,
         is_encrypted: usingFanout ? false : (options.isEncrypted ?? false),
         nonce: usingFanout ? null : (options.nonce ?? null),
         encrypted_for: usingFanout
-          ? options.encryptedFor!.map((r) => ({ device_id: r.deviceId, ciphertext: r.ciphertext, nonce: r.nonce }))
+          ? options.encryptedFor!.map((r) => ({
+              device_id: r.deviceId,
+              ciphertext: r.ciphertext,
+              nonce: r.nonce,
+              attachment_key_ciphertext: r.attachmentKeyCiphertext ?? null,
+              attachment_key_nonce: r.attachmentKeyNonce ?? null,
+            }))
           : null,
         sender_device_id: usingFanout ? options.senderDeviceId ?? null : null,
       }),

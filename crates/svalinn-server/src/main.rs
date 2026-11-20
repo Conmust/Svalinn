@@ -210,7 +210,20 @@ async fn main() {
         
         // --- Uploaded files: signed, access-checked links only ---
         .route("/api/v1/files/:name", get(files::serve_file))
-        
+
+        // --- Generic upload: a bare file -> stored path, for callers that
+        // attach it to a separate send afterward (currently: encrypted DM
+        // attachments -- the client encrypts the file client-side, then
+        // uploads the resulting ciphertext blob here before sending the
+        // message that references it). Unlike `create_message`'s own
+        // multipart handling, this never sees message content, so it has
+        // nothing DM-specific to know about either.
+        .route(
+            "/api/v1/upload",
+            post(routes::uploads::upload_file)
+                .layer(DefaultBodyLimit::max(upload_body_limit(MAX_ATTACHMENT_BYTES))),
+        )
+
         // --- Middleware & State ---
         .layer(cors_layer())
         .with_state(db); // Now receives the unwrapped `Database` struct
