@@ -8,6 +8,7 @@ mod models;
 mod presence;
 mod rate_limit;
 mod sessions;
+mod tiers;
 mod routes;
 
 use axum::{
@@ -139,7 +140,6 @@ async fn main() {
         .route("/api/v1/users/me/email", patch(routes::users::change_email))
         .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
-        .route("/api/v1/users/me/patron-tier", patch(routes::users::update_patron_tier))
         .route("/api/v1/users/me/avatar", patch(routes::users::update_avatar))
         .route("/api/v1/users/me/badge-emblem", patch(routes::users::update_badge_emblem))
         .route("/api/v1/users/:user_id", get(routes::users::get_user_profile))

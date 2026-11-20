@@ -14,11 +14,6 @@ use crate::files::{sign_opt, stored_path};
 use crate::models::user::{PublicUser, User};
 
 #[derive(Deserialize)]
-pub struct UpdatePatronRequest {
-    pub patron_tier: String,
-}
-
-#[derive(Deserialize)]
 pub struct AdminUpdatePatronRequest {
     pub user_id: Uuid,
     pub patron_tier: String,
@@ -66,34 +61,6 @@ pub async fn get_current_user(
         WHERE id = $1
         "#,
     )
-    .bind(user_id)
-    .fetch_one(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let mut public_user = PublicUser::from(user);
-    sign_opt(&mut public_user.avatar_url, user_id, session_id);
-    Ok(Json(public_user))
-}
-
-pub async fn update_patron_tier(
-    State(db): State<Database>,
-    CurrentSession { user_id, session_id }: CurrentSession,
-    Json(payload): Json<UpdatePatronRequest>,
-) -> Result<Json<PublicUser>, AppError> {
-    if !["free", "patron", "guild", "enterprise"].contains(&payload.patron_tier.as_str()) {
-        return Err(AppError::BadRequest("Invalid patron tier".into()));
-    }
-
-    let user: User = sqlx::query_as(
-        r#"
-        UPDATE users
-        SET patron_tier = $1
-        WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url, badge_emblem, site_role, has_beta_badge
-        "#,
-    )
-    .bind(&payload.patron_tier)
     .bind(user_id)
     .fetch_one(&db.pool)
     .await
@@ -902,82 +869,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn self_service_update_patron_tier_changes_own_tier() {
-        let db = test_db().await;
-        let user = create_test_user(&db).await;
-
-        let result = update_patron_tier(
-            State(db.clone()),
-            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
-            Json(UpdatePatronRequest { patron_tier: "guild".into() }),
-        )
-        .await
-        .expect("a user should be able to set their own patron tier");
-
-        assert_eq!(result.0.patron_tier, "guild");
-
-        let patron_tier: String =
-            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching the user's patron_tier failed");
-        assert_eq!(patron_tier, "guild", "the database row should reflect the self-service update");
-
-        cleanup_test_user(&db, user).await;
-    }
-
-    #[tokio::test]
-    async fn self_service_update_patron_tier_rejects_unknown_tier() {
-        let db = test_db().await;
-        let user = create_test_user(&db).await;
-
-        let result = update_patron_tier(
-            State(db.clone()),
-            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
-            Json(UpdatePatronRequest { patron_tier: "super-ultra-vip".into() }),
-        )
-        .await;
-
-        match result {
-            Err(AppError::BadRequest(_)) => {}
-            other => panic!("expected AppError::BadRequest for an unknown tier, got {other:?}"),
-        }
-
-        let patron_tier: String =
-            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching the user's patron_tier failed");
-        assert_eq!(patron_tier, "free", "a rejected tier name must not change the stored value");
-
-        cleanup_test_user(&db, user).await;
-    }
-
-    #[tokio::test]
-    async fn self_service_update_patron_tier_cannot_target_another_user() {
-        // There's no `user_id` field on `UpdatePatronRequest` at all -- unlike
-        // `admin_update_patron_tier`, the self-service endpoint always acts on
-        // the caller's own `CurrentUser` id, so there's no request field that
-        // could let one user change another's tier. This test pins that
-        // shape down: if a `user_id` field is ever added to
-        // `UpdatePatronRequest`, this won't catch a regression, but changing
-        // who it updates without changing the type would fail to compile
-        // against the call in `update_patron_tier`'s body.
-        let db = test_db().await;
-        let caller = create_test_user(&db).await;
-        let other = create_test_user(&db).await;
-
-        let _ = update_patron_tier(
-            State(db.clone()),
-            CurrentSession { user_id: caller, session_id: Uuid::new_v4() },
-            Json(UpdatePatronRequest { patron_tier: "patron".into() }),
-        )
-        .await
-        .expect("updating the caller's own tier should succeed");
-
-        let other_tier: String =
-            sqlx::query_scalar("SELECT patron_tier FROM users WHERE id = $1").bind(other).fetch_one(&db.pool).await.expect("fetching the other user's patron_tier failed");
-        assert_eq!(other_tier, "free", "updating the caller's tier must not affect a different user's row");
-
-        cleanup_test_user(&db, caller).await;
-        cleanup_test_user(&db, other).await;
-    }
-
-    #[tokio::test]
     async fn get_user_profile_returns_expected_fields() {
         let db = test_db().await;
         let viewer = create_test_user(&db).await;
@@ -1422,8 +1313,9 @@ mod tests {
     }
 
     /// Sets a test user's `patron_tier` directly via SQL, bypassing
-    /// `update_patron_tier`'s own validation -- the badge-emblem tests only
-    /// care about having a user at a known tier, not about that endpoint.
+    /// `admin_update_patron_tier`'s own validation -- most of these tests
+    /// only care about having a user at a known tier, not about that
+    /// endpoint itself.
     async fn set_test_patron_tier(db: &Database, user_id: Uuid, tier: &str) {
         sqlx::query("UPDATE users SET patron_tier = $1 WHERE id = $2")
             .bind(tier)
