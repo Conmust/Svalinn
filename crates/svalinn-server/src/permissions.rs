@@ -139,7 +139,7 @@ pub fn bits_from_names(names: &[String]) -> Result<Bits, AppError> {
 /// site owner, and shouldn't see into one they haven't (see the e2e test
 /// "a site owner outranks server owners but can't see servers they
 /// haven't joined").
-async fn is_unconditional_owner(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<bool, AppError> {
+pub(crate) async fn is_unconditional_owner(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<bool, AppError> {
     let row: Option<(Uuid, bool)> = sqlx::query_as(
         r#"
         SELECT s.owner_id, COALESCE(u.site_role = 'owner', false)
@@ -234,20 +234,30 @@ async fn base_permissions(db: &Database, server_id: Uuid, user_id: Uuid) -> Resu
     Ok(Some(Permissions(bits.into_iter().fold(0, |acc, b| acc | b))))
 }
 
-/// A member's effective permissions in `server_id` as a whole (no
-/// channel overwrites apply at this level -- use `resolve_channel` for a
-/// specific channel).
-pub async fn resolve_server(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<Permissions, AppError> {
+/// Shared first stage of `resolve_server`/`resolve_channel`: the
+/// unconditional owner bypass, then base (role-derived) permissions with
+/// `ADMINISTRATOR` already resolved to full access. The second return
+/// value is `true` exactly when the bypass fired (owner, site owner, or
+/// `ADMINISTRATOR` via a role) -- `resolve_channel` uses it to skip
+/// overwrites entirely for those cases, same as Discord.
+async fn resolve_server_base(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<(Permissions, bool), AppError> {
     if is_unconditional_owner(db, server_id, user_id).await? {
-        return Ok(Permissions::ALL);
+        return Ok((Permissions::ALL, true));
     }
     let base = base_permissions(db, server_id, user_id)
         .await?
         .ok_or_else(|| AppError::Forbidden("You are not a member of this server".into()))?;
     if base.has(Permission::ADMINISTRATOR) {
-        return Ok(Permissions::ALL);
+        return Ok((Permissions::ALL, true));
     }
-    Ok(base)
+    Ok((base, false))
+}
+
+/// A member's effective permissions in `server_id` as a whole (no
+/// channel overwrites apply at this level -- use `resolve_channel` for a
+/// specific channel).
+pub async fn resolve_server(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<Permissions, AppError> {
+    Ok(resolve_server_base(db, server_id, user_id).await?.0)
 }
 
 /// A member's effective permissions in one specific channel: their base
@@ -258,13 +268,8 @@ pub async fn resolve_server(db: &Database, server_id: Uuid, user_id: Uuid) -> Re
 pub async fn resolve_channel(db: &Database, channel_id: Uuid, user_id: Uuid) -> Result<Permissions, AppError> {
     let server_id = channel_server_id(db, channel_id).await?;
 
-    if is_unconditional_owner(db, server_id, user_id).await? {
-        return Ok(Permissions::ALL);
-    }
-    let base = base_permissions(db, server_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::Forbidden("You are not a member of this server".into()))?;
-    if base.has(Permission::ADMINISTRATOR) {
+    let (base, bypassed) = resolve_server_base(db, server_id, user_id).await?;
+    if bypassed {
         return Ok(Permissions::ALL);
     }
 
