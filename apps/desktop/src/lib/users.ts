@@ -7,10 +7,21 @@ export interface UserProfile {
   patron_tier?: string;
   status: string;
   created_at: string;
+  avatar_url?: string | null;
+  /** This user's nickname in the server the profile was opened from, if any
+   *  -- only populated when `fetchUserProfile` was called with a `serverId`. */
+  nickname?: string | null;
 }
 
-export async function fetchUserProfile(userId: string): Promise<UserProfile> {
-  const response = await apiFetch(`${apiBase()}/api/v1/users/${userId}`, {
+/**
+ * Fetches a user's profile. Pass `serverId` when opening the profile from
+ * within a server (e.g. the member roster) to also get this user's
+ * nickname there; omit it (e.g. opening from a DM) and `nickname` comes
+ * back null.
+ */
+export async function fetchUserProfile(userId: string, serverId?: string): Promise<UserProfile> {
+  const query = serverId ? `?server_id=${encodeURIComponent(serverId)}` : '';
+  const response = await apiFetch(`${apiBase()}/api/v1/users/${userId}${query}`, {
     headers: getAuthHeaders(),
   });
 
@@ -30,6 +41,20 @@ export interface PublicUser {
   patron_tier: string;
   bio?: string | null;
   public_key?: string | null;
+  avatar_url?: string | null;
+}
+
+/** The logged-in user's own profile, with a freshly-signed `avatar_url`. */
+export async function fetchMyProfile(): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to fetch your profile');
+  }
+
+  return response.json();
 }
 
 /** All non-banned users, for pickers like "start a new DM". */
@@ -68,4 +93,60 @@ export async function updateMyPatronTier(tier: PatronTier): Promise<PublicUser> 
   }
 
   return response.json();
+}
+
+/**
+ * Sets or clears the caller's own profile picture. Pass the `url` from
+ * `uploadFile()` (see `lib/messages.ts`) to set one, or `null` to clear it
+ * back to the initial-letter default. The returned `avatar_url` is already
+ * signed for display.
+ */
+export async function updateMyAvatar(avatarUrl: string | null): Promise<PublicUser> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/avatar`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ avatar_url: avatarUrl }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update avatar');
+  }
+
+  return response.json();
+}
+
+/** Sets or clears the caller's own nickname in one server. */
+export async function setMyNickname(serverId: string, nickname: string | null): Promise<string | null> {
+  const response = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/nickname`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nickname }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update nickname');
+  }
+
+  return (await response.json()).nickname ?? null;
+}
+
+/**
+ * Admin/owner override: sets or clears another member's nickname in a
+ * server. Requires admin or owner rank -- see `require_admin` server-side.
+ */
+export async function adminSetNickname(serverId: string, userId: string, nickname: string | null): Promise<string | null> {
+  const response = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/members/${userId}/nickname`, {
+    method: 'PATCH',
+    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nickname }),
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error || 'Failed to update nickname');
+  }
+
+  return (await response.json()).nickname ?? null;
 }

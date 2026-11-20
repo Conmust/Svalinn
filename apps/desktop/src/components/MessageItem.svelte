@@ -2,6 +2,7 @@
   import { fileUrl } from '../lib/api';
   import { createEventDispatcher, tick } from 'svelte';
   import ReactionPicker from './ReactionPicker.svelte';
+  import Avatar from './Avatar.svelte';
   import type { Message } from '../lib/messages';
 
   export let message: Message;
@@ -66,6 +67,8 @@
 
   const toolButton =
     'px-2 py-1 text-xs text-[#00aa00] hover:text-black hover:bg-[#00ff00] transition-colors terminal-glow';
+
+  $: displayName = message.nickname || message.username;
 </script>
 
 {#if message.is_hidden}
@@ -73,7 +76,7 @@
   <div class="flex gap-3 px-4 py-1">
     <div class="w-10 flex-shrink-0"></div>
     <div class="text-xs text-[#00aa00]/70 italic">
-      Message from {message.username} hidden.
+      Message from {displayName} hidden.
       <button
         type="button"
         class="ml-1 not-italic underline hover:text-[#00ff00]"
@@ -101,10 +104,16 @@
   {#if showHeader}
     <button
       type="button"
-      class="w-10 h-10 rounded-full border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm bg-black text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all flex-shrink-0"
+      class="flex-shrink-0 hover:opacity-80 transition-opacity"
       on:click={() => dispatch('userClicked', message.user_id)}
+      aria-label="View {displayName}'s profile"
     >
-      {message.username[0].toUpperCase()}
+      <Avatar
+        url={message.avatar_url}
+        label={message.username}
+        rounded
+        className="w-10 h-10 border-2 border-[#00ff00] font-bold text-sm bg-black text-[#00ff00]"
+      />
     </button>
   {:else}
     <div class="w-10 flex-shrink-0"></div>
@@ -118,7 +127,7 @@
           class="font-bold text-[#00ff00] hover:underline terminal-glow"
           on:click={() => dispatch('userClicked', message.user_id)}
         >
-          {message.username}
+          {displayName}
         </button>
         <span class="text-xs text-[#00aa00]">{formatTime(message.created_at)}</span>
         {#if message.is_edited}

@@ -28,6 +28,7 @@ export interface Conversation {
    * if they've set one up. Missing/null means they haven't -- sending must
    * be blocked client-side rather than falling back to plaintext. */
   participant_public_key?: string | null;
+  participant_avatar_url?: string | null;
   has_unread: boolean;
 }
 

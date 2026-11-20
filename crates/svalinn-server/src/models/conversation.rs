@@ -25,5 +25,6 @@ pub struct ConversationWithParticipant {
     /// messages to them; a missing key means sending must be blocked
     /// client-side rather than falling back to plaintext.
     pub participant_public_key: Option<String>,
+    pub participant_avatar_url: Option<String>,
     pub has_unread: bool,
 }

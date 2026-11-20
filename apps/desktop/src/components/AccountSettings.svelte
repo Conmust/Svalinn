@@ -3,7 +3,10 @@
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
-  import { updateMyPatronTier, PATRON_TIERS, type PatronTier } from '../lib/users';
+  import { updateMyPatronTier, updateMyAvatar, PATRON_TIERS, type PatronTier } from '../lib/users';
+  import { uploadFile } from '../lib/messages';
+  import { selfAvatarUrl } from '../lib/selfProfile';
+  import Avatar from './Avatar.svelte';
   import PatronBadge from './PatronBadge.svelte';
   import { getMyDeviceId } from '../lib/crypto';
   import { deviceEncryptionReady, replaceActiveKeypair, restoreFromBackup, IncorrectPassphraseError } from '../lib/recovery';
@@ -14,6 +17,44 @@
   let username = '';
   let email = '';
   let isSiteOwner = false;
+
+  // Profile picture
+  let avatarUrl: string | null = null;
+  let avatarBusy = false;
+  let avatarError = '';
+  let avatarFileInput: HTMLInputElement;
+
+  async function handleAvatarFile(e: Event) {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    avatarError = '';
+    avatarBusy = true;
+    try {
+      const uploaded = await uploadFile(file);
+      const updated = await updateMyAvatar(uploaded.url);
+      avatarUrl = updated.avatar_url ?? null;
+      selfAvatarUrl.set(avatarUrl);
+    } catch (err: any) {
+      avatarError = err.message || 'Failed to update avatar';
+    } finally {
+      avatarBusy = false;
+      if (avatarFileInput) avatarFileInput.value = '';
+    }
+  }
+
+  async function clearAvatar() {
+    avatarError = '';
+    avatarBusy = true;
+    try {
+      const updated = await updateMyAvatar(null);
+      avatarUrl = updated.avatar_url ?? null;
+      selfAvatarUrl.set(avatarUrl);
+    } catch (err: any) {
+      avatarError = err.message || 'Failed to remove avatar';
+    } finally {
+      avatarBusy = false;
+    }
+  }
 
   // Patron tier (self-service -- see lib/users.ts's updateMyPatronTier doc
   // comment: there's no billing integration, so this is a free pick, not
@@ -272,6 +313,7 @@
     if (meRes.ok) {
       const me = await meRes.json();
       if (PATRON_TIERS.includes(me.patron_tier)) patronTier = me.patron_tier;
+      avatarUrl = me.avatar_url ?? null;
     }
     await loadDevices();
     await loadKeyBackup();
@@ -353,12 +395,46 @@
     </div>
 
     <div class="p-6 space-y-8">
-      <section>
-        <div class="text-lg font-bold text-[#00ff00]">{username}</div>
-        <div class="text-xs text-[#00aa00]">{email}</div>
-        {#if isSiteOwner}
-          <div class="inline-block mt-2 px-2 py-0.5 text-[10px] uppercase tracking-widest border border-[#ffaa00] text-[#ffaa00]">Site owner</div>
-        {/if}
+      <section class="flex items-center gap-4">
+        <Avatar
+          url={avatarUrl}
+          label={username}
+          className="w-16 h-16 border-2 border-[#00ff00] font-bold text-2xl terminal-glow bg-[#0a0e0a]"
+        />
+        <div class="flex-1 min-w-0">
+          <div class="text-lg font-bold text-[#00ff00]">{username}</div>
+          <div class="text-xs text-[#00aa00]">{email}</div>
+          {#if isSiteOwner}
+            <div class="inline-block mt-2 px-2 py-0.5 text-[10px] uppercase tracking-widest border border-[#ffaa00] text-[#ffaa00]">Site owner</div>
+          {/if}
+        </div>
+      </section>
+
+      <section class="space-y-2">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Profile picture</h4>
+        <input
+          bind:this={avatarFileInput}
+          type="file"
+          accept="image/*"
+          class="hidden"
+          on:change={handleAvatarFile}
+        />
+        <div class="flex gap-2">
+          <button
+            type="button"
+            class="text-xs text-[#00ff00] underline disabled:opacity-50"
+            disabled={avatarBusy}
+            on:click={() => avatarFileInput?.click()}
+          >
+            {avatarBusy ? 'Uploading...' : avatarUrl ? 'Change picture' : 'Upload a picture'}
+          </button>
+          {#if avatarUrl}
+            <button type="button" class="text-xs text-red-500 underline disabled:opacity-50" disabled={avatarBusy} on:click={clearAvatar}>
+              Remove
+            </button>
+          {/if}
+        </div>
+        {#if avatarError}<div class="text-xs text-red-500">{'>'} {avatarError}</div>{/if}
       </section>
 
       <section class="space-y-3">

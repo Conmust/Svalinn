@@ -9,7 +9,8 @@ use sqlx::FromRow;
 
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::{CurrentSession, CurrentUser};
+use crate::files::{sign_opt, stored_path};
 use crate::models::user::{PublicUser, User};
 
 #[derive(Deserialize)]
@@ -30,11 +31,11 @@ pub struct UpdateStatusRequest {
 
 pub async fn get_all_users(
     State(db): State<Database>,
-    CurrentUser(_user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
 ) -> Result<Json<Vec<PublicUser>>, AppError> {
     let users: Vec<User> = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         FROM users
         WHERE banned_at IS NULL
         ORDER BY username ASC
@@ -44,17 +45,23 @@ pub async fn get_all_users(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let public_users: Vec<PublicUser> = users.into_iter().map(PublicUser::from).collect();
+    // Avatars are public to any logged-in viewer (see files.rs's access
+    // check), but the link itself is still viewer-signed like any other
+    // served file, so it has to be signed per request rather than once.
+    let mut public_users: Vec<PublicUser> = users.into_iter().map(PublicUser::from).collect();
+    for u in &mut public_users {
+        sign_opt(&mut u.avatar_url, user_id, session_id);
+    }
     Ok(Json(public_users))
 }
 
 pub async fn get_current_user(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
 ) -> Result<Json<PublicUser>, AppError> {
     let user: User = sqlx::query_as(
         r#"
-        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        SELECT id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         FROM users
         WHERE id = $1
         "#,
@@ -64,12 +71,14 @@ pub async fn get_current_user(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(PublicUser::from(user)))
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
 }
 
 pub async fn update_patron_tier(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Json(payload): Json<UpdatePatronRequest>,
 ) -> Result<Json<PublicUser>, AppError> {
     if !["free", "patron", "guild", "enterprise"].contains(&payload.patron_tier.as_str()) {
@@ -81,7 +90,7 @@ pub async fn update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         "#,
     )
     .bind(&payload.patron_tier)
@@ -90,13 +99,71 @@ pub async fn update_patron_tier(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(PublicUser::from(user)))
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAvatarRequest {
+    /// The `url` from `POST /api/v1/upload`, a signed file link, or an
+    /// external image URL -- same flexibility `servers.icon_url` already
+    /// has. `None`/omitted (or an empty string) clears the avatar back to
+    /// the initial-letter default.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+/// PATCH /api/v1/users/me/avatar
+pub async fn update_avatar(
+    State(db): State<Database>,
+    CurrentSession { user_id, session_id }: CurrentSession,
+    Json(payload): Json<UpdateAvatarRequest>,
+) -> Result<Json<PublicUser>, AppError> {
+    let avatar_url = payload.avatar_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(stored_path);
+
+    // Reject a stored path that's already in use as a channel/DM attachment,
+    // a custom emoji, or a server icon. Those are only visible to people who
+    // share a server/conversation with the uploader; an avatar is visible to
+    // every logged-in user (see `files::serve_file`'s avatar branch), so
+    // accepting a path like that here -- which a legitimate recipient of
+    // such a file could do just by knowing its name -- would make a private
+    // file public for everyone, permanently, bypassing that access control.
+    // A path not of ours (an external URL) or a freshly-uploaded one that
+    // isn't referenced anywhere yet is unaffected.
+    if let Some(path) = &avatar_url {
+        if crate::files::is_stored_path(path)
+            && crate::files::is_file_used_elsewhere(&db, path).await.map_err(|e| AppError::Database(e.to_string()))?
+        {
+            return Err(AppError::BadRequest(
+                "That file is already in use elsewhere and can't be set as an avatar".into(),
+            ));
+        }
+    }
+
+    let user: User = sqlx::query_as(
+        r#"
+        UPDATE users
+        SET avatar_url = $1
+        WHERE id = $2
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
+        "#,
+    )
+    .bind(&avatar_url)
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
 }
 
 /// PATCH /api/v1/admin/patron-tier — site owners only.
 pub async fn admin_update_patron_tier(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Json(payload): Json<AdminUpdatePatronRequest>,
 ) -> Result<Json<PublicUser>, AppError> {
     let is_site_owner: bool = sqlx::query_scalar(
@@ -121,7 +188,7 @@ pub async fn admin_update_patron_tier(
         UPDATE users
         SET patron_tier = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         "#,
     )
     .bind(&payload.patron_tier)
@@ -130,7 +197,9 @@ pub async fn admin_update_patron_tier(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(PublicUser::from(user)))
+    let mut public_user = PublicUser::from(user);
+    sign_opt(&mut public_user.avatar_url, user_id, session_id);
+    Ok(Json(public_user))
 }
 
 pub async fn update_status(
@@ -150,7 +219,7 @@ pub async fn update_status(
         UPDATE users
         SET status = $1, is_online = $2, last_activity = CURRENT_TIMESTAMP
         WHERE id = $3
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         "#,
     )
     .bind(&payload.status)
@@ -206,7 +275,7 @@ pub async fn update_public_key(
         UPDATE users
         SET public_key = $1
         WHERE id = $2
-        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key
+        RETURNING id, username, email, password_hash, is_online, status, created_at, patron_tier, bio, public_key, avatar_url
         "#,
     )
     .bind(payload.public_key.trim())
@@ -240,29 +309,60 @@ pub struct UserProfile {
     pub patron_tier: Option<String>,
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub avatar_url: Option<String>,
+    /// The viewer's nickname for this user in `server_id`, if that query
+    /// param was given and the viewer is actually a member there -- NULL
+    /// otherwise, including when no nickname is set.
+    pub nickname: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UserProfileQuery {
+    /// Optional: when the profile is opened from within a server (e.g. the
+    /// member roster), pass that server's id so the response can include
+    /// this user's nickname there.
+    pub server_id: Option<Uuid>,
 }
 
 pub async fn get_user_profile(
     State(db): State<Database>,
-    CurrentUser(_caller_id): CurrentUser,
+    CurrentSession { user_id: caller_id, session_id }: CurrentSession,
     Path(user_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<UserProfileQuery>,
 ) -> Result<Json<UserProfile>, AppError> {
+    // Only honor server_id if the caller is actually a member there --
+    // otherwise this would let anyone probe which servers a user belongs to
+    // one guess at a time by checking whether a nickname comes back.
+    let server_id = match query.server_id {
+        Some(id) if crate::access::require_member(&db, id, caller_id).await.is_ok() => Some(id),
+        _ => None,
+    };
+
     let user: Option<UserProfile> = sqlx::query_as(
-        "SELECT id, username, patron_tier, status, created_at FROM users WHERE id = $1",
+        r#"
+        SELECT u.id, u.username, u.patron_tier, u.status, u.created_at, u.avatar_url,
+               sm.nickname
+        FROM users u
+        LEFT JOIN server_members sm ON sm.server_id = $2 AND sm.user_id = u.id
+        WHERE u.id = $1
+        "#,
     )
     .bind(user_id)
+    .bind(server_id)
     .fetch_optional(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     match user {
-        Some(u) => Ok(Json(u)),
+        Some(mut u) => {
+            sign_opt(&mut u.avatar_url, caller_id, session_id);
+            Ok(Json(u))
+        }
         None => Err(AppError::NotFound("User not found".into())),
     }
 }
 // ---------- Account settings ----------
 
-use crate::extractors::auth::CurrentSession;
 use crate::rate_limit::REAUTH_FAILURES_PER_USER;
 
 #[derive(Serialize)]
@@ -647,7 +747,7 @@ mod tests {
 
         let result = admin_update_patron_tier(
             State(db.clone()),
-            CurrentUser(caller),
+            CurrentSession { user_id: caller, session_id: Uuid::new_v4() },
             Json(AdminUpdatePatronRequest { user_id: target, patron_tier: "enterprise".into() }),
         )
         .await;
@@ -673,7 +773,7 @@ mod tests {
 
         let result = admin_update_patron_tier(
             State(db.clone()),
-            CurrentUser(owner),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
             Json(AdminUpdatePatronRequest { user_id: target, patron_tier: "patron".into() }),
         )
         .await
@@ -696,7 +796,7 @@ mod tests {
 
         let result = update_patron_tier(
             State(db.clone()),
-            CurrentUser(user),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
             Json(UpdatePatronRequest { patron_tier: "guild".into() }),
         )
         .await
@@ -718,7 +818,7 @@ mod tests {
 
         let result = update_patron_tier(
             State(db.clone()),
-            CurrentUser(user),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
             Json(UpdatePatronRequest { patron_tier: "super-ultra-vip".into() }),
         )
         .await;
@@ -751,7 +851,7 @@ mod tests {
 
         let _ = update_patron_tier(
             State(db.clone()),
-            CurrentUser(caller),
+            CurrentSession { user_id: caller, session_id: Uuid::new_v4() },
             Json(UpdatePatronRequest { patron_tier: "patron".into() }),
         )
         .await
@@ -771,7 +871,12 @@ mod tests {
         let viewer = create_test_user(&db).await;
         let target = create_test_user(&db).await;
 
-        let profile = get_user_profile(State(db.clone()), CurrentUser(viewer), Path(target))
+        let profile = get_user_profile(
+            State(db.clone()),
+            CurrentSession { user_id: viewer, session_id: Uuid::new_v4() },
+            Path(target),
+            axum::extract::Query(UserProfileQuery { server_id: None }),
+        )
             .await
             .expect("fetching an existing user's profile should succeed");
 
@@ -1070,6 +1175,136 @@ mod tests {
         )
         .await;
         assert!(ok.is_ok(), "a well-formed kdf_params shape should still be accepted: {ok:?}");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_avatar_sets_and_clears_and_response_is_signed() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let set = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: Some("/uploads/avatar123.png".into()) }),
+        )
+        .await
+        .expect("setting an avatar should succeed");
+        // The response is signed for the viewer (query params attached),
+        // not the bare stored path.
+        assert!(set.0.avatar_url.as_deref().unwrap_or("").starts_with("/api/v1/files/avatar123.png"));
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT avatar_url FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching stored avatar_url failed");
+        assert_eq!(stored, Some("/uploads/avatar123.png".to_string()), "the DB should hold the canonical unsigned path");
+
+        let cleared = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: None }),
+        )
+        .await
+        .expect("clearing an avatar should succeed");
+        assert_eq!(cleared.0.avatar_url, None);
+
+        let stored_after_clear: Option<String> =
+            sqlx::query_scalar("SELECT avatar_url FROM users WHERE id = $1").bind(user).fetch_one(&db.pool).await.expect("fetching stored avatar_url failed");
+        assert_eq!(stored_after_clear, None);
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_avatar_accepts_an_external_url_unsigned() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: Some("https://example.invalid/pic.png".into()) }),
+        )
+        .await
+        .expect("an external avatar URL should be accepted, same as servers' icon_url");
+        assert_eq!(result.0.avatar_url, Some("https://example.invalid/pic.png".to_string()), "an external URL is returned as-is, not signed");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_avatar_rejects_a_path_already_used_as_a_private_dm_attachment() {
+        // A user who legitimately receives a private DM attachment knows
+        // its exact `/uploads/<name>` path. Setting that same path as their
+        // own avatar must be rejected -- otherwise it would become globally
+        // visible via `files::serve_file`'s avatar branch, bypassing the DM
+        // participant check that's supposed to gate it.
+        let db = test_db().await;
+        let sender = create_test_user(&db).await;
+        let recipient = create_test_user(&db).await;
+
+        let conversation_id: Uuid = sqlx::query_scalar("INSERT INTO conversations DEFAULT VALUES RETURNING id")
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test conversation");
+        sqlx::query("INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(conversation_id)
+            .bind(sender)
+            .bind(recipient)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test participants");
+        let private_path = format!("/uploads/private_{}.png", Uuid::new_v4());
+        sqlx::query("INSERT INTO messages (conversation_id, user_id, content, attachment_url) VALUES ($1, $2, $3, $4)")
+            .bind(conversation_id)
+            .bind(sender)
+            .bind("")
+            .bind(&private_path)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test DM attachment message");
+
+        let result = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: recipient, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: Some(private_path.clone()) }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a path already used as a DM attachment, got {other:?}"),
+        }
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT avatar_url FROM users WHERE id = $1").bind(recipient).fetch_one(&db.pool).await.expect("fetching stored avatar_url failed");
+        assert_eq!(stored, None, "a rejected avatar path must not be stored");
+
+        cleanup_test_user(&db, sender).await;
+        cleanup_test_user(&db, recipient).await;
+    }
+
+    #[tokio::test]
+    async fn get_all_users_and_get_current_user_include_signed_avatar() {
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+        let _ = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: Some("/uploads/pic.png".into()) }),
+        )
+        .await
+        .expect("setting an avatar should succeed");
+
+        let me = get_current_user(State(db.clone()), CurrentSession { user_id: user, session_id: Uuid::new_v4() })
+            .await
+            .expect("fetching self should succeed");
+        assert!(me.0.avatar_url.as_deref().unwrap_or("").starts_with("/api/v1/files/pic.png"));
+
+        let all = get_all_users(State(db.clone()), CurrentSession { user_id: user, session_id: Uuid::new_v4() })
+            .await
+            .expect("listing users should succeed");
+        let me_in_list = all.0.iter().find(|u| u.id == user).expect("self should be in the all-users list");
+        assert!(me_in_list.avatar_url.as_deref().unwrap_or("").starts_with("/api/v1/files/pic.png"));
 
         cleanup_test_user(&db, user).await;
     }

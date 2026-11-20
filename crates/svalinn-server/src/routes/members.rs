@@ -6,31 +6,40 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access::{member_rank, require_member, role_rank, SITE_OWNER_RANK};
+use crate::access::{member_rank, require_admin, require_member, role_rank, SITE_OWNER_RANK};
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::{CurrentSession, CurrentUser};
+use crate::files::sign_opt;
 use crate::models::message::BroadcastMessage;
 use crate::presence::VISIBLE_STATUS_SQL;
 
 /// Moderators and above can kick and ban.
 const MODERATOR_RANK: u8 = 2;
 
+/// Nicknames are a display label, not sensitive data, but still capped well
+/// under the `users.username`/`VARCHAR(100)` nickname column width.
+const MAX_NICKNAME_CHARS: usize = 64;
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct ServerMember {
     pub id: Uuid,
     pub username: String,
+    /// This member's nickname in this one server, if they (or an admin) set
+    /// one -- NULL means "show the username instead".
+    pub nickname: Option<String>,
     pub is_online: bool,
     pub status: String,
     pub role: String,
     pub is_owner: bool,
     pub is_site_owner: bool,
     pub patron_tier: String,
+    pub avatar_url: Option<String>,
 }
 
 pub async fn get_server_members(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Vec<ServerMember>>, AppError> {
     require_member(&db, server_id, user_id).await?;
@@ -41,12 +50,14 @@ pub async fn get_server_members(
             SELECT
                 u.id,
                 u.username,
+                sm.nickname,
                 COALESCE(u.is_online, false) AS is_online,
                 {VISIBLE_STATUS_SQL} AS status,
                 COALESCE(sm.role, 'member') AS role,
                 s.owner_id = u.id AS is_owner,
                 COALESCE(u.site_role = 'owner', false) AS is_site_owner,
-                COALESCE(u.patron_tier, 'free') AS patron_tier
+                COALESCE(u.patron_tier, 'free') AS patron_tier,
+                u.avatar_url
             FROM server_members sm
             JOIN users u ON sm.user_id = u.id
             JOIN servers s ON s.id = sm.server_id
@@ -68,7 +79,78 @@ pub async fn get_server_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let mut members = members;
+    for m in &mut members {
+        sign_opt(&mut m.avatar_url, user_id, session_id);
+    }
     Ok(Json(members))
+}
+
+#[derive(Deserialize)]
+pub struct SetNicknameRequest {
+    /// `None` or an empty/whitespace-only string clears the nickname.
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+/// Trims and validates a nickname, turning an empty string into `None`
+/// (clearing it) the same way the rest of the app treats a blank optional
+/// field.
+fn normalize_nickname(nickname: Option<String>) -> Result<Option<String>, AppError> {
+    let trimmed = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match trimmed {
+        None => Ok(None),
+        Some(n) if n.chars().count() > MAX_NICKNAME_CHARS => {
+            Err(AppError::BadRequest(format!("Nickname must be {MAX_NICKNAME_CHARS} characters or fewer")))
+        }
+        Some(n) => Ok(Some(n.to_string())),
+    }
+}
+
+async fn set_nickname(db: &Database, server_id: Uuid, target: Uuid, nickname: Option<String>) -> Result<(), AppError> {
+    let result = sqlx::query("UPDATE server_members SET nickname = $1 WHERE server_id = $2 AND user_id = $3")
+        .bind(&nickname)
+        .bind(server_id)
+        .bind(target)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("That user isn't a member of this server".into()));
+    }
+
+    let payload = serde_json::json!({ "server_id": server_id, "user_id": target, "nickname": nickname });
+    let _ = db.message_tx.send(BroadcastMessage::to_server("member_updated", payload, server_id));
+    Ok(())
+}
+
+/// PATCH /api/v1/servers/:server_id/nickname — set or clear your own nickname.
+pub async fn set_my_nickname(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(server_id): Path<Uuid>,
+    Json(payload): Json<SetNicknameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_member(&db, server_id, user_id).await?;
+    let nickname = normalize_nickname(payload.nickname)?;
+    set_nickname(&db, server_id, user_id, nickname.clone()).await?;
+    Ok(Json(serde_json::json!({ "nickname": nickname })))
+}
+
+/// PATCH /api/v1/servers/:server_id/members/:user_id/nickname — admins and
+/// owners can set or clear anyone's nickname (e.g. to enforce a naming
+/// policy). Unlike roles/kicks/bans this isn't rank-gated beyond "is an
+/// admin": renaming someone doesn't give or take away any power over them.
+pub async fn admin_set_nickname(
+    State(db): State<Database>,
+    CurrentUser(actor): CurrentUser,
+    Path((server_id, target)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<SetNicknameRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_admin(&db, server_id, actor).await?;
+    let nickname = normalize_nickname(payload.nickname)?;
+    set_nickname(&db, server_id, target, nickname.clone()).await?;
+    Ok(Json(serde_json::json!({ "nickname": nickname })))
 }
 
 /// GET /api/v1/servers/:server_id/role — the current user's role and rank.
@@ -402,4 +484,242 @@ pub async fn transfer_ownership(
         ));
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    async fn create_test_server(db: &Database, owner: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        join_server(db, server_id, owner, "owner").await;
+        server_id
+    }
+
+    async fn join_server(db: &Database, server_id: Uuid, user_id: Uuid, role: &str) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, $3)")
+            .bind(server_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test membership");
+    }
+
+    async fn cleanup(db: &Database, server_id: Uuid, user_ids: &[Uuid]) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+        for user_id in user_ids {
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+        }
+    }
+
+    async fn nickname_of(db: &Database, server_id: Uuid, user_id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT nickname FROM server_members WHERE server_id = $1 AND user_id = $2")
+            .bind(server_id)
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetching nickname failed")
+    }
+
+    #[tokio::test]
+    async fn member_can_set_and_clear_their_own_nickname() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+
+        let result = set_my_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(SetNicknameRequest { nickname: Some("  Cap'n  ".into()) }),
+        )
+        .await
+        .expect("a member should be able to set their own nickname");
+        assert_eq!(result.0["nickname"], "Cap'n", "the nickname should be trimmed");
+        assert_eq!(nickname_of(&db, server_id, owner).await, Some("Cap'n".to_string()));
+
+        let cleared = set_my_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(SetNicknameRequest { nickname: Some("   ".into()) }),
+        )
+        .await
+        .expect("a blank nickname should clear it rather than error");
+        assert!(cleared.0["nickname"].is_null(), "a whitespace-only nickname should clear to null");
+        assert_eq!(nickname_of(&db, server_id, owner).await, None);
+
+        cleanup(&db, server_id, &[owner]).await;
+    }
+
+    #[tokio::test]
+    async fn self_service_nickname_rejects_a_non_member() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+
+        let result = set_my_nickname(
+            State(db.clone()),
+            CurrentUser(outsider),
+            Path(server_id),
+            Json(SetNicknameRequest { nickname: Some("Nope".into()) }),
+        )
+        .await;
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden for a non-member, got {other:?}"),
+        }
+
+        cleanup(&db, server_id, &[owner, outsider]).await;
+    }
+
+    #[tokio::test]
+    async fn self_service_nickname_rejects_names_over_the_length_limit() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+
+        let too_long = "x".repeat(MAX_NICKNAME_CHARS + 1);
+        let result = set_my_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(SetNicknameRequest { nickname: Some(too_long) }),
+        )
+        .await;
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an over-length nickname, got {other:?}"),
+        }
+        assert_eq!(nickname_of(&db, server_id, owner).await, None, "a rejected nickname must not be stored");
+
+        cleanup(&db, server_id, &[owner]).await;
+    }
+
+    #[tokio::test]
+    async fn admin_can_set_and_clear_another_members_nickname() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let member = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        join_server(&db, server_id, member, "member").await;
+
+        let _ = admin_set_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path((server_id, member)),
+            Json(SetNicknameRequest { nickname: Some("House Name".into()) }),
+        )
+        .await
+        .expect("an admin/owner should be able to set another member's nickname");
+        assert_eq!(nickname_of(&db, server_id, member).await, Some("House Name".to_string()));
+
+        let _ = admin_set_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path((server_id, member)),
+            Json(SetNicknameRequest { nickname: None }),
+        )
+        .await
+        .expect("an admin/owner should be able to clear another member's nickname");
+        assert_eq!(nickname_of(&db, server_id, member).await, None);
+
+        cleanup(&db, server_id, &[owner, member]).await;
+    }
+
+    #[tokio::test]
+    async fn plain_member_cannot_set_another_members_nickname() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let member_a = create_test_user(&db).await;
+        let member_b = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        join_server(&db, server_id, member_a, "member").await;
+        join_server(&db, server_id, member_b, "member").await;
+
+        let result = admin_set_nickname(
+            State(db.clone()),
+            CurrentUser(member_a),
+            Path((server_id, member_b)),
+            Json(SetNicknameRequest { nickname: Some("Nope".into()) }),
+        )
+        .await;
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected AppError::Forbidden for a non-admin caller, got {other:?}"),
+        }
+        assert_eq!(nickname_of(&db, server_id, member_b).await, None);
+
+        cleanup(&db, server_id, &[owner, member_a, member_b]).await;
+    }
+
+    #[tokio::test]
+    async fn admin_set_nickname_rejects_a_non_member_target() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+
+        let result = admin_set_nickname(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path((server_id, outsider)),
+            Json(SetNicknameRequest { nickname: Some("Ghost".into()) }),
+        )
+        .await;
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected AppError::NotFound for a target who isn't a member, got {other:?}"),
+        }
+
+        cleanup(&db, server_id, &[owner, outsider]).await;
+    }
+
+    #[tokio::test]
+    async fn get_server_members_includes_nickname_and_avatar_url() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let _ = set_nickname(&db, server_id, owner, Some("Boss".into())).await;
+
+        let members = get_server_members(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(server_id),
+        )
+        .await
+        .expect("fetching server members should succeed");
+
+        let me = members.0.iter().find(|m| m.id == owner).expect("owner should be in the member list");
+        assert_eq!(me.nickname, Some("Boss".to_string()));
+
+        cleanup(&db, server_id, &[owner]).await;
+    }
 }

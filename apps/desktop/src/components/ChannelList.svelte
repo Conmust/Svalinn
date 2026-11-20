@@ -3,7 +3,10 @@
   import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { logout } from '../lib/auth';
   import { wsClient } from '../lib/websocket';
+  import { selfAvatarUrl } from '../lib/selfProfile';
+  import { fetchMyProfile } from '../lib/users';
   import ServerSettings from './ServerSettings.svelte';
+  import Avatar from './Avatar.svelte';
 
   export let currentUser: any;
   export let activeServer: string | null = null;
@@ -120,6 +123,9 @@
     wsClient.on('channel_updated', onChannelUpdated);
     wsClient.on('channel_deleted', onChannelDeleted);
     wsClient.on('member_updated', onMemberUpdated);
+    // Seeds the self-avatar store with a freshly-signed URL -- a cached
+    // one from an earlier login would have an expired signature.
+    fetchMyProfile().then(p => selfAvatarUrl.set(p.avatar_url ?? null)).catch(() => {});
   });
 
   onDestroy(() => {
@@ -283,9 +289,11 @@
   <!-- User Footer -->
   <div class="p-3 border-t-2 border-[#00ff00] bg-black">
     <div class="flex items-center gap-2">
-      <div class="w-8 h-8 border-2 border-[#00ff00] flex items-center justify-center font-bold text-sm terminal-glow flex-shrink-0">
-        {currentUser.username[0].toUpperCase()}
-      </div>
+      <Avatar
+        url={$selfAvatarUrl}
+        label={currentUser.username}
+        className="w-8 h-8 border-2 border-[#00ff00] font-bold text-sm terminal-glow"
+      />
       <div class="flex-1 min-w-0">
         <div class="text-xs text-[#00ff00] truncate terminal-glow">{currentUser.username}</div>
         <div class="text-[10px] text-[#00aa00] terminal-glow">Online</div>

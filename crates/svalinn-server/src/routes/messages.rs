@@ -29,6 +29,10 @@ pub struct Message {
     pub channel_id: Uuid,
     pub user_id: Uuid,
     pub username: String,
+    /// The author's nickname in this message's server, if they have one set
+    /// -- resolved live (like `username`), so renaming updates history too.
+    pub nickname: Option<String>,
+    pub avatar_url: Option<String>,
     pub content: String,
     pub attachment_url: Option<String>,
     pub attachment_filename: Option<String>,
@@ -45,7 +49,7 @@ pub struct Message {
 
 /// Columns for `Message`. `$1` must be the requesting user's id.
 const MESSAGE_COLUMNS: &str = r#"
-    m.id, m.channel_id, m.user_id, u.username, m.content,
+    m.id, m.channel_id, m.user_id, u.username, sm.nickname, u.avatar_url, m.content,
     m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
     COALESCE(m.is_edited, false) AS is_edited,
     COALESCE(m.is_locked, false) AS is_locked,
@@ -70,7 +74,14 @@ const MESSAGE_COLUMNS: &str = r#"
 
 async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Result<Message, AppError> {
     sqlx::query_as(&format!(
-        "SELECT {MESSAGE_COLUMNS} FROM messages m JOIN users u ON m.user_id = u.id WHERE m.id = $2"
+        r#"
+        SELECT {MESSAGE_COLUMNS}
+        FROM messages m
+        JOIN users u ON m.user_id = u.id
+        JOIN channels c ON c.id = m.channel_id
+        LEFT JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = m.user_id
+        WHERE m.id = $2
+        "#
     ))
     .bind(viewer_id)
     .bind(message_id)
@@ -170,6 +181,8 @@ pub async fn get_channel_messages(
                 SELECT {MESSAGE_COLUMNS}
                 FROM messages m
                 JOIN users u ON m.user_id = u.id
+                JOIN channels c ON c.id = m.channel_id
+                LEFT JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = m.user_id
                 WHERE m.channel_id = $2 AND (m.created_at, m.id) < ($3, $4)
                 ORDER BY m.created_at DESC, m.id DESC
                 LIMIT $5
@@ -192,6 +205,8 @@ pub async fn get_channel_messages(
                 SELECT {MESSAGE_COLUMNS}
                 FROM messages m
                 JOIN users u ON m.user_id = u.id
+                JOIN channels c ON c.id = m.channel_id
+                LEFT JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = m.user_id
                 WHERE m.channel_id = $2
                 ORDER BY m.created_at DESC, m.id DESC
                 LIMIT $3
@@ -211,6 +226,7 @@ pub async fn get_channel_messages(
         let mut messages = messages;
         for m in &mut messages {
             sign_opt(&mut m.attachment_url, user_id, session_id);
+            sign_opt(&mut m.avatar_url, user_id, session_id);
         }
         return Ok(Json(messages));
     }
@@ -234,6 +250,7 @@ pub async fn get_channel_messages(
     let mut messages = messages;
     for m in &mut messages {
         sign_opt(&mut m.attachment_url, user_id, session_id);
+        sign_opt(&mut m.avatar_url, user_id, session_id);
     }
     Ok(Json(messages))
 }
@@ -333,6 +350,7 @@ pub async fn create_message(
     broadcast(&db, "new_message", payload, server_id);
 
     sign_opt(&mut message.attachment_url, user_id, session_id);
+    sign_opt(&mut message.avatar_url, user_id, session_id);
     Ok(Json(message))
 }
 

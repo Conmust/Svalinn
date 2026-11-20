@@ -2,6 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import type { UserProfile } from '../lib/users';
   import PatronBadge from './PatronBadge.svelte';
+  import Avatar from './Avatar.svelte';
 
   export let user: UserProfile | null = null;
 
@@ -65,9 +66,11 @@
       <div class="p-6 flex flex-col items-center text-center">
         <!-- Avatar -->
         <div class="relative mb-4">
-          <div class="w-20 h-20 border-2 border-[#00ff00] flex items-center justify-center font-bold text-3xl terminal-glow bg-[#0a0e0a]">
-            {user.username[0].toUpperCase()}
-          </div>
+          <Avatar
+            url={user.avatar_url}
+            label={user.username}
+            className="w-20 h-20 border-2 border-[#00ff00] font-bold text-3xl terminal-glow bg-[#0a0e0a]"
+          />
           <!-- Status Indicator -->
           <div
             class="absolute bottom-0 right-0 w-5 h-5 border-2 border-black rounded-full"
@@ -76,13 +79,16 @@
           ></div>
         </div>
 
-        <!-- Username & Patron Badge -->
+        <!-- Nickname (server-context) & Patron Badge -->
         <div class="flex items-center gap-2 mb-2">
-          <h2 class="text-xl font-bold text-[#00ff00] terminal-glow">{user.username}</h2>
+          <h2 class="text-xl font-bold text-[#00ff00] terminal-glow">{user.nickname || user.username}</h2>
           {#if user.patron_tier && user.patron_tier !== 'free'}
             <PatronBadge tier={user.patron_tier} size="medium" />
           {/if}
         </div>
+        {#if user.nickname}
+          <div class="text-xs text-[#00aa00] -mt-2 mb-2 terminal-glow">@{user.username}</div>
+        {/if}
 
         <!-- Status Text -->
         <div class="text-sm text-[#00aa00] mb-6 terminal-glow">

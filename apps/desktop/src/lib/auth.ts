@@ -6,6 +6,7 @@ export interface User {
   email: string;
   patron_tier?: string;
   status?: string;
+  avatar_url?: string | null;
 }
 
 export function getCurrentUser(): User | null {
