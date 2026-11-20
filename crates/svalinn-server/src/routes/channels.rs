@@ -12,6 +12,7 @@ use crate::models::message::BroadcastMessage;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
+use crate::permissions::{resolve_server, Permission};
 
 #[derive(Serialize, FromRow)]
 pub struct Channel {
@@ -88,12 +89,20 @@ fn clean_name(name: &str) -> Result<&str, AppError> {
 }
 
 /// Renaming and deleting channels needs admin rank or above.
+/// Admin rank or above always qualifies, same as before; a member who
+/// isn't admin-ranked but has been granted `MANAGE_CHANNELS` through a
+/// custom role now also qualifies -- purely additive, nothing that could
+/// rename or delete a channel before loses that ability here.
 async fn require_channel_admin(db: &Database, server_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
     match member_rank(db, server_id, user_id).await? {
-        Some(rank) if rank >= 3 => Ok(()),
-        Some(_) => Err(AppError::Forbidden("Only admins can rename or delete channels".into())),
-        None => Err(AppError::Forbidden("You are not a member of this server".into())),
+        Some(rank) if rank >= 3 => return Ok(()),
+        Some(_) => {}
+        None => return Err(AppError::Forbidden("You are not a member of this server".into())),
     }
+    if resolve_server(db, server_id, user_id).await?.has(Permission::MANAGE_CHANNELS) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden("Only admins, or members with the manage_channels permission, can rename or delete channels".into()))
 }
 
 pub async fn create_channel(

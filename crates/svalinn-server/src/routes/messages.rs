@@ -207,6 +207,7 @@ pub async fn get_channel_messages(
 ) -> Result<Json<Vec<Message>>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
+    crate::permissions::require_channel_permission(&db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
     let limit = query.limit.unwrap_or(PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
 
     // Page by (created_at, id) so messages with the same timestamp are
@@ -384,6 +385,7 @@ pub async fn create_message(
 ) -> Result<Json<Message>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
+    crate::permissions::require_channel_permission(&db, channel_id, user_id, crate::permissions::Permission::SEND_MESSAGES).await?;
 
     if payload.encrypted_for.is_empty() {
         return Err(AppError::BadRequest(
