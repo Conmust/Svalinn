@@ -30,15 +30,33 @@ pub struct MessageRecipientPayload {
     pub ciphertext: String,
     pub nonce: String,
     pub sender_public_key: String,
+    /// This device's own wrapped copy of the message's attachment
+    /// symmetric key (`crypto_box_easy`, unwrapped with `sender_public_key`
+    /// above and this device's own private key), when the message has an
+    /// encrypted attachment. `None` for a message with no attachment, and
+    /// for every row of a message that predates this feature.
+    pub attachment_key_ciphertext: Option<String>,
+    /// Nonce for `attachment_key_ciphertext`. Always present together with
+    /// it, never alone.
+    pub attachment_key_nonce: Option<String>,
 }
 
 /// One entry of a fan-out send request: the server-assigned encrypting
 /// device ciphertext for one specific recipient device.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct EncryptedRecipient {
     pub device_id: Uuid,
     pub ciphertext: String,
     pub nonce: String,
+    /// This recipient device's wrapped copy of the attachment's symmetric
+    /// key, when this send has an attachment. Required (and must be
+    /// non-empty) for every entry when `SendDirectMessageRequest::
+    /// attachment_url` is set; must be absent otherwise -- see
+    /// `send_fanout_message`'s validation.
+    #[serde(default)]
+    pub attachment_key_ciphertext: Option<String>,
+    #[serde(default)]
+    pub attachment_key_nonce: Option<String>,
 }
 
 /// One of a conversation's two participants' devices, as seen by a client

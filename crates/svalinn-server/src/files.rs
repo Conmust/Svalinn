@@ -10,8 +10,10 @@
 //! The link is tied to the viewer's login session. Each time it's fetched the
 //! server checks the signature and expiry, that the account isn't banned and
 //! the session is still active, and that the viewer is a member of the server
-//! the file belongs to. A ban, logout or leaving a server therefore stops
-//! access to saved links immediately.
+//! the file belongs to (channel attachments, emojis, server icons) or a
+//! participant of the DM conversation it belongs to (DM attachments). A ban,
+//! logout, leaving a server, or no longer being a DM participant therefore
+//! stops access to saved links immediately.
 
 use axum::{
     body::Body,
@@ -178,7 +180,11 @@ pub async fn serve_file(
         return denied(StatusCode::FORBIDDEN);
     }
 
-    // 3. Viewer is a member of the server the file belongs to
+    // 3. Viewer is a member of the server the file belongs to (channel
+    // attachments, custom emojis, server icons) OR a participant of the DM
+    // conversation it belongs to (DM attachments -- added alongside
+    // encrypted DM attachments; applies to legacy plaintext DM attachments
+    // too, which had no access check covering them at all before this).
     let allowed: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS(
@@ -191,6 +197,10 @@ pub async fn serve_file(
                 UNION
                 SELECT id FROM servers WHERE icon_url = $1
             )
+        ) OR EXISTS(
+            SELECT 1 FROM conversation_participants cp
+            JOIN messages m ON m.conversation_id = cp.conversation_id
+            WHERE cp.user_id = $2 AND m.attachment_url = $1
         )
         "#,
     )
@@ -234,6 +244,135 @@ pub async fn serve_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("user_{unique}"))
+        .bind(format!("{unique}@example.com"))
+        .bind("hash")
+        .bind("Test User")
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to create test user")
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    /// `check_access` (called by `serve_file` before its own membership
+    /// check even runs) requires a real, unexpired, unrevoked
+    /// `refresh_tokens` row for (user_id, session_id) -- a session id that
+    /// isn't backed by one is indistinguishable from a logged-out session
+    /// and gets denied before the access check this test exists to cover.
+    async fn create_test_session(db: &Database, user_id: Uuid) -> Uuid {
+        let session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(format!("test-hash-{}", Uuid::new_v4()))
+        .execute(&db.pool)
+        .await
+        .expect("failed to create test session");
+        session_id
+    }
+
+    fn query_for(name: &str, user_id: Uuid, session_id: Uuid) -> AxumQuery<FileQuery> {
+        let signed = sign_path(&format!("{STORED_PREFIX}{name}"), user_id, session_id);
+        let (path, qs) = signed.split_once('?').expect("sign_path must produce a query string");
+        assert_eq!(path, format!("{ROUTE_PREFIX}{name}"));
+        let uri: axum::http::Uri = format!("http://x/{path}?{qs}").parse().expect("valid uri");
+        AxumQuery::<FileQuery>::try_from_uri(&uri).expect("signed query string must parse")
+    }
+
+    /// A DM participant can fetch a DM attachment's signed link; a
+    /// non-participant with an otherwise validly-signed link (correct
+    /// secret, correct expiry -- just not a participant of the
+    /// conversation the file belongs to) cannot. Exercises the
+    /// `conversation_participants` branch added to `serve_file`'s access
+    /// check -- before it existed, EVERY DM attachment 404'd for everyone,
+    /// participant included, since the old check only recognized
+    /// server-channel attachments.
+    #[tokio::test]
+    async fn dm_participant_can_fetch_dm_attachment_but_outsider_cannot() {
+        init_secret();
+        let db = test_db().await;
+        let participant = create_test_user(&db).await;
+        let other_participant = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+
+        let conversation_id: Uuid = sqlx::query_scalar("INSERT INTO conversations DEFAULT VALUES RETURNING id")
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to create test conversation");
+        sqlx::query("INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(conversation_id)
+            .bind(participant)
+            .bind(other_participant)
+            .execute(&db.pool)
+            .await
+            .expect("failed to add test participants");
+
+        let stored_name = format!("test_{}.txt", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, is_encrypted) VALUES ($1, NULL, $2, 'hi', $3, false)",
+        )
+        .bind(conversation_id)
+        .bind(participant)
+        .bind(format!("{STORED_PREFIX}{stored_name}"))
+        .execute(&db.pool)
+        .await
+        .expect("failed to insert test message");
+
+        tokio::fs::create_dir_all(UPLOAD_DIR).await.expect("failed to create uploads dir");
+        let file_path = std::path::Path::new(UPLOAD_DIR).join(&stored_name);
+        tokio::fs::write(&file_path, b"test attachment bytes").await.expect("failed to write test file");
+
+        let participant_session = create_test_session(&db, participant).await;
+        let outsider_session = create_test_session(&db, outsider).await;
+        let dummy_request = || Request::builder().body(Body::empty()).expect("valid request");
+
+        let participant_response = serve_file(
+            AxumState(db.clone()),
+            AxumPath(stored_name.clone()),
+            query_for(&stored_name, participant, participant_session),
+            dummy_request(),
+        )
+        .await;
+        assert_eq!(participant_response.status(), StatusCode::OK, "a participant must be able to fetch a DM attachment");
+
+        let outsider_response = serve_file(
+            AxumState(db.clone()),
+            AxumPath(stored_name.clone()),
+            query_for(&stored_name, outsider, outsider_session),
+            dummy_request(),
+        )
+        .await;
+        assert_eq!(
+            outsider_response.status(),
+            StatusCode::NOT_FOUND,
+            "a non-participant must not be able to fetch a DM attachment, even with an otherwise validly-signed link"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1").bind(conversation_id).execute(&db.pool).await;
+        cleanup_test_user(&db, participant).await;
+        cleanup_test_user(&db, other_participant).await;
+        cleanup_test_user(&db, outsider).await;
+    }
 
     fn init_secret() {
         std::env::set_var("JWT_SECRET", "x".repeat(40));

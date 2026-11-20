@@ -330,3 +330,123 @@ export function decryptFromSender(
     return null;
   }
 }
+
+// --- File attachment encryption -------------------------------------------
+//
+// Re-encrypting a whole file once per recipient device (the way
+// `encryptForRecipient` handles short message text above) would mean
+// uploading/storing N copies of a potentially large file. Instead this uses
+// hybrid encryption, same idea TLS/PGP/age all use: generate ONE random
+// symmetric key, encrypt the file bytes with it ONCE (`crypto_secretbox_easy`
+// -- XSalsa20-Poly1305 under a shared secret key, as opposed to `crypto_box`'s
+// X25519-derived shared secret), then "wrap" (encrypt) that small 32-byte key
+// once per recipient device with the EXISTING per-device `crypto_box_easy`
+// mechanism above. Only the small wrapped key is duplicated per device, not
+// the file itself -- the encrypted file blob is uploaded/stored exactly once,
+// same as an unencrypted attachment is today.
+
+/** A file's bytes, encrypted once under a fresh random symmetric key. Upload
+ * `ciphertext` as the attachment blob (it replaces the plaintext file bytes
+ * byte-for-byte in the upload); `nonce` goes on the message itself
+ * (`attachment_nonce`, shared across every recipient since the blob is
+ * shared); `fileKey` never leaves this function's caller -- it's only ever
+ * used locally to call `wrapFileKey` once per recipient device, and must
+ * never be sent to the server in this raw form. */
+export interface EncryptedFile {
+  ciphertext: Uint8Array;
+  nonce: string;
+  fileKey: Uint8Array;
+}
+
+/** Encrypts `fileBytes` with a freshly generated random key -- never reused
+ * across files, including a resend of the exact same file, same spirit as
+ * `encryptForRecipient`'s fresh nonce per call. */
+export function encryptFileForFanout(fileBytes: Uint8Array): EncryptedFile {
+  const fileKey = sodium.randombytes_buf(sodium.crypto_secretbox_KEYBYTES);
+  const nonceBytes = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
+  const ciphertext = sodium.crypto_secretbox_easy(fileBytes, nonceBytes, fileKey);
+  return {
+    ciphertext,
+    nonce: sodium.to_base64(nonceBytes, sodium.base64_variants.ORIGINAL),
+    fileKey,
+  };
+}
+
+/** Wraps (encrypts) a file's symmetric key for one recipient device, using
+ * the exact same per-device mechanism as `encryptForRecipient` -- this is
+ * just that function applied to 32 key bytes instead of a text string. One
+ * call per recipient device (see `get_participant_devices`/
+ * `ParticipantDevice`), same fan-out list the message ciphertext itself goes
+ * to. */
+export function wrapFileKey(
+  fileKey: Uint8Array,
+  recipientPublicKeyBase64: string,
+  myPrivateKeyBase64: string
+): { ciphertext: string; nonce: string } {
+  const recipientPublicKey = sodium.from_base64(recipientPublicKeyBase64, sodium.base64_variants.ORIGINAL);
+  const myPrivateKey = sodium.from_base64(myPrivateKeyBase64, sodium.base64_variants.ORIGINAL);
+  const nonceBytes = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
+
+  const wrappedBytes = sodium.crypto_box_easy(fileKey, nonceBytes, recipientPublicKey, myPrivateKey);
+
+  return {
+    ciphertext: sodium.to_base64(wrappedBytes, sodium.base64_variants.ORIGINAL),
+    nonce: sodium.to_base64(nonceBytes, sodium.base64_variants.ORIGINAL),
+  };
+}
+
+/** Unwraps this device's own copy of a file's symmetric key (from
+ * `message_recipients.attachment_key_ciphertext`/`attachment_key_nonce`),
+ * using the sending device's public key -- same (sender_public_key, my own
+ * private key) pairing `decryptFromSender` uses for message text, and for
+ * the same reason (X25519 key agreement is symmetric). Returns `null`
+ * rather than throwing on any failure, same contract as
+ * `decryptFromSender`. */
+export function unwrapFileKey(
+  wrappedKeyCiphertextBase64: string,
+  wrappedKeyNonceBase64: string,
+  senderPublicKeyBase64: string,
+  myPrivateKeyBase64: string
+): Uint8Array | null {
+  let wrapped: Uint8Array, nonce: Uint8Array, senderPublicKey: Uint8Array, myPrivateKey: Uint8Array;
+  try {
+    wrapped = sodium.from_base64(wrappedKeyCiphertextBase64, sodium.base64_variants.ORIGINAL);
+    nonce = sodium.from_base64(wrappedKeyNonceBase64, sodium.base64_variants.ORIGINAL);
+    senderPublicKey = sodium.from_base64(senderPublicKeyBase64, sodium.base64_variants.ORIGINAL);
+    myPrivateKey = sodium.from_base64(myPrivateKeyBase64, sodium.base64_variants.ORIGINAL);
+  } catch (err) {
+    console.warn('Could not decode a wrapped attachment key (malformed base64 -- likely a corrupt row):', err);
+    return null;
+  }
+
+  try {
+    return sodium.crypto_box_open_easy(wrapped, nonce, senderPublicKey, myPrivateKey);
+  } catch {
+    // Expected, ordinary failure: wrong key, tampered ciphertext, or wrong
+    // nonce -- not logged as an error, same as `decryptFromSender`.
+    return null;
+  }
+}
+
+/** Decrypts an attachment blob's bytes with its (already unwrapped)
+ * symmetric file key. Returns `null` rather than throwing on any failure --
+ * wrong key, truncated/tampered download, or wrong nonce -- so a bad
+ * attachment degrades to a placeholder instead of crashing the message
+ * list. */
+export function decryptFileBytes(ciphertextBytes: Uint8Array, nonceBase64: string, fileKey: Uint8Array): Uint8Array | null {
+  let nonce: Uint8Array;
+  try {
+    nonce = sodium.from_base64(nonceBase64, sodium.base64_variants.ORIGINAL);
+  } catch (err) {
+    console.warn('Could not decode an attachment nonce (malformed base64 -- likely a corrupt row):', err);
+    return null;
+  }
+
+  try {
+    return sodium.crypto_secretbox_open_easy(ciphertextBytes, nonce, fileKey);
+  } catch {
+    // Expected, ordinary failure: wrong key or a corrupted/tampered
+    // download -- not logged as an error.
+    return null;
+  }
+}

@@ -5,11 +5,10 @@ use axum::{
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::access::{safe_extension, MAX_ATTACHMENT_BYTES};
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
-
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 
 #[derive(Serialize)]
 pub struct UploadResponse {
@@ -52,20 +51,24 @@ pub async fn upload_file(
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to read file data: {}", e)))?;
 
-    if data.len() as u64 > MAX_FILE_SIZE {
-        return Err(AppError::BadRequest(
-            "File exceeds 100MB size limit".into(),
-        ));
+    if data.len() > MAX_ATTACHMENT_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "File exceeds the {}MB size limit",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        )));
     }
 
-    // Generate UUID filename with original extension
-    let extension = std::path::Path::new(&original_filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{}", e))
-        .unwrap_or_default();
-
-    let stored_filename = format!("{}{}", Uuid::new_v4(), extension);
+    // Generate a UUID filename with an allowlisted extension -- same
+    // `safe_extension` used for channel/emoji uploads (messages.rs,
+    // emojis.rs), rather than taking whatever's after the last `.` as-is.
+    // `Path::extension()` alone can't be used for a path-traversal escape
+    // (it can never contain a `/`, by construction -- it's drawn only from
+    // within the last path component), so this wasn't itself exploitable,
+    // but routing every upload path through the same allowlist keeps this
+    // handler consistent with the rest of the codebase instead of being
+    // the one upload path with a different, ad hoc rule.
+    let extension = safe_extension(&original_filename, "bin");
+    let stored_filename = format!("{}.{}", Uuid::new_v4(), extension);
     let file_path = uploads_dir.join(&stored_filename);
 
     tokio::fs::write(&file_path, &data)

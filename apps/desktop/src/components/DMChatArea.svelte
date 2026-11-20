@@ -7,10 +7,21 @@
     sendDirectMessage,
     SendDirectMessageError,
   } from '../lib/conversations';
-  import { encryptForRecipient, decryptFromSender, CryptoLibraryError, DeviceSetupError } from '../lib/crypto';
+  import {
+    encryptForRecipient,
+    decryptFromSender,
+    encryptFileForFanout,
+    wrapFileKey,
+    unwrapFileKey,
+    decryptFileBytes,
+    CryptoLibraryError,
+    DeviceSetupError,
+  } from '../lib/crypto';
   import { activeDeviceKeypair, deviceEncryptionReady } from '../lib/recovery';
   import { fetchParticipantDevices, type ParticipantDevice } from '../lib/devices';
-  import { TimeoutError } from '../lib/timeout';
+  import { uploadFile } from '../lib/messages';
+  import { fileUrl } from '../lib/api';
+  import { withTimeout, TimeoutError } from '../lib/timeout';
 
   // --- DM-specific error boundary -----------------------------------------
   //
@@ -63,6 +74,36 @@
   let loading = true;
   let newMessage = '';
   let sending = false;
+
+  /** A file picked in the compose box, waiting to be encrypted and sent
+   * with the next message. Cleared on send (success or failure) and when
+   * the user removes it explicitly. */
+  let selectedFile: File | null = null;
+  let fileInputEl: HTMLInputElement;
+  /** Set when a selected file is rejected client-side (too large) --
+   * shown next to the compose box; distinct from `panelError` since
+   * nothing else about the panel is affected. */
+  let attachmentError: string | null = null;
+  /** Mirrors the server's own cap (`MAX_ATTACHMENT_BYTES` in
+   * `access.rs`) so an oversized file is rejected immediately instead of
+   * only after encrypting and uploading it. */
+  const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+
+  const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
+
+  /** Per-message decryption state for an encrypted attachment, keyed by
+   * message id. Populated lazily (see `ensureAttachmentDecrypted`) rather
+   * than for every attachment in a loaded page up front, since decrypting
+   * is real work (a network fetch plus two crypto operations) that most
+   * messages in a long history don't need right away. */
+  type AttachmentState =
+    | { status: 'loading' }
+    | { status: 'ready'; objectUrl: string; mimeType: string }
+    | { status: 'error'; message: string };
+  let attachmentState: Record<string, AttachmentState> = {};
+  /** Object URLs created for decrypted attachments, revoked on destroy so
+   * this component never leaks them for the lifetime of the whole app. */
+  const createdObjectUrls: string[] = [];
 
   /** Set the moment ANY part of this panel's setup hits an unrecoverable
    * failure (crypto library, device setup, or an unexpected exception
@@ -218,6 +259,79 @@
     }
   }
 
+  // Decrypting an attachment is real work (a network fetch plus unwrapping
+  // the file key and decrypting the blob), so it's done lazily, once per
+  // message, rather than for every attachment in a loaded page up front.
+  // Re-runs whenever `messages` changes (new page loaded, new message
+  // arrived, or `myPrivateKey`/`myDeviceId` just became available) and
+  // kicks off decryption for anything not already attempted.
+  $: {
+    for (const m of messages) {
+      if (m.attachment_url && m.is_encrypted && m.attachment_nonce && !attachmentState[m.id]) {
+        void ensureAttachmentDecrypted(m);
+      }
+    }
+  }
+
+  async function ensureAttachmentDecrypted(message: DisplayMessage): Promise<void> {
+    // Claim this message immediately (before any `await`) so the reactive
+    // block above never starts a second, overlapping decrypt for the same
+    // message while the first is still in flight.
+    attachmentState = { ...attachmentState, [message.id]: { status: 'loading' } };
+
+    const fail = (text: string) => {
+      attachmentState = { ...attachmentState, [message.id]: { status: 'error', message: text } };
+    };
+
+    try {
+      if (!myPrivateKey || !myDeviceId) {
+        fail('Encryption keys not ready yet');
+        return;
+      }
+      const recipients = Array.isArray(message.recipients) ? message.recipients : [];
+      const mine = recipients.find(r => r.device_id === myDeviceId);
+      if (!mine || !mine.attachment_key_ciphertext || !mine.attachment_key_nonce) {
+        fail(SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER);
+        return;
+      }
+      const fileKey = unwrapFileKey(mine.attachment_key_ciphertext, mine.attachment_key_nonce, mine.sender_public_key, myPrivateKey);
+      if (!fileKey) {
+        fail(DECRYPT_FAILED_PLACEHOLDER);
+        return;
+      }
+
+      const response = await withTimeout(
+        fetch(fileUrl(message.attachment_url)),
+        ATTACHMENT_FETCH_TIMEOUT_MS,
+        'Timed out downloading the attachment.'
+      );
+      if (!response.ok) {
+        fail('Failed to download attachment');
+        return;
+      }
+      const ciphertextBytes = new Uint8Array(await response.arrayBuffer());
+
+      const plaintextBytes = decryptFileBytes(ciphertextBytes, message.attachment_nonce as string, fileKey);
+      if (!plaintextBytes) {
+        fail(DECRYPT_FAILED_PLACEHOLDER);
+        return;
+      }
+
+      const mimeType = message.attachment_mime_type || 'application/octet-stream';
+      // `.slice()` copies into a fresh, exact-sized `ArrayBuffer` -- `Blob`'s
+      // type signature doesn't accept the more general `ArrayBufferLike`
+      // (which also covers `SharedArrayBuffer`) a typed array's `.buffer`
+      // normally has.
+      const blob = new Blob([plaintextBytes.slice()], { type: mimeType });
+      const objectUrl = URL.createObjectURL(blob);
+      createdObjectUrls.push(objectUrl);
+      attachmentState = { ...attachmentState, [message.id]: { status: 'ready', objectUrl, mimeType } };
+    } catch (e) {
+      console.error('Unexpected error decrypting a DM attachment:', e);
+      fail(e instanceof TimeoutError ? e.message : 'Failed to decrypt attachment');
+    }
+  }
+
   // History is loaded a page at a time; scrolling to the top loads more.
   const PAGE_SIZE = 50;
   let container: HTMLDivElement;
@@ -276,6 +390,7 @@
 
   onDestroy(() => {
     wsClient.off('new_direct_message', onNewDirectMessage);
+    for (const url of createdObjectUrls) URL.revokeObjectURL(url);
   });
 
   async function loadMessages() {
@@ -373,19 +488,64 @@
   // `toDisplayMessage`). Shared by the initial attempt and the
   // stale-device-list retry below so both encrypt against whatever device
   // list they were actually given.
-  async function encryptAndSend(content: string, devices: ParticipantDevice[]): Promise<ConversationMessage> {
+  async function encryptAndSend(
+    content: string,
+    devices: ParticipantDevice[],
+    file: File | null
+  ): Promise<ConversationMessage> {
+    // No attachment: exactly the original behavior, one ciphertext per
+    // device, nothing attachment-related sent at all.
+    if (!file) {
+      const encryptedFor = devices.map(d => {
+        const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
+        return { deviceId: d.device_id, ciphertext, nonce };
+      });
+      return sendDirectMessage(conversationId, null, null, {
+        encryptedFor,
+        senderDeviceId: myDeviceId as string,
+      });
+    }
+
+    // Hybrid encryption (see `lib/crypto.ts`): the file is encrypted ONCE
+    // with a fresh random symmetric key, then that small key is wrapped
+    // once per recipient device -- same device list, same per-device
+    // ciphertext-fan-out as the message text uses, just applied to the key
+    // instead of the whole file.
+    const fileBytes = new Uint8Array(await file.arrayBuffer());
+    const { ciphertext: fileCiphertext, nonce: attachmentNonce, fileKey } = encryptFileForFanout(fileBytes);
+
+    // The uploaded blob's own Content-Type is deliberately generic
+    // (ciphertext isn't a valid image/video/whatever anymore) -- the TRUE
+    // original type travels as plaintext message metadata instead (see
+    // `attachment_mime_type` below), same tier as the filename always has
+    // been on this path (see `send_fanout_message`'s validation in
+    // `conversations.rs`, which never treats attachment metadata as
+    // something needing per-device encryption).
+    const encryptedBlob = new File([fileCiphertext.slice()], file.name, { type: 'application/octet-stream' });
+    const uploaded = await uploadFile(encryptedBlob);
+
     const encryptedFor = devices.map(d => {
-      // A fresh random nonce is generated inside `encryptForRecipient` on
-      // every call, including this one for our own device -- never reused
-      // across the devices in this same batch.
       const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
-      return { deviceId: d.device_id, ciphertext, nonce };
+      const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+      return {
+        deviceId: d.device_id,
+        ciphertext,
+        nonce,
+        attachmentKeyCiphertext: wrapped.ciphertext,
+        attachmentKeyNonce: wrapped.nonce,
+      };
     });
 
-    return sendDirectMessage(conversationId, null, null, {
-      encryptedFor,
-      senderDeviceId: myDeviceId as string,
-    });
+    return sendDirectMessage(
+      conversationId,
+      null,
+      { url: uploaded.url, filename: file.name, size: file.size, mime_type: file.type || 'application/octet-stream' },
+      {
+        encryptedFor,
+        senderDeviceId: myDeviceId as string,
+        attachmentNonce,
+      }
+    );
   }
 
   // Whether a failed send was caused by `participantDevices` going stale
@@ -401,10 +561,33 @@
     );
   }
 
+  function pickFile() {
+    attachmentError = null;
+    fileInputEl?.click();
+  }
+
+  function onFileChosen(e: Event) {
+    const file = (e.target as HTMLInputElement).files?.[0] ?? null;
+    attachmentError = null;
+    if (file && file.size > MAX_ATTACHMENT_BYTES) {
+      attachmentError = `File exceeds the ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB size limit`;
+      selectedFile = null;
+    } else {
+      selectedFile = file;
+    }
+    // Reset so choosing the exact same file again still fires `change`.
+    (e.target as HTMLInputElement).value = '';
+  }
+
+  function clearSelectedFile() {
+    selectedFile = null;
+    attachmentError = null;
+  }
+
   async function handleSendMessage(e: Event) {
     e.preventDefault();
     const content = newMessage.trim();
-    if (!content || sending) return;
+    if ((!content && !selectedFile) || sending) return;
 
     // The single most important invariant: never send plaintext when
     // encryption was supposed to happen. If the other participant has no
@@ -412,6 +595,7 @@
     // blocked outright -- there is no silent plaintext fallback.
     if (!canSend || !myPrivateKey || !myDeviceId) return;
 
+    const fileToSend = selectedFile;
     sending = true;
     try {
       // Encrypt once per device that should get a copy: every device of
@@ -424,7 +608,7 @@
       // ordinary dedup-by-id, same as it is for every other message.
       let created: ConversationMessage;
       try {
-        created = await encryptAndSend(content, participantDevices);
+        created = await encryptAndSend(content, participantDevices, fileToSend);
       } catch (err) {
         // `participantDevices` is only fetched once per conversation (see
         // the `conversationId` watcher above), so it goes stale if the
@@ -433,10 +617,11 @@
         // with the fresh list rather than dropping the message outright.
         if (!isStaleDeviceListError(err)) throw err;
         await loadParticipantDevices();
-        created = await encryptAndSend(content, participantDevices);
+        created = await encryptAndSend(content, participantDevices, fileToSend);
       }
       addMessage(created);
       newMessage = '';
+      selectedFile = null;
       scrollToBottom(true);
     } catch (e) {
       console.error('Failed to send direct message:', e);
@@ -538,9 +723,32 @@
             {#if message.displayContent}
               <div class="text-sm text-[#00dd00] whitespace-pre-wrap break-words">{message.displayContent}</div>
             {/if}
-            {#if message.attachment_url}
+            {#if message.attachment_url && message.is_encrypted && message.attachment_nonce}
+              {@const att = attachmentState[message.id]}
+              {#if !att || att.status === 'loading'}
+                <div class="text-xs text-[#00aa00] mt-1 animate-pulse">{'>'} Decrypting attachment...</div>
+              {:else if att.status === 'error'}
+                <div class="text-xs text-[#ffaa00] mt-1">{'>'} {att.message}</div>
+              {:else if att.mimeType.startsWith('image/')}
+                <a href={att.objectUrl} target="_blank" rel="noopener noreferrer" class="block mt-1">
+                  <img src={att.objectUrl} alt={message.attachment_filename || 'Attachment'} class="max-w-xs max-h-64 border border-[#00ff00]" />
+                </a>
+              {:else}
+                <a
+                  href={att.objectUrl}
+                  download={message.attachment_filename || 'attachment'}
+                  class="inline-block mt-1 text-xs text-[#00aa00] underline hover:text-[#00ff00]"
+                >
+                  📎 {message.attachment_filename || 'Attachment'}
+                </a>
+              {/if}
+            {:else if message.attachment_url}
+              <!-- Plaintext/legacy attachment -- never produced by this
+                   client (every fan-out send encrypts its attachment), but
+                   kept so any such row still renders as a plain link
+                   rather than silently vanishing. -->
               <a
-                href={message.attachment_url}
+                href={fileUrl(message.attachment_url)}
                 target="_blank"
                 rel="noopener noreferrer"
                 class="inline-block mt-1 text-xs text-[#00aa00] underline hover:text-[#00ff00]"
@@ -567,7 +775,34 @@
         {'>'} This user hasn't set up encrypted messaging on any device yet &mdash; you can't send them a message.
       </div>
     {/if}
+    {#if attachmentError}
+      <div class="text-xs text-[#ffaa00] mb-2 terminal-glow">{'>'} {attachmentError}</div>
+    {/if}
+    {#if selectedFile}
+      <div class="flex items-center gap-2 mb-2 text-xs text-[#00aa00]">
+        <span>📎 {selectedFile.name}</span>
+        <button
+          type="button"
+          on:click={clearSelectedFile}
+          disabled={sending}
+          class="text-[#ffaa00] hover:text-[#ff0000] disabled:opacity-50"
+          aria-label="Remove attachment"
+        >
+          ✕
+        </button>
+      </div>
+    {/if}
     <form on:submit={handleSendMessage} class="flex gap-2">
+      <input bind:this={fileInputEl} type="file" class="hidden" on:change={onFileChosen} disabled={sending || !canSend} />
+      <button
+        type="button"
+        on:click={pickFile}
+        disabled={sending || !canSend}
+        class="px-3 py-2 border border-[#00ff00] text-[#00ff00] hover:bg-[rgba(0,255,0,0.1)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        aria-label="Attach file"
+      >
+        📎
+      </button>
       <input
         bind:value={newMessage}
         type="text"
@@ -577,7 +812,7 @@
       />
       <button
         type="submit"
-        disabled={sending || !canSend || !newMessage.trim()}
+        disabled={sending || !canSend || (!newMessage.trim() && !selectedFile)}
         class="px-6 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {sending ? '...' : 'Send'}

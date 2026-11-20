@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::errors::AppError;
-use crate::extractors::auth::CurrentUser;
+use crate::extractors::auth::{CurrentSession, CurrentUser};
+use crate::files::sign_opt;
 use crate::models::conversation::ConversationWithParticipant;
 use crate::models::device::{EncryptedRecipient, MessageRecipientPayload, ParticipantDevice};
 use crate::models::message::BroadcastMessage;
@@ -216,6 +217,12 @@ pub struct ConversationMessage {
     pub attachment_filename: Option<String>,
     pub attachment_mime_type: Option<String>,
     pub attachment_size: Option<i64>,
+    /// Base64 nonce for the attachment blob at `attachment_url`, encrypted
+    /// with `crypto_secretbox_easy` under a symmetric key shared across
+    /// every recipient device (that key itself is wrapped per-device --
+    /// see `recipients[].attachment_key_ciphertext`). `None` when there's
+    /// no attachment, or it's a plaintext/legacy one.
+    pub attachment_nonce: Option<String>,
     pub is_edited: bool,
     /// Whether this message is encrypted (either the legacy single-device
     /// way, with ciphertext in `content`, or the new fan-out way, with
@@ -253,6 +260,7 @@ pub struct ConversationMessage {
 const CONVERSATION_MESSAGE_COLUMNS: &str = r#"
     m.id, m.conversation_id, m.user_id, u.username, m.content,
     m.attachment_url, m.attachment_filename, m.attachment_mime_type, m.attachment_size,
+    m.attachment_nonce,
     COALESCE(m.is_edited, false) AS is_edited,
     m.is_encrypted, m.nonce,
     m.created_at
@@ -302,11 +310,14 @@ async fn fetch_recipients_for_messages(
         ciphertext: String,
         nonce: String,
         sender_public_key: String,
+        attachment_key_ciphertext: Option<String>,
+        attachment_key_nonce: Option<String>,
     }
 
     let rows: Vec<RecipientRow> = sqlx::query_as(
         r#"
-        SELECT message_id, device_id, ciphertext, nonce, sender_public_key
+        SELECT message_id, device_id, ciphertext, nonce, sender_public_key,
+               attachment_key_ciphertext, attachment_key_nonce
         FROM message_recipients
         WHERE message_id = ANY($1) AND ($2::uuid IS NULL OR device_id = $2)
         "#,
@@ -324,6 +335,8 @@ async fn fetch_recipients_for_messages(
             ciphertext: row.ciphertext,
             nonce: row.nonce,
             sender_public_key: row.sender_public_key,
+            attachment_key_ciphertext: row.attachment_key_ciphertext,
+            attachment_key_nonce: row.attachment_key_nonce,
         });
     }
     Ok(map)
@@ -337,7 +350,7 @@ async fn fetch_recipients_for_messages(
 /// a participant.
 pub async fn get_conversation_messages(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(conversation_id): Path<Uuid>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Vec<ConversationMessage>>, AppError> {
@@ -458,6 +471,16 @@ pub async fn get_conversation_messages(
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
+    // Each message's `attachment_url`, if any, is stored as a bare
+    // `/uploads/<name>` path -- turn it into a signed, viewer-bound link
+    // before it leaves the server (see `files.rs`). Unlike the WebSocket
+    // broadcast path (where `ws.rs` signs generically per-connection at
+    // delivery time), this HTTP response has exactly one recipient --
+    // this request's own caller -- so it's signed once, right here.
+    for message in &mut messages {
+        sign_opt(&mut message.attachment_url, user_id, session_id);
+    }
+
     Ok(Json(messages))
 }
 
@@ -478,6 +501,13 @@ const MAX_FANOUT_CIPHERTEXT_B64_CHARS: usize = 24_000;
 /// `crypto_box_NONCEBYTES` (24-byte) nonce, which is always exactly 32
 /// base64 chars -- no headroom needed since this isn't an estimate.
 const MAX_FANOUT_NONCE_B64_CHARS: usize = 32;
+
+/// Longest per-recipient wrapped attachment key accepted. The wrapped
+/// value is a `crypto_box_easy` ciphertext of a fixed 32-byte
+/// `crypto_secretbox` key: 32 + 16 (Poly1305 MAC) = 48 bytes, base64 ->
+/// exactly 64 chars. Rounded up with headroom, same style as
+/// `MAX_FANOUT_CIPHERTEXT_B64_CHARS` above.
+const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 100;
 
 /// GET /api/v1/conversations/:id/participant-devices
 ///
@@ -532,6 +562,12 @@ pub struct SendDirectMessageRequest {
     pub attachment_filename: Option<String>,
     pub attachment_size: Option<i64>,
     pub attachment_mime_type: Option<String>,
+    /// Base64 `crypto_secretbox_easy` nonce for the attachment blob at
+    /// `attachment_url`. Only meaningful (and only accepted) alongside
+    /// `encrypted_for` -- see `send_fanout_message`'s validation. Ignored
+    /// on the legacy path, same as attachment fields always have been.
+    #[serde(default)]
+    pub attachment_nonce: Option<String>,
     /// Legacy single-device encryption flag: whether `content` is base64
     /// ciphertext (NaCl `crypto_box`) rather than plaintext. Kept only for
     /// backward compatibility / non-encrypted sends -- a new E2EE send
@@ -569,7 +605,7 @@ pub struct SendDirectMessageRequest {
 /// the body (the desktop client sends one) is ignored.
 pub async fn send_conversation_message(
     State(db): State<Database>,
-    CurrentUser(user_id): CurrentUser,
+    CurrentSession { user_id, session_id }: CurrentSession,
     Path(conversation_id): Path<Uuid>,
     Json(payload): Json<SendDirectMessageRequest>,
 ) -> Result<Json<ConversationMessage>, AppError> {
@@ -624,6 +660,16 @@ pub async fn send_conversation_message(
         }
     }
 
+    // Signed AFTER building the broadcast payload above, and only on this
+    // function's own local `message`, never on a value shared with it: the
+    // broadcast must carry the bare `/uploads/<name>` path so `ws.rs` can
+    // sign it fresh for each connection it's delivered to (every
+    // participant, each with their own user_id/session_id -- see
+    // `sign_json` there). Signing it here first would bake in THIS
+    // request's caller as the only valid viewer, breaking the link for
+    // everyone else it's broadcast to.
+    sign_opt(&mut message.attachment_url, user_id, session_id);
+
     Ok(Json(message))
 }
 
@@ -644,6 +690,16 @@ async fn send_legacy_message(
     }
     if payload.is_encrypted && payload.nonce.as_deref().unwrap_or("").trim().is_empty() {
         return Err(AppError::BadRequest("nonce is required for an encrypted message".into()));
+    }
+    // Encrypted attachments are only supported on the fan-out path (every
+    // recipient device needs its own wrapped copy of the file key, which
+    // only exists there) -- a client sending `attachment_nonce` here
+    // without `encrypted_for` is sending a payload this path can't honor,
+    // not an attachment this path should silently store unencrypted.
+    if payload.attachment_nonce.is_some() {
+        return Err(AppError::BadRequest(
+            "attachment_nonce requires encrypted_for (per-device fan-out send)".into(),
+        ));
     }
 
     sqlx::query_scalar(
@@ -683,6 +739,22 @@ async fn send_fanout_message(
         .sender_device_id
         .ok_or_else(|| AppError::BadRequest("sender_device_id is required when encrypted_for is set".into()))?;
 
+    // An attachment is encrypted iff `attachment_url` is set: then every
+    // recipient MUST carry a wrapped copy of the file key (skipping even
+    // one leaves that device permanently unable to read the attachment,
+    // same invariant as the message ciphertext itself), and the message
+    // needs the shared blob's nonce. With no attachment, none of this
+    // applies -- reject a mismatched client payload outright rather than
+    // silently ignoring stray fields, since either direction of mismatch
+    // is a real client bug worth surfacing immediately.
+    let has_attachment = payload.attachment_url.is_some();
+    if has_attachment && payload.attachment_nonce.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::BadRequest("attachment_nonce is required when attachment_url is set".into()));
+    }
+    if !has_attachment && payload.attachment_nonce.is_some() {
+        return Err(AppError::BadRequest("attachment_nonce must not be set without attachment_url".into()));
+    }
+
     for r in recipients {
         if r.ciphertext.trim().is_empty() || r.nonce.trim().is_empty() {
             return Err(AppError::BadRequest("ciphertext and nonce are required for every entry in encrypted_for".into()));
@@ -696,6 +768,29 @@ async fn send_fanout_message(
             return Err(AppError::BadRequest(format!(
                 "nonce in encrypted_for can be at most {MAX_FANOUT_NONCE_B64_CHARS} characters"
             )));
+        }
+        let key_ct = r.attachment_key_ciphertext.as_deref().unwrap_or("").trim();
+        let key_nonce = r.attachment_key_nonce.as_deref().unwrap_or("").trim();
+        if has_attachment {
+            if key_ct.is_empty() || key_nonce.is_empty() {
+                return Err(AppError::BadRequest(
+                    "attachment_key_ciphertext and attachment_key_nonce are required for every entry in encrypted_for when attachment_url is set".into(),
+                ));
+            }
+            if key_ct.len() > MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_ciphertext in encrypted_for can be at most {MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS} characters"
+                )));
+            }
+            if key_nonce.len() > MAX_FANOUT_NONCE_B64_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_nonce in encrypted_for can be at most {MAX_FANOUT_NONCE_B64_CHARS} characters"
+                )));
+            }
+        } else if !key_ct.is_empty() || !key_nonce.is_empty() {
+            return Err(AppError::BadRequest(
+                "attachment_key_ciphertext/attachment_key_nonce must not be set without attachment_url".into(),
+            ));
         }
     }
     let device_ids: Vec<Uuid> = recipients.iter().map(|r| r.device_id).collect();
@@ -772,8 +867,8 @@ async fn send_fanout_message(
 
     let msg_id: Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, is_encrypted, nonce)
-        VALUES ($1, NULL, $2, NULL, $3, $4, $5, $6, true, NULL)
+        INSERT INTO messages (conversation_id, channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, attachment_nonce, is_encrypted, nonce)
+        VALUES ($1, NULL, $2, NULL, $3, $4, $5, $6, $7, true, NULL)
         RETURNING id
         "#,
     )
@@ -783,19 +878,22 @@ async fn send_fanout_message(
     .bind(&payload.attachment_filename)
     .bind(&payload.attachment_mime_type)
     .bind(payload.attachment_size)
+    .bind(&payload.attachment_nonce)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     for r in recipients {
         sqlx::query(
-            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(msg_id)
         .bind(r.device_id)
         .bind(&r.ciphertext)
         .bind(&r.nonce)
         .bind(&sender_public_key)
+        .bind(&r.attachment_key_ciphertext)
+        .bind(&r.attachment_key_nonce)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1058,7 +1156,7 @@ mod tests {
 
         let read_result = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_c),
+            CurrentSession { user_id: user_c, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
@@ -1070,7 +1168,7 @@ mod tests {
 
         let send_result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_c),
+            CurrentSession { user_id: user_c, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: Some("hello from an outsider".into()),
@@ -1078,6 +1176,7 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: None,
@@ -1114,7 +1213,7 @@ mod tests {
 
         let sent = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: Some("hello from A".into()),
@@ -1122,6 +1221,7 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: None,
@@ -1137,7 +1237,7 @@ mod tests {
 
         let messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
@@ -1173,7 +1273,7 @@ mod tests {
 
         let _ = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: Some("ping".into()),
@@ -1181,6 +1281,7 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: None,
@@ -1215,7 +1316,7 @@ mod tests {
         // B reads the conversation (loading the latest page marks it read).
         let _ = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
@@ -1293,7 +1394,7 @@ mod tests {
 
         let sent = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: Some(fake_ciphertext.into()),
@@ -1301,6 +1402,7 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: true,
                 nonce: Some(fake_nonce.into()),
                 encrypted_for: None,
@@ -1317,7 +1419,7 @@ mod tests {
 
         let messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
@@ -1357,7 +1459,7 @@ mod tests {
 
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: Some("ciphertext-looking-thing".into()),
@@ -1365,6 +1467,7 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: true,
                 nonce: None,
                 encrypted_for: None,
@@ -1504,7 +1607,7 @@ mod tests {
 
         let sent = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1512,12 +1615,13 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![
-                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into() },
-                    EncryptedRecipient { device_id: a_device2, ciphertext: "ct-for-a2".into(), nonce: "nonce-a2".into() },
-                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into() },
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: a_device2, ciphertext: "ct-for-a2".into(), nonce: "nonce-a2".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
                 ]),
                 sender_device_id: Some(a_device1),
             }),
@@ -1535,7 +1639,7 @@ mod tests {
         // A's device 2 fetching history sees only its own ciphertext.
         let a2_messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: Some(a_device2) }),
         )
@@ -1551,7 +1655,7 @@ mod tests {
         // B's device 1 fetching history sees only its own ciphertext.
         let b1_messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
         )
@@ -1569,7 +1673,7 @@ mod tests {
         // echo (which is what caused the self-echo race this replaced).
         let a1_messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: Some(a_device1) }),
         )
@@ -1585,7 +1689,7 @@ mod tests {
         // unrecognized device id: no ciphertext handed out.
         let no_device_messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: None }),
         )
@@ -1628,7 +1732,7 @@ mod tests {
 
         let sent = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1636,11 +1740,12 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![
-                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into() },
-                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into() },
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
                 ]),
                 sender_device_id: Some(a_device1),
             }),
@@ -1654,7 +1759,7 @@ mod tests {
         // devices -- as the filter. This must not leak B's ciphertext.
         let messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
         )
@@ -1672,7 +1777,7 @@ mod tests {
         // not the device_id itself.
         let b_messages = get_conversation_messages(
             State(db.clone()),
-            CurrentUser(user_b),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
         )
@@ -1714,7 +1819,7 @@ mod tests {
 
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1722,12 +1827,14 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![EncryptedRecipient {
                     device_id: outsider_device,
                     ciphertext: "ct".into(),
                     nonce: "nonce".into(),
+                    ..Default::default()
                 }]),
                 sender_device_id: Some(a_device1),
             }),
@@ -1776,7 +1883,7 @@ mod tests {
 
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1784,12 +1891,14 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![EncryptedRecipient {
                     device_id: b_device1,
                     ciphertext: "ct".into(),
                     nonce: "nonce".into(),
+                    ..Default::default()
                 }]),
                 // B's device, not A's -- A must not be able to claim it.
                 sender_device_id: Some(b_device1),
@@ -1868,7 +1977,7 @@ mod tests {
         let oversized_ciphertext = "a".repeat(MAX_FANOUT_CIPHERTEXT_B64_CHARS + 1);
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1876,12 +1985,14 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![EncryptedRecipient {
                     device_id: b_device1,
                     ciphertext: oversized_ciphertext,
                     nonce: "nonce-b1".into(),
+                    ..Default::default()
                 }]),
                 sender_device_id: Some(a_device1),
             }),
@@ -1929,7 +2040,7 @@ mod tests {
         let oversized_nonce = "a".repeat(MAX_FANOUT_NONCE_B64_CHARS + 1);
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -1937,12 +2048,14 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![EncryptedRecipient {
                     device_id: b_device1,
                     ciphertext: "ct-for-b1".into(),
                     nonce: oversized_nonce,
+                    ..Default::default()
                 }]),
                 sender_device_id: Some(a_device1),
             }),
@@ -1960,6 +2073,372 @@ mod tests {
             .await
             .expect("count query failed");
         assert_eq!(message_count, 0, "a rejected fan-out send must not leave a partial message row behind");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// A fan-out message with an encrypted attachment: every recipient
+    /// device gets its own wrapped copy of the attachment key, the shared
+    /// blob's nonce lives on the message itself, and fetching history later
+    /// returns both back to each device.
+    #[tokio::test]
+    async fn fanout_attachment_round_trips_per_device_key_and_nonce() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 60, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 61, "B's Laptop").await;
+
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: Some("/uploads/abc.png".into()),
+                attachment_filename: Some("photo.png".into()),
+                attachment_size: Some(1234),
+                attachment_mime_type: Some("image/png".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient {
+                        device_id: a_device1,
+                        ciphertext: "ct-for-a1".into(),
+                        nonce: "nonce-a1".into(),
+                        attachment_key_ciphertext: Some("wrapped-key-a1".into()),
+                        attachment_key_nonce: Some("wrap-nonce-a1".into()),
+                    },
+                    EncryptedRecipient {
+                        device_id: b_device1,
+                        ciphertext: "ct-for-b1".into(),
+                        nonce: "nonce-b1".into(),
+                        attachment_key_ciphertext: Some("wrapped-key-b1".into()),
+                        attachment_key_nonce: Some("wrap-nonce-b1".into()),
+                    },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await
+        .expect("sending fan-out message with attachment failed")
+        .0;
+
+        assert_eq!(sent.attachment_nonce.as_deref(), Some("file-nonce"));
+
+        let b1_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
+        )
+        .await
+        .expect("fetching as B's device 1 failed")
+        .0;
+        let found = b1_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert_eq!(found.attachment_nonce.as_deref(), Some("file-nonce"));
+        assert_eq!(found.recipients.len(), 1);
+        assert_eq!(found.recipients[0].attachment_key_ciphertext.as_deref(), Some("wrapped-key-b1"));
+        assert_eq!(found.recipients[0].attachment_key_nonce.as_deref(), Some("wrap-nonce-b1"));
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// `attachment_url` set without `attachment_nonce` is rejected -- an
+    /// encrypted attachment blob is never stored without the nonce needed
+    /// to decrypt it.
+    #[tokio::test]
+    async fn fanout_rejects_attachment_without_nonce() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 62, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 63, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: Some("/uploads/abc.png".into()),
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an attachment with no nonce, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// `attachment_nonce` set without `attachment_url` is rejected -- there
+    /// is nothing for that nonce to decrypt.
+    #[tokio::test]
+    async fn fanout_rejects_attachment_nonce_without_url() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 64, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 65, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for attachment_nonce with no attachment_url, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// Every recipient must carry a wrapped attachment key when there's an
+    /// attachment -- skipping even one would leave that device permanently
+    /// unable to read it, the same invariant as the message ciphertext
+    /// itself.
+    #[tokio::test]
+    async fn fanout_rejects_missing_attachment_key_for_a_recipient() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 66, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 67, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: Some("/uploads/abc.png".into()),
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient {
+                        device_id: a_device1,
+                        ciphertext: "ct-for-a1".into(),
+                        nonce: "nonce-a1".into(),
+                        attachment_key_ciphertext: Some("wrapped-key-a1".into()),
+                        attachment_key_nonce: Some("wrap-nonce-a1".into()),
+                    },
+                    // B's device carries no wrapped key at all.
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for a recipient missing its attachment key, got {other:?}"),
+        }
+
+        let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count query failed");
+        assert_eq!(message_count, 0, "a rejected fan-out send must not leave a partial message row behind");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// A recipient carrying a wrapped attachment key when there's no
+    /// attachment at all is rejected as a mismatched/buggy payload, rather
+    /// than silently stored and ignored.
+    #[tokio::test]
+    async fn fanout_rejects_attachment_key_without_attachment() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 68, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 69, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient {
+                        device_id: b_device1,
+                        ciphertext: "ct-for-b1".into(),
+                        nonce: "nonce-b1".into(),
+                        attachment_key_ciphertext: Some("wrapped-key-b1".into()),
+                        attachment_key_nonce: Some("wrap-nonce-b1".into()),
+                    },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for an attachment key with no attachment, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// The legacy single-device send path never supports encrypted
+    /// attachments (there's no per-device fan-out there to carry a wrapped
+    /// key) -- `attachment_nonce` on that path is rejected outright rather
+    /// than silently stored with no way to ever decrypt the blob.
+    #[tokio::test]
+    async fn legacy_send_rejects_attachment_nonce() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentUser(user_a),
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: Some("hi".into()),
+                attachment_url: Some("/uploads/abc.png".into()),
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected AppError::BadRequest for attachment_nonce on the legacy send path, got {other:?}"),
+        }
 
         cleanup_test_user(&db, user_a).await;
         cleanup_test_user(&db, user_b).await;
@@ -1995,7 +2474,7 @@ mod tests {
         // no error anywhere, if the server didn't catch it.
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -2003,11 +2482,12 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![
-                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into() },
-                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into() },
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
                 ]),
                 sender_device_id: Some(a_device1),
             }),
@@ -2060,7 +2540,7 @@ mod tests {
         // either.
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -2068,11 +2548,12 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![
-                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into() },
-                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into() },
+                    EncryptedRecipient { device_id: a_device1, ciphertext: "ct-for-a1".into(), nonce: "nonce-a1".into(), ..Default::default() },
+                    EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
                 ]),
                 sender_device_id: Some(a_device1),
             }),
@@ -2129,7 +2610,7 @@ mod tests {
         // the one entry the real client never actually omits.
         let result = send_conversation_message(
             State(db.clone()),
-            CurrentUser(user_a),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
             Path(conversation_id),
             Json(SendDirectMessageRequest {
                 content: None,
@@ -2137,12 +2618,14 @@ mod tests {
                 attachment_filename: None,
                 attachment_size: None,
                 attachment_mime_type: None,
+                attachment_nonce: None,
                 is_encrypted: false,
                 nonce: None,
                 encrypted_for: Some(vec![EncryptedRecipient {
                     device_id: b_device1,
                     ciphertext: "ct-for-b1".into(),
                     nonce: "nonce-b1".into(),
+                    ..Default::default()
                 }]),
                 sender_device_id: Some(a_device1),
             }),
