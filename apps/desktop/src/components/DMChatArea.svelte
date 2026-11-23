@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, onDestroy, tick, createEventDispatcher } from 'svelte';
   import { wsClient } from '../lib/websocket';
   import {
     type ConversationMessage,
@@ -57,6 +57,8 @@
   export let conversationId: string;
   export let participantUsername: string = '';
   export let participantPublicKey: string | null | undefined = null;
+
+  const dispatch = createEventDispatcher();
   // No longer read in this component now that the sending device's own
   // current device is treated like any other recipient device (see
   // `encryptAndSend`) -- kept only because the parent passes it uniformly
@@ -669,8 +671,19 @@
 <div class="flex-1 min-w-0 flex flex-col bg-black border-l-2 border-[#00ff00]">
   <!-- Header -->
   <div class="h-12 border-b-2 border-[#00ff00] flex items-center px-4 gap-2">
-    <div class="flex-1">
-      <h3 class="text-sm font-bold text-[#00ff00] terminal-glow">
+    <!-- Mobile only: DMs are their own full-screen pane there (see
+         App.svelte), so it needs its own way back to the DM list. -->
+    <button
+      type="button"
+      class="md:hidden w-7 h-7 flex-shrink-0 flex items-center justify-center border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+      aria-label="Back to conversations"
+      on:click={() => dispatch('back')}
+    >
+      ←
+    </button>
+
+    <div class="flex-1 min-w-0">
+      <h3 class="text-sm font-bold text-[#00ff00] terminal-glow truncate">
         {'>'} {participantUsername || 'Direct Message'}
       </h3>
     </div>

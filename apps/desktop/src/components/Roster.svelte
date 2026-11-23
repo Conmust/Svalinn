@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import { fetchUserProfile, setMyNickname, adminSetNickname, type UserProfile } from '../lib/users';
@@ -10,6 +10,8 @@
 
   export let serverId: string | null = null;
   export let currentUser: any = null;
+
+  const dispatch = createEventDispatcher();
 
   interface Member {
     id: string;
@@ -249,9 +251,19 @@
   }
 </script>
 
-<aside class="w-60 bg-[#0a0e0a] border-l-2 border-[#00ff00] flex flex-col h-full shadow-[-10px_0_30px_rgba(0,255,0,0.2)]">
+<aside class="w-full md:w-60 bg-[#0a0e0a] border-l-2 border-[#00ff00] flex flex-col h-full shadow-[-10px_0_30px_rgba(0,255,0,0.2)]">
   <!-- Header -->
-  <div class="p-4 border-b-2 border-[#00ff00] flex items-center">
+  <div class="p-4 border-b-2 border-[#00ff00] flex items-center gap-2">
+    <!-- Mobile only: roster is its own full-screen pane there (see
+         App.svelte), so it needs its own way back to the chat. -->
+    <button
+      type="button"
+      class="md:hidden px-2 py-1 -ml-1 border border-[#00ff00] text-[#00ff00] text-xs hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+      aria-label="Back to chat"
+      on:click={() => dispatch('close')}
+    >
+      ←
+    </button>
     <h3 class="text-xs font-semibold text-[#00aa00] uppercase tracking-widest terminal-glow">
       {'>'} Members — {members.length}
     </h3>
