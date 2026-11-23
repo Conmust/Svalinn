@@ -59,10 +59,19 @@
       history = [...history, appMemoryMb].slice(-HISTORY_LENGTH);
     } catch (e) {
       // Not running under Tauri (e.g. `vite dev` in a plain browser tab for
-      // frontend-only work), or the native call itself failed. Either way,
-      // show a plain dash instead of a broken/misleading readout.
+      // frontend-only work), the command doesn't exist on this build (it's
+      // compiled out for mobile -- see src-tauri/src/lib.rs), or the native
+      // call itself failed. Whatever the reason, the badge hides itself
+      // entirely (see the template) rather than show a permanent dead
+      // placeholder, and stops polling: on mobile this failure is
+      // permanent, so there's no point burning battery retrying every
+      // POLL_INTERVAL_MS forever.
       console.error('Svalinn Gauge: failed to read system stats', e);
       unavailable = true;
+      if (timer) {
+        clearInterval(timer);
+        timer = undefined;
+      }
     }
   }
 
@@ -104,6 +113,7 @@
   (`top-full`), so it stays anchored to the badge instead of a second
   hardcoded position.
 -->
+{#if !unavailable}
 <div class="fixed top-2 left-1/2 -translate-x-1/2 z-[150]">
   <button
     type="button"
@@ -111,9 +121,7 @@
     on:click={() => (expanded = !expanded)}
     title="Svalinn Gauge -- click for details"
   >
-    {#if unavailable}
-      [ -- ]
-    {:else if appMemoryMb === null}
+    {#if appMemoryMb === null}
       [ measuring... ]
     {:else}
       [ {appMemoryMb.toFixed(0)} MB | {(appCpuPercent ?? 0).toFixed(1)}% CPU ]
@@ -124,9 +132,6 @@
   <div
     class="absolute top-full left-1/2 -translate-x-1/2 mt-2 p-3 bg-black border border-[#00aa00]/50 text-[#00ff00] text-xs font-mono w-64 max-w-[90vw] space-y-2"
   >
-    {#if unavailable}
-      <div class="text-[#ffaa00]">Gauge unavailable in this environment.</div>
-    {:else}
       <div class="text-[#00aa00]">Svalinn (app only)</div>
       <div class="flex justify-between pl-2"><span class="text-[#00aa00]">Memory (RSS)</span><span>{appMemoryMb?.toFixed(1) ?? '--'} MB</span></div>
       <div class="flex justify-between pl-2"><span class="text-[#00aa00]">CPU</span><span>{(appCpuPercent ?? 0).toFixed(1)}%</span></div>
@@ -168,7 +173,7 @@
           <div>methodology: "app" = our own process only; "total" = our process + every descendant OS process (webview/GPU/network helpers included)</div>
         </div>
       {/if}
-    {/if}
   </div>
   {/if}
 </div>
+{/if}

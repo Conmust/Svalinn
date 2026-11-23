@@ -23,6 +23,14 @@
   let showRoster = false;
   let showAccountSettings = false;
 
+  // Below the `md` breakpoint there isn't room to show the server rail,
+  // channel list, chat and roster side by side (see the responsive wrapper
+  // classes in the template below), so only one "pane" is visible at a
+  // time and this tracks which. It's read and written here but ignored by
+  // the layout at `md` and above, where every pane is always shown as
+  // before.
+  let mobileView: 'nav' | 'chat' | 'roster' = 'nav';
+
   // Stay connected whenever logged in, whatever is on screen, so live
   // updates and a ban or revoked session reach the app straight away.
   $: if (currentUser) wsClient.connect();
@@ -71,6 +79,7 @@
       activeServer = null;
       activeChannel = null;
       showRoster = false;
+      mobileView = 'nav';
     }
     if (data.reason === 'kicked') showNotice(`You were removed from ${data.server_name}.`);
     if (data.reason === 'banned') showNotice(`You were banned from ${data.server_name}.`);
@@ -93,14 +102,30 @@
     activeServer = event.detail;
     activeChannel = null;
     activeConversation = null;
+    mobileView = 'nav';
   }
 
   function handleChannelSelected(event: CustomEvent<Channel>) {
     activeChannel = event.detail;
+    mobileView = 'chat';
   }
 
   function handleConversationSelected(event: CustomEvent<Conversation>) {
     activeConversation = event.detail;
+    mobileView = 'chat';
+  }
+
+  // On mobile, "Members" swaps the chat pane out for a full-width roster
+  // instead of showing a side-by-side column; the reverse happens when the
+  // roster's own back button fires `rosterClosed`.
+  function handleToggleRoster() {
+    showRoster = !showRoster;
+    mobileView = showRoster ? 'roster' : 'chat';
+  }
+
+  function handleRosterClosed() {
+    showRoster = false;
+    mobileView = 'chat';
   }
 
   function handleCreateChannel() {
@@ -129,6 +154,7 @@
     activeConversation = null;
     checkedEncryptionSetup = false;
     resetDeviceEncryptionSetup();
+    mobileView = 'nav';
   }
 
   async function handleAuthSubmit(e: Event) {
@@ -167,81 +193,99 @@
 {#if currentUser}
   <SvalinnGauge />
   <div class="flex h-screen bg-black text-[#00ff00] overflow-hidden font-mono">
-    <!-- 1. Server Rail -->
-    <ServerRail
-      on:serverSelected={handleServerSelected}
-      on:openAccountSettings={() => (showAccountSettings = true)}
-    />
+    <!-- 1. Nav pane: Server Rail + Channel/DM list. Below `md` this is its
+         own full-screen pane (only shown when mobileView === 'nav'); at
+         `md` and above it's always shown side by side with the rest, same
+         as before this pane wrapper existed. -->
+    <div class="w-full md:w-auto {mobileView === 'nav' ? 'flex' : 'hidden'} md:flex">
+      <ServerRail
+        on:serverSelected={handleServerSelected}
+        on:openAccountSettings={() => (showAccountSettings = true)}
+      />
+
+      <!-- 2. Channel List (Only show if a server is selected) -->
+      {#if activeServer}
+        <ChannelList
+          {currentUser}
+          activeServer={activeServer}
+          activeChannel={activeChannel?.id ?? null}
+          on:channelSelected={handleChannelSelected}
+          on:channelDeleted={() => (activeChannel = null)}
+          on:createChannel={handleCreateChannel}
+          on:logout={handleLogout}
+        />
+      {:else}
+        <!-- No server selected: Direct Messages list -->
+        <DMList
+          activeConversation={activeConversation?.id ?? null}
+          on:conversationSelected={handleConversationSelected}
+          on:logout={handleLogout}
+        />
+      {/if}
+    </div>
+
     {#if showAccountSettings}
       <AccountSettings on:close={() => (showAccountSettings = false)} />
     {/if}
     {#if $recoveryChoiceNeeded || $recoveryCheckFailed}
       <RecoveryChoice />
     {/if}
-    
-    <!-- 2. Channel List (Only show if a server is selected) -->
-    {#if activeServer}
-      <ChannelList
-        {currentUser}
-        activeServer={activeServer}
-        activeChannel={activeChannel?.id ?? null}
-        on:channelSelected={handleChannelSelected}
-        on:channelDeleted={() => (activeChannel = null)}
-        on:createChannel={handleCreateChannel}
-        on:logout={handleLogout}
-      />
-    {/if}
 
-    <!-- 3. Chat Area (Only show if a channel is selected) -->
-    {#if activeChannel && activeServer && activeChannel.channel_type === 'voice'}
-      <!-- Voice channels aren't wired up yet; be honest instead of showing a chat view. -->
-      <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
-        <div class="text-4xl mb-4">🔊</div>
-        <div class="text-xl font-bold">{'>'} Voice channels aren't supported yet</div>
-      </div>
-    {:else if activeChannel && activeServer}
-      <ChatArea
-        channelId={activeChannel.id}
-        serverId={activeServer}
-        {currentUser}
-        {showRoster}
-        on:toggleRoster={() => (showRoster = !showRoster)}
-      />
-      {#if showRoster}
-        <Roster serverId={activeServer} {currentUser} />
-      {/if}
-    {:else if activeServer}
-      <!-- Empty state when server is selected but no channel -->
-      <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
-        <div class="text-4xl mb-4">⌘</div>
-        <div class="text-xl font-bold">{'>'} Select a channel to start chatting</div>
-      </div>
-    {:else}
-      <!-- No server selected: Direct Messages view -->
-      <DMList
-        activeConversation={activeConversation?.id ?? null}
-        on:conversationSelected={handleConversationSelected}
-        on:logout={handleLogout}
-      />
-      {#if activeConversation}
+    <!-- 3. Chat pane: whatever's active for the current server/DM context.
+         Below `md` this only shows once something is actually selected
+         (mobileView only becomes 'chat' from a selection handler), so
+         there's no empty placeholder stranded with no way back to 'nav'. -->
+    <div class="flex-1 min-w-0 {mobileView === 'chat' ? 'flex' : 'hidden'} md:flex">
+      {#if activeChannel && activeServer && activeChannel.channel_type === 'voice'}
+        <!-- Voice channels aren't wired up yet; be honest instead of showing a chat view. -->
+        <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
+          <div class="text-4xl mb-4">🔊</div>
+          <div class="text-xl font-bold">{'>'} Voice channels aren't supported yet</div>
+        </div>
+      {:else if activeChannel && activeServer}
+        <ChatArea
+          channelId={activeChannel.id}
+          serverId={activeServer}
+          {currentUser}
+          {showRoster}
+          on:toggleRoster={handleToggleRoster}
+          on:back={() => (mobileView = 'nav')}
+        />
+      {:else if activeConversation}
         <DMChatArea
           conversationId={activeConversation.id}
           participantUsername={activeConversation.participant_username}
           participantPublicKey={activeConversation.participant_public_key}
           {currentUser}
+          on:back={() => (mobileView = 'nav')}
         />
+      {:else if activeServer}
+        <!-- Empty state when server is selected but no channel (desktop only; see note above) -->
+        <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
+          <div class="text-4xl mb-4">⌘</div>
+          <div class="text-xl font-bold">{'>'} Select a channel to start chatting</div>
+        </div>
       {:else}
+        <!-- Empty state when no conversation is open (desktop only; see note above) -->
         <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
           <div class="text-4xl mb-4">✉</div>
           <div class="text-xl font-bold">{'>'} Select a conversation to start chatting</div>
         </div>
       {/if}
+    </div>
+
+    <!-- 4. Roster pane: full-width on mobile (its own pane), a fixed-width
+         sidebar alongside chat at `md` and above, same as before. -->
+    {#if showRoster && activeServer}
+      <div class="w-full md:w-auto {mobileView === 'roster' ? 'flex' : 'hidden'} md:flex">
+        <Roster serverId={activeServer} {currentUser} on:close={handleRosterClosed} />
+      </div>
     {/if}
   </div>
 {:else}
   <!-- Login/Register Screen -->
-  <div class="flex h-screen items-center justify-center bg-black font-mono">
-    <div class="w-[400px] bg-[#0a0e0a] border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-8">
+  <div class="flex h-screen items-center justify-center bg-black font-mono px-4">
+    <div class="w-full max-w-[400px] bg-[#0a0e0a] border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-8">
       <h1 class="text-3xl font-bold text-[#00ff00] uppercase tracking-widest mb-2 terminal-glow text-center">
         Svalinn
       </h1>

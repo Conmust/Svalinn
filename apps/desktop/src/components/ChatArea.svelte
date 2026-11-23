@@ -654,6 +654,17 @@
 <div class="flex-1 min-w-0 flex flex-col bg-black border-l-2 border-[#00ff00]">
   <!-- Header -->
   <div class="h-12 border-b-2 border-[#00ff00] flex items-center px-4 gap-2">
+    <!-- Mobile only: chat is its own full-screen pane there (see
+         App.svelte), so it needs its own way back to the channel list. -->
+    <button
+      type="button"
+      class="md:hidden w-7 h-7 flex-shrink-0 flex items-center justify-center border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+      aria-label="Back to channels"
+      on:click={() => dispatch('back')}
+    >
+      ←
+    </button>
+
     <!-- Which channel this is now shows only via the highlighted row in the
          channel list, not here -- this spacer just keeps the buttons below
          pinned to the right edge like before. -->

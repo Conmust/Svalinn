@@ -96,7 +96,7 @@
   }
 </script>
 
-<aside class="w-60 bg-[#0a0e0a] border-r-2 border-[#00ff00] flex flex-col h-full">
+<aside class="flex-1 min-w-0 md:w-60 md:flex-none bg-[#0a0e0a] border-r-2 border-[#00ff00] flex flex-col h-full">
   <!-- Header -->
   <div class="p-4 border-b-2 border-[#00ff00] flex items-center justify-between gap-2">
     <h3 class="text-xs font-semibold text-[#00aa00] uppercase tracking-widest terminal-glow">
