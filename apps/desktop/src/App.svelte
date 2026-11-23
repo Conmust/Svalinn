@@ -13,8 +13,15 @@
   import RecoveryChoice from './components/RecoveryChoice.svelte';
   import DMList from './components/DMList.svelte';
   import DMChatArea from './components/DMChatArea.svelte';
+  import CallOverlay from './components/CallOverlay.svelte';
+  import { initCallSignaling } from './lib/calls';
   import type { Conversation } from './lib/conversations';
   import type { Channel } from './lib/servers';
+
+  // Registers the WS listeners that drive incoming/outgoing calls. Only
+  // needs to happen once -- `wsClient.on` just adds listeners, independent
+  // of connect/reconnect cycles below.
+  initCallSignaling();
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
@@ -231,6 +238,8 @@
       <RecoveryChoice />
     {/if}
 
+    <CallOverlay />
+
     <!-- 3. Chat pane: whatever's active for the current server/DM context.
          Below `md` this only shows once something is actually selected
          (mobileView only becomes 'chat' from a selection handler), so
@@ -254,6 +263,7 @@
       {:else if activeConversation}
         <DMChatArea
           conversationId={activeConversation.id}
+          participantId={activeConversation.participant_id}
           participantUsername={activeConversation.participant_username}
           participantPublicKey={activeConversation.participant_public_key}
           {currentUser}

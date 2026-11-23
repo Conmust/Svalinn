@@ -244,6 +244,9 @@ async fn main() {
             delete(routes::emojis::delete_emoji),
         )
         
+        // --- Calls: TURN credentials for WebRTC; signaling itself rides the WS ---
+        .route("/api/v1/calls/turn-credentials", get(routes::calls::get_turn_credentials))
+
         // --- WebSocket Route ---
         .route("/api/v1/ws", get(routes::ws::websocket_handler))
         

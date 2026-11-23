@@ -22,6 +22,7 @@
   import { uploadFile } from '../lib/messages';
   import { fileUrl } from '../lib/api';
   import { withTimeout, TimeoutError } from '../lib/timeout';
+  import { startCall } from '../lib/calls';
 
   // --- DM-specific error boundary -----------------------------------------
   //
@@ -55,6 +56,7 @@
   }
 
   export let conversationId: string;
+  export let participantId: string = '';
   export let participantUsername: string = '';
   export let participantPublicKey: string | null | undefined = null;
 
@@ -687,6 +689,27 @@
         {'>'} {participantUsername || 'Direct Message'}
       </h3>
     </div>
+
+    {#if participantId}
+      <button
+        type="button"
+        class="w-7 h-7 flex-shrink-0 flex items-center justify-center border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+        aria-label="Voice call"
+        title="Voice call"
+        on:click={() => startCall(participantId, participantUsername, false)}
+      >
+        📞
+      </button>
+      <button
+        type="button"
+        class="w-7 h-7 flex-shrink-0 flex items-center justify-center border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow"
+        aria-label="Video call"
+        title="Video call"
+        on:click={() => startCall(participantId, participantUsername, true)}
+      >
+        🎥
+      </button>
+    {/if}
   </div>
 
   <!-- Messages -->
