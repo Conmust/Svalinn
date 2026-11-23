@@ -203,8 +203,11 @@ export async function acceptCall() {
     }
   } catch (e) {
     console.error('Failed to accept call:', e);
-    if (current.peerId) sendSignal('call-reject', current.peerId);
-    endCall(mediaErrorMessage(e));
+    const reason = mediaErrorMessage(e);
+    // Distinguish "couldn't accept" from an actual decline so the caller
+    // sees why the call ended instead of being told it was declined.
+    if (current.peerId) sendSignal('call-reject', current.peerId, { reason });
+    endCall(reason);
   }
 }
 
@@ -248,6 +251,12 @@ function mediaErrorMessage(e: unknown): string {
   }
   if (e instanceof DOMException && e.name === 'NotFoundError') {
     return 'No camera/microphone found';
+  }
+  if (e instanceof DOMException && e.name === 'NotReadableError') {
+    // Thrown when the camera/mic is already claimed by another
+    // application or browser tab -- common when testing two accounts on
+    // one machine, which only has one camera between them.
+    return 'Camera/microphone already in use elsewhere';
   }
   return 'Call failed';
 }
@@ -301,7 +310,7 @@ export function initCallSignaling() {
     callState.update((s) => ({ ...s, status: 'connecting' }));
   });
 
-  wsClient.on('call-reject', () => endCall('Call declined'));
+  wsClient.on('call-reject', (data: { reason?: string }) => endCall(data?.reason || 'Call declined'));
   wsClient.on('call-busy', () => endCall('User is busy'));
   wsClient.on('call-cancel', () => endCall('Call cancelled'));
   wsClient.on('call-hangup', () => endCall(null));
