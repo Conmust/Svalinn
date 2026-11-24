@@ -132,9 +132,23 @@ async function createPeerConnection(peerId: string): Promise<RTCPeerConnection> 
   return connection;
 }
 
+// Explicit audio constraints rather than `audio: true`. Chromium's WebView2
+// (what the desktop app runs on Windows) applies its own built-in noise
+// suppression/echo cancellation/gain control when these are requested, same
+// as a regular Chrome tab -- this is NOT RNNoise specifically (a real RNNoise
+// pipeline needs a WASM build run through an AudioWorklet, which isn't
+// bundled here; see the comment on `NOISE_SUPPRESSION_AVAILABLE` below for
+// why), but it's the same baseline improvement most calling apps ship with
+// no extra dependencies, and it's a real step up from the raw mic signal.
+const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
 async function acquireLocalMedia(withVideo: boolean): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: true,
+    audio: AUDIO_CONSTRAINTS,
     video: withVideo,
   });
   localMedia = stream;
