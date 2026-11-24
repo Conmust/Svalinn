@@ -3,6 +3,15 @@
   import { getAuthHeaders, apiFetch, fileUrl, apiBase } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import { fetchServerEmojis, uploadEmoji, deleteEmoji, type CustomEmoji } from '../lib/emojis';
+  import {
+    listRoles,
+    createRole,
+    updateRole,
+    deleteRole,
+    myServerPermissions,
+    PERMISSION_INFO,
+    type Role,
+  } from '../lib/roles';
 
   export let serverId: string;
   export let serverName: string = '';
@@ -11,13 +20,19 @@
 
   const dispatch = createEventDispatcher();
 
-  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' = 'overview';
+  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' | 'roles' = 'overview';
 
   // Your rank here: 4 owner, 3 admin, 2 moderator, 1 member.
   let myRank = 1;
   let isServerOwner = false;
   $: canModerate = myRank >= 2;
   $: canEditServer = myRank >= 3;
+
+  // Resolved permission names (see permissions.rs) -- rank alone doesn't
+  // account for a custom role granting MANAGE_ROLES to someone below admin
+  // rank, so the Roles tab is gated on this instead of myRank.
+  let myPermissions: string[] = [];
+  $: canManageRoles = myPermissions.includes('administrator') || myPermissions.includes('manage_roles');
 
   interface Invite {
     code: string;
@@ -162,6 +177,7 @@
     if (tab === 'emojis') loadEmojis();
     if (tab === 'invites') loadInvites();
     if (tab === 'bans') loadBans();
+    if (tab === 'roles') loadRoles();
   }
   let emojis: CustomEmoji[] = [];
   let loading = false;
@@ -181,6 +197,11 @@
       }
     } catch {
       // keep the member view
+    }
+    try {
+      myPermissions = await myServerPermissions(serverId);
+    } catch {
+      // Roles tab just stays hidden if this fails.
     }
     // Load the current values first. Saving the form sends every field, so
     // saving with unloaded defaults would wipe the server's real name/icon.
@@ -271,6 +292,121 @@
       alert(e.message);
     }
   }
+
+  // --- Roles ---
+
+  let roles: Role[] = [];
+  let rolesLoading = false;
+  let rolesError = '';
+
+  // null = form closed; otherwise the role being edited, or 'new' for create.
+  let editingRole: Role | 'new' | null = null;
+  let formName = '';
+  let formColor = '#99aab5';
+  let formPermissions = new Set<string>();
+  let roleFormError = '';
+  let roleFormBusy = false;
+
+  // Only permissions the actor holds themselves are offered -- the server
+  // rejects granting a bit you don't hold yourself (see reject_ungranted_bits
+  // in roles.rs), so there's no point showing a checkbox that would just error.
+  $: grantablePermissions = PERMISSION_INFO.filter(
+    p => myPermissions.includes('administrator') || myPermissions.includes(p.name),
+  );
+
+  async function loadRoles() {
+    rolesLoading = true;
+    rolesError = '';
+    try {
+      roles = await listRoles(serverId);
+    } catch (e: any) {
+      rolesError = e.message;
+    } finally {
+      rolesLoading = false;
+    }
+  }
+
+  function openCreateRole() {
+    editingRole = 'new';
+    formName = '';
+    formColor = '#99aab5';
+    formPermissions = new Set();
+    roleFormError = '';
+  }
+
+  function openEditRole(role: Role) {
+    editingRole = role;
+    formName = role.name;
+    formColor = role.color || '#99aab5';
+    formPermissions = new Set(role.permissions);
+    roleFormError = '';
+  }
+
+  function closeRoleForm() {
+    editingRole = null;
+    roleFormError = '';
+  }
+
+  function togglePermission(name: string) {
+    const next = new Set(formPermissions);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    formPermissions = next;
+  }
+
+  async function saveRole(e: Event) {
+    e.preventDefault();
+    const name = formName.trim();
+    if (!name) return;
+    roleFormBusy = true;
+    roleFormError = '';
+    try {
+      const payload = { name, color: formColor, permissions: Array.from(formPermissions) };
+      if (editingRole === 'new') {
+        await createRole(serverId, payload);
+      } else if (editingRole) {
+        await updateRole(serverId, editingRole.id, payload);
+      }
+      editingRole = null;
+      await loadRoles();
+    } catch (e: any) {
+      roleFormError = e.message;
+    } finally {
+      roleFormBusy = false;
+    }
+  }
+
+  async function handleDeleteRole(role: Role) {
+    if (!confirm(`Delete the "${role.name}" role? Members who have it will lose its permissions.`)) return;
+    rolesError = '';
+    try {
+      await deleteRole(serverId, role.id);
+      await loadRoles();
+    } catch (e: any) {
+      rolesError = e.message;
+    }
+  }
+
+  // Moves a role up/down by swapping its position with its neighbor in the
+  // (position DESC) list -- the default role is excluded (its position is
+  // fixed server-side) and is always last, so it's never a swap target.
+  async function moveRole(index: number, direction: -1 | 1) {
+    const other = index + direction;
+    if (other < 0 || other >= roles.length) return;
+    const a = roles[index];
+    const b = roles[other];
+    if (a.is_default || b.is_default) return;
+    rolesError = '';
+    try {
+      await Promise.all([
+        updateRole(serverId, a.id, { position: b.position }),
+        updateRole(serverId, b.id, { position: a.position }),
+      ]);
+      await loadRoles();
+    } catch (e: any) {
+      rolesError = e.message;
+    }
+  }
 </script>
 
 <!-- Outer Backdrop: Added on:keydown for A11y -->
@@ -328,6 +464,14 @@
           on:click={() => switchTab('bans')}
         >
           Bans
+        </button>
+      {/if}
+      {#if canManageRoles}
+        <button
+          class="flex-1 py-3 text-sm font-semibold {activeTab === 'roles' ? 'text-[#00ff00] border-b-2 border-[#00ff00] bg-[rgba(0,255,0,0.05)]' : 'text-[#00aa00] hover:text-[#00ff00]'}"
+          on:click={() => switchTab('roles')}
+        >
+          Roles
         </button>
       {/if}
     </div>
@@ -514,6 +658,93 @@
                   </div>
                 </div>
                 <button type="button" class="px-2 py-1 text-xs border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black" on:click={() => unban(ban.user_id)}>Unban</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {:else if activeTab === 'roles'}
+        {#if rolesError}
+          <div class="mb-4 text-xs text-red-500">{'>'} {rolesError}</div>
+        {/if}
+
+        {#if editingRole}
+          <!-- Create/edit role form -->
+          <form on:submit={saveRole} class="mb-6 p-4 border border-[#00aa00]/30 bg-[#0a0e0a] space-y-3">
+            <h4 class="text-xs text-[#00aa00] uppercase tracking-wider">
+              {editingRole === 'new' ? 'New Role' : `Edit "${editingRole.name}"`}
+            </h4>
+            <div class="flex gap-3 items-end">
+              <div class="flex-1">
+                <label for="role-name" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Name</label>
+                <input id="role-name" bind:value={formName} type="text" maxlength="50" required
+                  class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none" />
+              </div>
+              <div>
+                <label for="role-color" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Color</label>
+                <input id="role-color" bind:value={formColor} type="color"
+                  class="w-12 h-[38px] bg-black border border-[#00ff00] cursor-pointer" />
+              </div>
+            </div>
+            <div>
+              <div class="block text-xs text-[#00aa00] uppercase tracking-wider mb-2">Permissions</div>
+              <div class="grid grid-cols-2 gap-x-4 gap-y-1 max-h-48 overflow-y-auto pr-2 custom-scrollbar">
+                {#each grantablePermissions as perm}
+                  <label class="flex items-start gap-2 text-xs text-[#00ff00] py-1 cursor-pointer" title={perm.description}>
+                    <input
+                      type="checkbox"
+                      checked={formPermissions.has(perm.name)}
+                      on:change={() => togglePermission(perm.name)}
+                      class="mt-0.5 accent-[#00ff00]"
+                    />
+                    <span>{perm.label}</span>
+                  </label>
+                {/each}
+              </div>
+              {#if grantablePermissions.length < PERMISSION_INFO.length}
+                <p class="text-[10px] text-[#00aa00]/70 mt-2">{'>'} Only showing permissions you hold yourself -- you can't grant what you don't have.</p>
+              {/if}
+            </div>
+            {#if roleFormError}
+              <div class="text-xs text-red-500">{'>'} {roleFormError}</div>
+            {/if}
+            <div class="flex gap-2">
+              <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={closeRoleForm}>Cancel</button>
+              <button type="submit" disabled={roleFormBusy || !formName.trim()} class="flex-1 py-2 bg-[#00ff00] text-black font-bold text-sm hover:bg-[#00aa00] disabled:opacity-40">
+                {editingRole === 'new' ? 'Create role' : 'Save changes'}
+              </button>
+            </div>
+          </form>
+        {:else}
+          <button type="button" class="w-full mb-4 py-2 bg-black border-2 border-[#00ff00] text-[#00ff00] font-semibold uppercase tracking-wider hover:bg-[#00ff00] hover:text-black transition-all terminal-glow" on:click={openCreateRole}>
+            + New Role
+          </button>
+        {/if}
+
+        {#if rolesLoading}
+          <div class="text-[#00aa00] text-xs animate-pulse">{'>'} Loading roles...</div>
+        {:else if roles.length === 0}
+          <div class="text-[#00aa00] text-xs">{'>'} No custom roles yet.</div>
+        {:else}
+          <ul class="space-y-2">
+            {#each roles as role, i (role.id)}
+              <li class="flex items-center gap-3 bg-[#0a0e0a] border border-[#00aa00]/30 px-3 py-2">
+                <span class="w-3 h-3 rounded-full flex-shrink-0" style="background-color: {role.color || '#99aab5'}"></span>
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm text-[#00ff00] truncate">{role.name}{role.is_default ? ' (default)' : ''}</div>
+                  <div class="text-[11px] text-[#00aa00] truncate">
+                    {role.permissions.length === 0 ? 'No permissions' : role.permissions.join(', ')}
+                  </div>
+                </div>
+                {#if !role.is_default}
+                  <div class="flex flex-col">
+                    <button type="button" class="text-[#00aa00] hover:text-[#00ff00] disabled:opacity-20 leading-none" disabled={i === 0} on:click={() => moveRole(i, -1)} title="Move up" aria-label="Move role up">▲</button>
+                    <button type="button" class="text-[#00aa00] hover:text-[#00ff00] disabled:opacity-20 leading-none" disabled={i === roles.length - 1 || roles[i + 1]?.is_default} on:click={() => moveRole(i, 1)} title="Move down" aria-label="Move role down">▼</button>
+                  </div>
+                {/if}
+                <button type="button" class="px-2 py-1 text-xs border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black" on:click={() => openEditRole(role)}>Edit</button>
+                {#if !role.is_default}
+                  <button type="button" class="px-2 py-1 text-xs border border-red-500 text-red-500 hover:bg-red-500 hover:text-black" on:click={() => handleDeleteRole(role)}>Delete</button>
+                {/if}
               </li>
             {/each}
           </ul>
