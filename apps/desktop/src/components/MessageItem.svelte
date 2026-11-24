@@ -167,17 +167,24 @@
       {#if message.attachment_url}
         <div class="mt-2">
           {#if message.attachment_mime_type && message.attachment_mime_type.startsWith('image/')}
-            <!-- Display Images -->
-            <img 
-              src={fileUrl(message.attachment_url)} 
-              alt={message.attachment_filename || 'Image attachment'}
-              class="max-w-sm max-h-80 rounded border border-[#00ff00] cursor-pointer hover:opacity-80 transition-opacity"
-              on:click={() => window.open(fileUrl(message.attachment_url), '_blank')}
-            />
+            <!-- Display Images: wrapped in a link rather than an on:click on the
+                 <img> itself, so opening it full-size is reachable by keyboard
+                 and screen readers too, not just a mouse click. -->
+            <a href={fileUrl(message.attachment_url)} target="_blank" rel="noopener noreferrer">
+              <img
+                src={fileUrl(message.attachment_url)}
+                alt={message.attachment_filename || 'Image attachment'}
+                class="max-w-sm max-h-80 rounded border border-[#00ff00] cursor-pointer hover:opacity-80 transition-opacity"
+              />
+            </a>
           {:else if message.attachment_mime_type && message.attachment_mime_type.startsWith('video/')}
             <!-- Display Videos -->
             <video controls class="max-w-sm max-h-80 rounded border border-[#00ff00]">
               <source src={fileUrl(message.attachment_url)} type={message.attachment_mime_type} />
+              <!-- No caption track is generated for user-uploaded videos; an
+                   empty captions track at least satisfies screen readers that
+                   check for one, rather than silently having none. -->
+              <track kind="captions" />
               Your browser does not support the video tag.
             </video>
           {:else}

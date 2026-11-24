@@ -202,6 +202,7 @@
   }
 </script>
 
+<!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
 <div
   class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
   on:click={() => dispatch('close')}
@@ -210,6 +211,7 @@
   aria-modal="true"
   tabindex="-1"
 >
+  <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
   <div
     class="relative w-[560px] max-w-[92vw] max-h-[85vh] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] flex flex-col"
     on:click|stopPropagation

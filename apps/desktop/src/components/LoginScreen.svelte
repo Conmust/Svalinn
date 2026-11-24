@@ -38,8 +38,9 @@
     <form on:submit|preventDefault={handleSubmit} class="space-y-4">
       {#if isRegistering}
         <div>
-          <label class="block text-sm font-medium text-tungsten mb-2">Username</label>
+          <label for="loginscreen-username" class="block text-sm font-medium text-tungsten mb-2">Username</label>
           <input
+            id="loginscreen-username"
             type="text"
             bind:value={username}
             required
@@ -50,8 +51,9 @@
       {/if}
 
       <div>
-        <label class="block text-sm font-medium text-tungsten mb-2">Email</label>
+        <label for="loginscreen-email" class="block text-sm font-medium text-tungsten mb-2">Email</label>
         <input
+          id="loginscreen-email"
           type="email"
           bind:value={email}
           required
@@ -61,8 +63,9 @@
       </div>
 
       <div>
-        <label class="block text-sm font-medium text-tungsten mb-2">Password</label>
+        <label for="loginscreen-password" class="block text-sm font-medium text-tungsten mb-2">Password</label>
         <input
+          id="loginscreen-password"
           type="password"
           bind:value={password}
           required

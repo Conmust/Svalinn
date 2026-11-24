@@ -4,6 +4,7 @@
   import { fetchUserConversations, createConversation, type Conversation } from '../lib/conversations';
   import { fetchAllUsers, fetchMyProfile, type PublicUser } from '../lib/users';
   import { selfAvatarUrl } from '../lib/selfProfile';
+  import { autofocus } from '../lib/actions';
   import PatronBadge from './PatronBadge.svelte';
   import BetaBadge from './BetaBadge.svelte';
   import Avatar from './Avatar.svelte';
@@ -212,7 +213,7 @@
         type="text"
         class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none"
         placeholder="Search users..."
-        autofocus
+        use:autofocus
       />
 
       {#if pickerError}

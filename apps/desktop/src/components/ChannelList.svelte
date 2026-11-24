@@ -7,6 +7,7 @@
   import { fetchMyProfile } from '../lib/users';
   import { voiceRosters, loadVoiceRosters } from '../lib/voiceChannel';
   import { myServerPermissions } from '../lib/roles';
+  import { autofocus } from '../lib/actions';
   import ServerSettings from './ServerSettings.svelte';
   import ChannelOverwrites from './ChannelOverwrites.svelte';
   import Avatar from './Avatar.svelte';
@@ -355,14 +356,17 @@
 
   <!-- Create Channel Modal -->
   {#if showCreateChannelModal}
-    <div 
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" 
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+    <div
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
       on:click={() => showCreateChannelModal = false}
       on:keydown={(e) => e.key === 'Escape' && (showCreateChannelModal = false)}
       role="dialog" aria-modal="true" tabindex="-1"
     >
-      <div 
-        class="relative w-[400px] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-6" 
+      <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+      <!-- svelte-ignore a11y-click-events-have-key-events -->
+      <div
+        class="relative w-[400px] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] p-6"
         on:click|stopPropagation role="document"
       >
         <h3 class="text-lg font-bold text-[#00ff00] uppercase tracking-widest mb-4 terminal-glow">{'>'} Create Channel</h3>
@@ -372,7 +376,7 @@
             <input 
               id="new-channel-name" bind:value={newChannelName} type="text" 
               class="w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" 
-              placeholder="e.g., general" required autofocus
+              placeholder="e.g., general" required use:autofocus
             />
           </div>
           <fieldset>

@@ -410,18 +410,20 @@
 </script>
 
 <!-- Outer Backdrop: Added on:keydown for A11y -->
-<div 
-  class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" 
-  on:click={() => dispatch('close')} 
+<!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+<div
+  class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+  on:click={() => dispatch('close')}
   on:keydown={(e) => e.key === 'Escape' && dispatch('close')}
-  role="dialog" 
+  role="dialog"
   aria-modal="true"
   tabindex="-1"
 >
   <!-- Inner Modal Content -->
-  <div 
-    class="relative w-[600px] max-w-[90vw] max-h-[80vh] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] flex flex-col" 
-    on:click|stopPropagation 
+  <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+  <div
+    class="relative w-[600px] max-w-[90vw] max-h-[80vh] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] flex flex-col"
+    on:click|stopPropagation
     on:keydown|stopPropagation
     role="document"
   >
