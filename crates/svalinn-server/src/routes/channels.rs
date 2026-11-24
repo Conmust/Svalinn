@@ -12,7 +12,7 @@ use crate::models::message::BroadcastMessage;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
-use crate::permissions::{resolve_server, Permission};
+use crate::permissions::{resolve_channel, resolve_server, Permission};
 
 #[derive(Serialize, FromRow)]
 pub struct Channel {
@@ -42,6 +42,13 @@ fn clean_channel_type(channel_type: Option<String>) -> Result<String, AppError> 
 }
 
 /// GET /api/v1/servers/:server_id/channels
+///
+/// Only returns channels the caller can actually view -- a channel
+/// where a role/member overwrite denies `VIEW_CHANNEL` (a private
+/// channel) is simply absent, the same way it's absent from message
+/// reads (`messages::get_channel_messages` already requires
+/// `VIEW_CHANNEL`; this is the list-level counterpart, so a hidden
+/// channel never even shows up to be clicked).
 pub async fn get_server_channels(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
@@ -72,7 +79,14 @@ pub async fn get_server_channels(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(channels))
+    let mut visible = Vec::with_capacity(channels.len());
+    for channel in channels {
+        if resolve_channel(&db, channel.id, user_id).await?.has(Permission::VIEW_CHANNEL) {
+            visible.push(channel);
+        }
+    }
+
+    Ok(Json(visible))
 }
 
 /// POST /api/v1/servers/:server_id/channels
