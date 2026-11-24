@@ -5,6 +5,7 @@
   import { wsClient } from '../lib/websocket';
   import { selfAvatarUrl } from '../lib/selfProfile';
   import { fetchMyProfile } from '../lib/users';
+  import { voiceRosters, loadVoiceRosters } from '../lib/voiceChannel';
   import ServerSettings from './ServerSettings.svelte';
   import Avatar from './Avatar.svelte';
 
@@ -42,6 +43,7 @@
   $: if (activeServer) {
     loadChannels(activeServer);
     loadRank(activeServer);
+    loadVoiceRosters(activeServer);
   }
 
   async function loadRank(serverId: string) {
@@ -273,6 +275,17 @@
             <div class="text-sm terminal-glow truncate {channel.id === activeChannel || channel.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
               {channel.channel_type === 'voice' ? '🔊' : '#'} {channel.name}
             </div>
+            {#if channel.channel_type === 'voice' && ($voiceRosters.get(channel.id)?.length ?? 0) > 0}
+              <!-- Who's currently in this voice channel, Discord-style --
+                   shown whether or not it's the active selection, since
+                   "active" here only means "its panel is open", not
+                   "connected" (see VoiceChannelView.svelte). -->
+              <div class="text-xs text-[#006600] truncate pl-1">
+                {#each $voiceRosters.get(channel.id) ?? [] as p (p.userId)}
+                  <span class="mr-1">{p.muted ? '🔇' : '🎤'} {p.username}</span>
+                {/each}
+              </div>
+            {/if}
           </div>
         </button>
         {#if canManageChannels}

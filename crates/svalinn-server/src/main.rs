@@ -10,6 +10,7 @@ mod presence;
 mod rate_limit;
 mod sessions;
 mod tiers;
+mod voice;
 mod routes;
 
 use axum::{
@@ -154,6 +155,14 @@ async fn main() {
             "/api/v1/channels/:channel_id/member-devices",
             get(routes::channels::get_channel_member_devices),
         )
+
+        // --- Voice Channel Routes: join/leave/mute go over REST; the
+        // WebRTC mesh those joins set up is signaled over the WS instead
+        // (see the "voice-*" events in routes/ws.rs). ---
+        .route("/api/v1/channels/:channel_id/voice/join", post(routes::voice::join_voice_channel))
+        .route("/api/v1/channels/:channel_id/voice/leave", post(routes::voice::leave_voice_channel))
+        .route("/api/v1/channels/:channel_id/voice/state", patch(routes::voice::set_voice_state))
+        .route("/api/v1/servers/:server_id/voice-rosters", get(routes::voice::get_server_voice_rosters))
 
         // --- Roles & Permissions Routes ---
         .route(

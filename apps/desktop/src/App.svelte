@@ -14,14 +14,17 @@
   import DMList from './components/DMList.svelte';
   import DMChatArea from './components/DMChatArea.svelte';
   import CallOverlay from './components/CallOverlay.svelte';
+  import VoiceChannelView from './components/VoiceChannelView.svelte';
   import { initCallSignaling } from './lib/calls';
+  import { initVoiceSignaling } from './lib/voiceChannel';
   import type { Conversation } from './lib/conversations';
   import type { Channel } from './lib/servers';
 
-  // Registers the WS listeners that drive incoming/outgoing calls. Only
-  // needs to happen once -- `wsClient.on` just adds listeners, independent
-  // of connect/reconnect cycles below.
+  // Registers the WS listeners that drive incoming/outgoing calls and voice
+  // channels. Only needs to happen once -- `wsClient.on` just adds
+  // listeners, independent of connect/reconnect cycles below.
   initCallSignaling();
+  initVoiceSignaling();
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
@@ -246,11 +249,11 @@
          there's no empty placeholder stranded with no way back to 'nav'. -->
     <div class="flex-1 min-w-0 {mobileView === 'chat' ? 'flex' : 'hidden'} md:flex">
       {#if activeChannel && activeServer && activeChannel.channel_type === 'voice'}
-        <!-- Voice channels aren't wired up yet; be honest instead of showing a chat view. -->
-        <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow">
-          <div class="text-4xl mb-4">🔊</div>
-          <div class="text-xl font-bold">{'>'} Voice channels aren't supported yet</div>
-        </div>
+        <VoiceChannelView
+          channelId={activeChannel.id}
+          channelName={activeChannel.name}
+          serverId={activeServer}
+        />
       {:else if activeChannel && activeServer}
         <ChatArea
           channelId={activeChannel.id}

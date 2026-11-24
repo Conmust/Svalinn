@@ -29,6 +29,15 @@ const RELAYABLE_EVENT_TYPES: &[&str] = &[
     "ice-candidate",
 ];
 
+/// Signaling for a voice channel's WebRTC mesh (see `routes/voice.rs` and
+/// the client's `lib/voiceChannel.ts`). Kept separate from
+/// `RELAYABLE_EVENT_TYPES` above because it's authorized differently: a DM
+/// call's offer/answer/ICE events are allowed between two users who share
+/// a conversation, but these carry a `channel_id` instead and are only
+/// relayed between two users who are both currently joined to that voice
+/// channel (see `relay_voice_signal`).
+const VOICE_SIGNAL_EVENT_TYPES: &[&str] = &["voice-offer", "voice-answer", "voice-ice-candidate"];
+
 #[derive(Deserialize)]
 struct ClientEvent {
     #[serde(rename = "type")]
@@ -180,19 +189,40 @@ async fn handle_socket_connection(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_task).await;
     db.connections.unregister(conn_id);
     crate::presence::disconnected(&db, user_id).await;
+
+    // Also drop them from any voice channel they were in. A closed socket
+    // (a crash, a closed laptop lid) never gets to call the `leave`
+    // endpoint itself, so without this the roster -- and everyone else's
+    // WebRTC mesh with them -- would be stuck thinking they're still there.
+    for channel_id in db.voice.leave_all(user_id).await {
+        if let Ok(server_id) = crate::access::channel_server_id(&db, channel_id).await {
+            let _ = db.message_tx.send(BroadcastMessage::to_server(
+                "voice_participant_left",
+                serde_json::json!({ "channel_id": channel_id, "user_id": user_id }),
+                server_id,
+            ));
+        }
+    }
+
     println!("🔌 User {} disconnected from WebSocket", user_id);
 }
 
-/// Relays an allow-listed client event (call signaling) to its target user,
-/// after checking the sender and target actually share a DM conversation --
-/// without that, the WS could otherwise be used to ring or message any
-/// user id a client cares to send, not just people already in your DMs.
+/// Dispatches an allow-listed client event to the right relay, based on
+/// which list of event types it belongs to.
 async fn handle_client_message(db: &Database, from_user: Uuid, text: &str) {
-    let Ok(mut event) = serde_json::from_str::<ClientEvent>(text) else { return };
-    if !RELAYABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
-        return;
+    let Ok(event) = serde_json::from_str::<ClientEvent>(text) else { return };
+    if RELAYABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
+        relay_dm_signal(db, from_user, event).await;
+    } else if VOICE_SIGNAL_EVENT_TYPES.contains(&event.event_type.as_str()) {
+        relay_voice_signal(db, from_user, event).await;
     }
+}
 
+/// Relays a 1:1 call-signaling event to its target user, after checking the
+/// sender and target actually share a DM conversation -- without that, the
+/// WS could otherwise be used to ring or message any user id a client cares
+/// to send, not just people already in your DMs.
+async fn relay_dm_signal(db: &Database, from_user: Uuid, mut event: ClientEvent) {
     let Some(payload_map) = event.payload.as_object_mut() else { return };
     // `to_user` rides inside the payload (see the `ClientEvent` comment
     // above); pull it out here and don't forward it, since it'd otherwise
@@ -228,6 +258,35 @@ async fn handle_client_message(db: &Database, from_user: Uuid, text: &str) {
     // server-side rather than trusting a client-supplied `from_user`.
     payload_map.insert("from_user".to_string(), serde_json::Value::String(from_user.to_string()));
 
+    let _ = db.message_tx.send(BroadcastMessage::to_user(&event.event_type, event.payload, to_user));
+}
+
+/// Relays a voice-channel signaling event (see `routes/voice.rs`) to its
+/// target user, after checking the sender and target are both currently
+/// joined to the `channel_id` carried in the payload -- the channel-voice
+/// equivalent of `relay_dm_signal`'s shared-conversation check, since
+/// there's no DM to look up here.
+async fn relay_voice_signal(db: &Database, from_user: Uuid, mut event: ClientEvent) {
+    let Some(payload_map) = event.payload.as_object_mut() else { return };
+    let Some(to_user) = payload_map.remove("to_user").and_then(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok())) else {
+        return;
+    };
+    if to_user == from_user {
+        return;
+    }
+    let Some(channel_id) = payload_map
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return;
+    };
+
+    if !db.voice.contains(channel_id, from_user).await || !db.voice.contains(channel_id, to_user).await {
+        return;
+    }
+
+    payload_map.insert("from_user".to_string(), serde_json::Value::String(from_user.to_string()));
     let _ = db.message_tx.send(BroadcastMessage::to_user(&event.event_type, event.payload, to_user));
 }
 
