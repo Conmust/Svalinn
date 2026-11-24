@@ -3,6 +3,7 @@
   import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
   import { wsClient } from '../lib/websocket';
   import { fetchUserProfile, setMyNickname, adminSetNickname, type UserProfile } from '../lib/users';
+  import { listRoles, assignRole, unassignRole, myServerPermissions, type Role } from '../lib/roles';
   import PatronBadge from './PatronBadge.svelte';
   import BetaBadge from './BetaBadge.svelte';
   import UserProfileModal from './UserProfileModal.svelte';
@@ -26,6 +27,8 @@
     avatar_url?: string | null;
     badge_emblem?: string | null;
     has_beta_badge?: boolean;
+    /** Custom (non-default) role ids this member currently holds. */
+    role_ids: string[];
   }
 
   /** What to actually show: the nickname set in this server, or the username. */
@@ -86,6 +89,49 @@
   ].filter(r => r.rank < myRank);
   $: canChangeRoles = myRank >= 3;
   $: canTransfer = isServerOwner || myRank >= 5;
+
+  // Custom (per-server) roles, separate from the simple owner/admin/
+  // moderator/member rank above -- see lib/roles.ts and migration 0036.
+  let roles: Role[] = [];
+  let myPermissions: string[] = [];
+  $: canManageCustomRoles = myPermissions.includes('administrator') || myPermissions.includes('manage_roles');
+  // Same owner bypass as `canTransfer`: the server/site owner can assign any
+  // role; anyone else (even with manage_roles) can only assign a role ranked
+  // strictly below the highest custom role they themselves hold -- mirrors
+  // require_role_management/require_below_actor_rank in roles.rs.
+  $: isOwnerBypass = isServerOwner || myRank >= 5;
+  $: myMaxRolePosition = (() => {
+    const me = members.find(m => m.id === currentUser?.id);
+    if (!me || !me.role_ids?.length) return -1;
+    return Math.max(-1, ...roles.filter(r => me.role_ids.includes(r.id)).map(r => r.position));
+  })();
+  $: assignableCustomRoles = roles.filter(r => !r.is_default && (isOwnerBypass || r.position < myMaxRolePosition));
+
+  // Dedicated handler, not an inline `as HTMLInputElement` cast in the
+  // template -- svelte-check's parser chokes on an inline cast there (see
+  // the same fix already applied to handleFileChange in ServerSettings.svelte).
+  function handleCustomRoleChange(e: Event, role: Role) {
+    const checked = (e.target as HTMLInputElement).checked;
+    toggleCustomRole(role, checked);
+  }
+
+  async function toggleCustomRole(role: Role, checked: boolean) {
+    if (!managing || !serverId) return;
+    const target = managing;
+    actionBusy = true;
+    actionError = '';
+    try {
+      if (checked) await assignRole(serverId, target.id, role.id);
+      else await unassignRole(serverId, target.id, role.id);
+      const roleIds = checked ? [...target.role_ids, role.id] : target.role_ids.filter(id => id !== role.id);
+      members = members.map(x => (x.id === target.id ? { ...x, role_ids: roleIds } : x));
+      managing = { ...target, role_ids: roleIds };
+    } catch (e: any) {
+      actionError = e.message || 'Failed to update roles';
+    } finally {
+      actionBusy = false;
+    }
+  }
 
   function openManage(member: Member) {
     managing = member;
@@ -183,6 +229,22 @@
     }
   }
 
+  async function loadRoles(id: string) {
+    try {
+      roles = await listRoles(id);
+    } catch {
+      roles = [];
+    }
+  }
+
+  async function loadMyPermissions(id: string) {
+    try {
+      myPermissions = await myServerPermissions(id);
+    } catch {
+      myPermissions = [];
+    }
+  }
+
   const statusOrder = ['online', 'idle', 'busy', 'away', 'invisible', 'offline'];
 
   const statusConfig = {
@@ -197,6 +259,8 @@
   $: if (serverId) {
     loadMembers(serverId);
     loadMyRank(serverId);
+    loadRoles(serverId);
+    loadMyPermissions(serverId);
   }
 
   // Someone joined, left, was kicked, banned or had their role changed.
@@ -213,12 +277,33 @@
     );
   }
 
+  // A custom role was created, edited or deleted -- refresh the role list
+  // (names, colors, positions) so e.g. an open Manage dialog's checkbox
+  // list stays in sync with someone else's change in Server Settings.
+  function onRoleChange(data: { server_id: string }) {
+    if (!serverId || data.server_id !== serverId) return;
+    loadRoles(serverId);
+  }
+
+  // A member's custom roles were assigned/unassigned (by anyone, from
+  // anywhere) -- refresh the member list so role_ids stays accurate.
+  function onMemberRoleChange(data: { server_id: string }) {
+    if (!serverId || data.server_id !== serverId) return;
+    loadMembers(serverId);
+    if (data.server_id === serverId) loadMyPermissions(serverId);
+  }
+
   onMount(() => {
     wsClient.connect();
     wsClient.on('presence_updated', onPresence);
     wsClient.on('member_joined', onMembershipChange);
     wsClient.on('member_left', onMembershipChange);
     wsClient.on('member_updated', onMembershipChange);
+    wsClient.on('role_created', onRoleChange);
+    wsClient.on('role_updated', onRoleChange);
+    wsClient.on('role_deleted', onRoleChange);
+    wsClient.on('member_role_assigned', onMemberRoleChange);
+    wsClient.on('member_role_unassigned', onMemberRoleChange);
   });
 
   onDestroy(() => {
@@ -226,6 +311,11 @@
     wsClient.off('member_joined', onMembershipChange);
     wsClient.off('member_left', onMembershipChange);
     wsClient.off('member_updated', onMembershipChange);
+    wsClient.off('role_created', onRoleChange);
+    wsClient.off('role_updated', onRoleChange);
+    wsClient.off('role_deleted', onRoleChange);
+    wsClient.off('member_role_assigned', onMemberRoleChange);
+    wsClient.off('member_role_unassigned', onMemberRoleChange);
   });
 
   $: groupedMembers = statusOrder.map(status => ({
@@ -372,6 +462,26 @@
             <button type="button" class="w-full py-2 border border-[#00aa00] text-[#00aa00] text-sm hover:bg-[#00aa00]/10" on:click={() => openNicknameEditor(m)}>
               Set nickname{m.nickname ? ` (currently "${m.nickname}")` : ''}
             </button>
+          {/if}
+          {#if canManageCustomRoles && assignableCustomRoles.length > 0}
+            <div>
+              <div class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Custom roles</div>
+              <div class="space-y-1 max-h-32 overflow-y-auto pr-1 custom-scrollbar">
+                {#each assignableCustomRoles as role (role.id)}
+                  <label class="flex items-center gap-2 text-xs text-[#00ff00] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={m.role_ids.includes(role.id)}
+                      disabled={actionBusy}
+                      on:change={(e) => handleCustomRoleChange(e, role)}
+                      class="accent-[#00ff00]"
+                    />
+                    <span class="w-2 h-2 rounded-full flex-shrink-0" style="background-color: {role.color || '#99aab5'}"></span>
+                    <span>{role.name}</span>
+                  </label>
+                {/each}
+              </div>
+            </div>
           {/if}
           <div class="grid grid-cols-2 gap-2">
             <button type="button" class="py-2 border border-[#ffaa00] text-[#ffaa00] text-sm hover:bg-[#ffaa00] hover:text-black" on:click={() => (mode = 'kick')}>Kick</button>
