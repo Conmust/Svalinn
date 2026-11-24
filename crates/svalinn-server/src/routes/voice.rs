@@ -22,6 +22,7 @@ use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
 use crate::models::message::BroadcastMessage;
+use crate::permissions::{require_channel_permission, resolve_channel, Permission};
 use crate::voice::VoiceParticipant;
 
 /// A channel must actually be a voice channel to be joined -- joining a
@@ -56,7 +57,7 @@ pub async fn join_voice_channel(
     Path(channel_id): Path<Uuid>,
 ) -> Result<Json<Vec<VoiceParticipant>>, AppError> {
     let server_id = require_voice_channel(&db, channel_id).await?;
-    require_member(&db, server_id, user_id).await?;
+    require_channel_permission(&db, channel_id, user_id, Permission::VIEW_CHANNEL).await?;
 
     let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
         .bind(user_id)
@@ -143,5 +144,14 @@ pub async fn get_server_voice_rosters(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(db.voice.rosters(&voice_channel_ids).await))
+    // Don't leak who's in a voice channel the caller can't even view --
+    // same private-channel overwrites that gate reading messages.
+    let mut visible_ids = Vec::with_capacity(voice_channel_ids.len());
+    for channel_id in voice_channel_ids {
+        if resolve_channel(&db, channel_id, user_id).await?.has(Permission::VIEW_CHANNEL) {
+            visible_ids.push(channel_id);
+        }
+    }
+
+    Ok(Json(db.voice.rosters(&visible_ids).await))
 }
