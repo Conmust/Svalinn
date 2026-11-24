@@ -37,6 +37,13 @@ pub struct ServerMember {
     pub avatar_url: Option<String>,
     pub badge_emblem: Option<String>,
     pub has_beta_badge: bool,
+    /// Every custom (non-default) role this member currently holds in this
+    /// server, so a client can show which roles are already assigned
+    /// before letting an admin add/remove one (see `routes::roles`). The
+    /// server's default ("@everyone") role is implicit for every member
+    /// and deliberately left out of this list -- there's nothing to
+    /// assign or unassign about it.
+    pub role_ids: Vec<Uuid>,
 }
 
 pub async fn get_server_members(
@@ -61,7 +68,12 @@ pub async fn get_server_members(
                 COALESCE(u.patron_tier, 'free') AS patron_tier,
                 u.avatar_url,
                 u.badge_emblem,
-                u.has_beta_badge
+                u.has_beta_badge,
+                COALESCE(
+                    (SELECT ARRAY_AGG(mr.role_id) FROM member_roles mr
+                     WHERE mr.server_id = sm.server_id AND mr.user_id = u.id),
+                    ARRAY[]::uuid[]
+                ) AS role_ids
             FROM server_members sm
             JOIN users u ON sm.user_id = u.id
             JOIN servers s ON s.id = sm.server_id
