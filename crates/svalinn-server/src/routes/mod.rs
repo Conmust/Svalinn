@@ -15,4 +15,3 @@ pub mod emojis;
 pub mod channels;
 pub mod invites;
 pub mod roles;
-pub mod voice;
