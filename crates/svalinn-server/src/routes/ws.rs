@@ -180,6 +180,7 @@ async fn handle_socket_connection(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_task).await;
     db.connections.unregister(conn_id);
     crate::presence::disconnected(&db, user_id).await;
+    crate::voice::leave_all_for_user(&db, user_id).await;
     println!("🔌 User {} disconnected from WebSocket", user_id);
 }
 

@@ -5,6 +5,7 @@
   import { wsClient } from '../lib/websocket';
   import { selfAvatarUrl } from '../lib/selfProfile';
   import { fetchMyProfile } from '../lib/users';
+  import { voiceParticipants } from '../lib/voiceChannels';
   import ServerSettings from './ServerSettings.svelte';
   import Avatar from './Avatar.svelte';
 
@@ -272,6 +273,9 @@
                  look as distinct as "unread", not just a faint tint. -->
             <div class="text-sm terminal-glow truncate {channel.id === activeChannel || channel.has_unread ? 'text-[#00ff00] font-bold' : 'text-[#00aa00]'}">
               {channel.channel_type === 'voice' ? '🔊' : '#'} {channel.name}
+              {#if channel.channel_type === 'voice' && $voiceParticipants[channel.id]?.length}
+                <span class="text-xs text-[#006600]">· {$voiceParticipants[channel.id].length}</span>
+              {/if}
             </div>
           </div>
         </button>

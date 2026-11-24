@@ -10,6 +10,7 @@ pub struct Database {
     pub presence: Arc<crate::presence::Presence>,
     pub connections: Arc<crate::sessions::Connections>,
     pub limits: Arc<crate::rate_limit::RateLimiter>,
+    pub voice_channels: Arc<crate::voice::VoiceChannels>,
 }
 
 impl Database {
@@ -19,6 +20,13 @@ impl Database {
         // Create a broadcast channel with a capacity of 1000 messages
         let (message_tx, _) = broadcast::channel(1000);
         
-        Ok(Self { pool, message_tx, presence: Arc::default(), connections: Arc::default(), limits: Arc::default() })
+        Ok(Self {
+            pool,
+            message_tx,
+            presence: Arc::default(),
+            connections: Arc::default(),
+            limits: Arc::default(),
+            voice_channels: Arc::default(),
+        })
     }
 }
