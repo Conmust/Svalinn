@@ -6,7 +6,9 @@
   import { selfAvatarUrl } from '../lib/selfProfile';
   import { fetchMyProfile } from '../lib/users';
   import { voiceRosters, loadVoiceRosters } from '../lib/voiceChannel';
+  import { myServerPermissions } from '../lib/roles';
   import ServerSettings from './ServerSettings.svelte';
+  import ChannelOverwrites from './ChannelOverwrites.svelte';
   import Avatar from './Avatar.svelte';
 
   export let currentUser: any;
@@ -39,11 +41,23 @@
   let renameValue = '';
   let deleting: Channel | null = null;
   let channelActionError = '';
+  let managingPermissions: Channel | null = null;
+
+  // Per-channel overwrites need manage_channels or manage_roles -- same
+  // server-wide resolved permissions the overwrite endpoints themselves
+  // check (require_channel_overwrite_management in roles.rs), not just the
+  // legacy rank myRank already covers.
+  let myPermissions: string[] = [];
+  $: canManageOverwrites =
+    myPermissions.includes('administrator') ||
+    myPermissions.includes('manage_channels') ||
+    myPermissions.includes('manage_roles');
 
   $: if (activeServer) {
     loadChannels(activeServer);
     loadRank(activeServer);
     loadVoiceRosters(activeServer);
+    loadMyPermissions(activeServer);
   }
 
   async function loadRank(serverId: string) {
@@ -52,6 +66,14 @@
       if (res.ok) myRank = (await res.json()).rank ?? 1;
     } catch {
       myRank = 1;
+    }
+  }
+
+  async function loadMyPermissions(serverId: string) {
+    try {
+      myPermissions = await myServerPermissions(serverId);
+    } catch {
+      myPermissions = [];
     }
   }
 
@@ -258,7 +280,7 @@
         <div class="relative group mb-1">
         <button
           type="button"
-          class="w-full text-left px-3 py-2 rounded border-l-2 transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)] border-[#00ff00]' : 'border-transparent hover:bg-[rgba(0,255,0,0.1)] ' + (channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')} {canManageChannels ? 'pr-14' : ''}"
+          class="w-full text-left px-3 py-2 rounded border-l-2 transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)] border-[#00ff00]' : 'border-transparent hover:bg-[rgba(0,255,0,0.1)] ' + (channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')} {canManageChannels && canManageOverwrites ? 'pr-20' : canManageChannels || canManageOverwrites ? 'pr-14' : ''}"
           aria-current={channel.id === activeChannel ? 'page' : undefined}
           on:click={() => handleChannelClick(channel)}
         >
@@ -288,10 +310,15 @@
             {/if}
           </div>
         </button>
-        {#if canManageChannels}
+        {#if canManageChannels || canManageOverwrites}
           <div class="absolute right-1 top-1/2 -translate-y-1/2 hidden group-hover:flex group-focus-within:flex gap-1">
-            <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Rename channel" aria-label="Rename {channel.name}" on:click={() => startRename(channel)}>✎</button>
-            <button type="button" class="px-1.5 text-xs text-red-500 hover:text-red-400" title="Delete channel" aria-label="Delete {channel.name}" on:click={() => { deleting = channel; channelActionError = ''; }}>✕</button>
+            {#if canManageOverwrites}
+              <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Channel permissions" aria-label="Permissions for {channel.name}" on:click={() => (managingPermissions = channel)}>🔒</button>
+            {/if}
+            {#if canManageChannels}
+              <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Rename channel" aria-label="Rename {channel.name}" on:click={() => startRename(channel)}>✎</button>
+              <button type="button" class="px-1.5 text-xs text-red-500 hover:text-red-400" title="Delete channel" aria-label="Delete {channel.name}" on:click={() => { deleting = channel; channelActionError = ''; }}>✕</button>
+            {/if}
           </div>
         {/if}
         </div>
@@ -403,10 +430,20 @@
 
   <!-- Server Settings Modal -->
   {#if showServerSettings && activeServer}
-    <ServerSettings 
-      serverId={activeServer} 
+    <ServerSettings
+      serverId={activeServer}
       on:close={() => showServerSettings = false}
       on:saved={() => { showServerSettings = false; }}
+    />
+  {/if}
+
+  <!-- Channel Permissions Modal -->
+  {#if managingPermissions && activeServer}
+    <ChannelOverwrites
+      channelId={managingPermissions.id}
+      channelName={managingPermissions.name}
+      serverId={activeServer}
+      on:close={() => (managingPermissions = null)}
     />
   {/if}
 </aside>
