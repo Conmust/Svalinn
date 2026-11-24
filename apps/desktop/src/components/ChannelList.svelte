@@ -133,6 +133,31 @@
     if (data.server_id === activeServer && data.user_id === currentUser?.id) loadRank(activeServer);
   }
 
+  // A channel overwrite, a role's own permission bits, or a role being
+  // created/deleted can all change which channels I can see or what I can
+  // do with them -- re-derive everything for this server rather than
+  // trying to work out client-side whether this particular change
+  // actually affects me. These are infrequent admin actions, so an extra
+  // fetch is cheap; sitting on a stale channel list (showing something I
+  // just lost access to, or hiding something I just gained) is worse.
+  function onPermissionsMayHaveChanged(data: { server_id: string }) {
+    if (data.server_id !== activeServer) return;
+    loadChannels(activeServer);
+    loadRank(activeServer);
+    loadMyPermissions(activeServer);
+  }
+
+  // Assigning/unassigning a role only matters here if it's MY role that
+  // changed -- someone else gaining or losing a role doesn't affect what
+  // I can see.
+  function onMemberRoleChanged(data: { server_id: string; user_id: string }) {
+    if (data.server_id === activeServer && data.user_id === currentUser?.id) {
+      loadChannels(activeServer);
+      loadRank(activeServer);
+      loadMyPermissions(activeServer);
+    }
+  }
+
   function onNewMessage(data: { channel_id?: string; user_id?: string }) {
     if (!data.channel_id || data.channel_id === activeChannel) return;
     if (data.user_id === currentUser?.id) return;
@@ -148,6 +173,11 @@
     wsClient.on('channel_updated', onChannelUpdated);
     wsClient.on('channel_deleted', onChannelDeleted);
     wsClient.on('member_updated', onMemberUpdated);
+    wsClient.on('channel_overwrite_changed', onPermissionsMayHaveChanged);
+    wsClient.on('role_updated', onPermissionsMayHaveChanged);
+    wsClient.on('role_deleted', onPermissionsMayHaveChanged);
+    wsClient.on('member_role_assigned', onMemberRoleChanged);
+    wsClient.on('member_role_unassigned', onMemberRoleChanged);
     // Seeds the self-avatar store with a freshly-signed URL -- a cached
     // one from an earlier login would have an expired signature.
     fetchMyProfile().then(p => selfAvatarUrl.set(p.avatar_url ?? null)).catch(() => {});
@@ -159,6 +189,11 @@
     wsClient.off('channel_updated', onChannelUpdated);
     wsClient.off('channel_deleted', onChannelDeleted);
     wsClient.off('member_updated', onMemberUpdated);
+    wsClient.off('channel_overwrite_changed', onPermissionsMayHaveChanged);
+    wsClient.off('role_updated', onPermissionsMayHaveChanged);
+    wsClient.off('role_deleted', onPermissionsMayHaveChanged);
+    wsClient.off('member_role_assigned', onMemberRoleChanged);
+    wsClient.off('member_role_unassigned', onMemberRoleChanged);
   });
 
    async function loadChannels(serverId: string) {
@@ -170,6 +205,12 @@
       
       if (response.ok) {
         channels = await response.json();
+        // If a permission change (or anything else) just dropped the
+        // channel I was looking at out of this list, navigate away from
+        // it rather than leaving its (now inaccessible) view on screen.
+        if (activeChannel && !channels.some(c => c.id === activeChannel)) {
+          dispatch('channelDeleted', activeChannel);
+        }
       } else if (response.status === 401) {
         console.error("Unauthorized: Token missing or invalid");
         localStorage.clear();

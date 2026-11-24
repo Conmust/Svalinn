@@ -529,6 +529,23 @@ fn validate_overwrite(allow: &[String], deny: &[String]) -> Result<(Bits, Bits),
 
 const OVERWRITE_RANK_ERROR: &str = "You can only set overwrites for a role or member ranked below your own";
 
+/// Tells every client on the server that a channel's permission overwrites
+/// changed, so a client whose access to that channel was just revoked (or
+/// granted) can refresh rather than sitting on a stale view until its next
+/// unrelated re-fetch. Broadcast broadly (like `role_updated` and
+/// `member_role_assigned`/`unassigned` already are) rather than only to
+/// whoever's affected -- this is an infrequent admin action, and working
+/// out exactly who gained or lost access would mean re-deriving
+/// permissions for every member for every edit; each client already knows
+/// to just re-check its own access when it sees this.
+fn broadcast_overwrite_changed(db: &Database, server_id: Uuid, channel_id: Uuid) {
+    let _ = db.message_tx.send(BroadcastMessage::to_server(
+        "channel_overwrite_changed",
+        serde_json::json!({ "server_id": server_id, "channel_id": channel_id }),
+        server_id,
+    ));
+}
+
 /// PUT /api/v1/channels/:channel_id/overwrites/role/:role_id
 pub async fn set_role_overwrite(
     State(db): State<Database>,
@@ -556,6 +573,7 @@ pub async fn set_role_overwrite(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    broadcast_overwrite_changed(&db, server_id, channel_id);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -574,6 +592,7 @@ pub async fn delete_role_overwrite(
         .execute(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    broadcast_overwrite_changed(&db, server_id, channel_id);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -611,6 +630,7 @@ pub async fn set_member_overwrite(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    broadcast_overwrite_changed(&db, server_id, channel_id);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -629,5 +649,6 @@ pub async fn delete_member_overwrite(
         .execute(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    broadcast_overwrite_changed(&db, server_id, channel_id);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
