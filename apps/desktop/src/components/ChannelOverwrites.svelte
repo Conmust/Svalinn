@@ -8,6 +8,7 @@
     setMemberOverwrite,
     deleteMemberOverwrite,
     listRoles,
+    myServerPermissions,
     PERMISSION_INFO,
     type ChannelOverwrites,
     type Role,
@@ -35,6 +36,14 @@
   let loading = true;
   let error = '';
 
+  // The server rejects an *allow* for any bit the actor doesn't hold
+  // themselves (`reject_ungranted_bits` in roles.rs) -- a *deny* has no
+  // such restriction, so only "cycling into allow" needs this check.
+  let myPermissions: string[] = [];
+  function canGrant(permName: string): boolean {
+    return myPermissions.includes('administrator') || myPermissions.includes(permName);
+  }
+
   // Which (kind, id, permission) is mid-request, so only that one button
   // shows busy instead of locking the whole panel.
   let busyKey = '';
@@ -50,9 +59,14 @@
     return 'inherit';
   }
 
-  // Inherit -> Allow -> Deny -> Inherit.
-  function nextState(state: OverwriteState): OverwriteState {
-    if (state === 'inherit') return 'allow';
+  // Inherit -> Allow -> Deny -> Inherit, except that inherit skips straight
+  // to deny when the actor doesn't hold this permission themselves -- they
+  // can still deny it (no restriction there), just not grant what they
+  // don't have. An existing allow set by someone else (or from before the
+  // actor's own permissions changed) still cycles normally; this only
+  // guards the *entry into* allow.
+  function nextState(state: OverwriteState, grantable: boolean): OverwriteState {
+    if (state === 'inherit') return grantable ? 'allow' : 'deny';
     if (state === 'allow') return 'deny';
     return 'inherit';
   }
@@ -79,9 +93,14 @@
     loading = true;
     error = '';
     try {
-      const [ow, rl] = await Promise.all([listChannelOverwrites(channelId), listRoles(serverId)]);
+      const [ow, rl, perms] = await Promise.all([
+        listChannelOverwrites(channelId),
+        listRoles(serverId),
+        myServerPermissions(serverId),
+      ]);
       overwrites = ow;
       roles = rl;
+      myPermissions = perms;
       await loadMembers();
     } catch (e: any) {
       error = e.message || 'Failed to load channel permissions';
@@ -106,7 +125,7 @@
   async function cycleRolePermission(roleId: string, permName: string) {
     const entry = overwrites.roles.find(o => o.role_id === roleId);
     if (!entry) return;
-    const state = nextState(bitsToState(entry.allow, entry.deny, permName));
+    const state = nextState(bitsToState(entry.allow, entry.deny, permName), canGrant(permName));
     const allow = entry.allow.filter(n => n !== permName);
     const deny = entry.deny.filter(n => n !== permName);
     if (state === 'allow') allow.push(permName);
@@ -130,7 +149,7 @@
   async function cycleMemberPermission(userId: string, permName: string) {
     const entry = overwrites.members.find(o => o.user_id === userId);
     if (!entry) return;
-    const state = nextState(bitsToState(entry.allow, entry.deny, permName));
+    const state = nextState(bitsToState(entry.allow, entry.deny, permName), canGrant(permName));
     const allow = entry.allow.filter(n => n !== permName);
     const deny = entry.deny.filter(n => n !== permName);
     if (state === 'allow') allow.push(permName);
@@ -250,12 +269,13 @@
                   <div class="grid grid-cols-2 gap-1">
                     {#each PERMISSION_INFO as perm}
                       {@const state = bitsToState(entry.allow, entry.deny, perm.name)}
+                      {@const grantable = canGrant(perm.name)}
                       <button
                         type="button"
                         disabled={busyKey === `role:${entry.role_id}:${perm.name}`}
-                        class="flex items-center justify-between gap-1 px-2 py-1 border text-[11px] disabled:opacity-50 {stateClass(state)}"
+                        class="flex items-center justify-between gap-1 px-2 py-1 border text-[11px] disabled:opacity-50 {stateClass(state)} {!grantable && state !== 'allow' ? 'opacity-60' : ''}"
                         on:click={() => cycleRolePermission(entry.role_id, perm.name)}
-                        title={perm.description}
+                        title={!grantable && state !== 'allow' ? `${perm.description} -- you don't hold this permission yourself, so you can only deny it here, not allow it` : perm.description}
                       >
                         <span class="truncate">{perm.label}</span>
                         <span class="font-bold">{stateLabel(state)}</span>
@@ -295,12 +315,13 @@
                   <div class="grid grid-cols-2 gap-1">
                     {#each PERMISSION_INFO as perm}
                       {@const state = bitsToState(entry.allow, entry.deny, perm.name)}
+                      {@const grantable = canGrant(perm.name)}
                       <button
                         type="button"
                         disabled={busyKey === `member:${entry.user_id}:${perm.name}`}
-                        class="flex items-center justify-between gap-1 px-2 py-1 border text-[11px] disabled:opacity-50 {stateClass(state)}"
+                        class="flex items-center justify-between gap-1 px-2 py-1 border text-[11px] disabled:opacity-50 {stateClass(state)} {!grantable && state !== 'allow' ? 'opacity-60' : ''}"
                         on:click={() => cycleMemberPermission(entry.user_id, perm.name)}
-                        title={perm.description}
+                        title={!grantable && state !== 'allow' ? `${perm.description} -- you don't hold this permission yourself, so you can only deny it here, not allow it` : perm.description}
                       >
                         <span class="truncate">{perm.label}</span>
                         <span class="font-bold">{stateLabel(state)}</span>
