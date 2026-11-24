@@ -9,6 +9,7 @@ pub mod moderation;
 pub mod reactions;
 pub mod servers;
 pub mod users;
+pub mod voice;
 pub mod ws;
 pub mod uploads;
 pub mod emojis;

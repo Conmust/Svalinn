@@ -10,6 +10,7 @@ mod presence;
 mod rate_limit;
 mod sessions;
 mod tiers;
+mod voice;
 mod routes;
 
 use axum::{
@@ -153,6 +154,14 @@ async fn main() {
         .route(
             "/api/v1/channels/:channel_id/member-devices",
             get(routes::channels::get_channel_member_devices),
+        )
+
+        // --- Voice channel presence (who's connected; not the media layer) ---
+        .route("/api/v1/channels/:channel_id/voice/join", post(routes::voice::join_voice_channel))
+        .route("/api/v1/channels/:channel_id/voice/leave", post(routes::voice::leave_voice_channel))
+        .route(
+            "/api/v1/servers/:server_id/voice-participants",
+            get(routes::voice::get_server_voice_participants),
         )
 
         // --- Roles & Permissions Routes ---
