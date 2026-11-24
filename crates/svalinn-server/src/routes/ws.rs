@@ -9,7 +9,37 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::models::message::BroadcastMessage;
 use crate::sessions::{check_access, AccessDenied};
+
+/// Client-to-server event types the WS forwards to another user, for call
+/// signaling. Everything else a client sends is ignored (see
+/// `handle_client_message`) -- this is deliberately an allow-list, not a
+/// general relay, so the socket can't be used to message arbitrary payloads
+/// to arbitrary users under other event names.
+const RELAYABLE_EVENT_TYPES: &[&str] = &[
+    "call-invite",
+    "call-accept",
+    "call-reject",
+    "call-busy",
+    "call-cancel",
+    "call-hangup",
+    "webrtc-offer",
+    "webrtc-answer",
+    "ice-candidate",
+];
+
+#[derive(Deserialize)]
+struct ClientEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    // The client's `wsClient.send(type, payload)` wraps everything as
+    // `{ type, payload }`, so `to_user` -- set by `sendSignal` in
+    // `lib/calls.ts` -- arrives nested inside `payload`, not as a sibling
+    // of `type`.
+    #[serde(default)]
+    payload: serde_json::Value,
+}
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -129,7 +159,10 @@ async fn handle_socket_connection(
         tokio::select! {
             incoming = receiver.next() => match incoming {
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {} // the client doesn't send anything we act on
+                Some(Ok(Message::Text(text))) => {
+                    handle_client_message(&db, user_id, &text).await;
+                }
+                Some(Ok(_)) => {} // binary/ping/pong frames: nothing to act on
             },
             Some(denied) = kicked.recv() => {
                 // Stop delivering events first, then tell the client why.
@@ -148,6 +181,54 @@ async fn handle_socket_connection(
     db.connections.unregister(conn_id);
     crate::presence::disconnected(&db, user_id).await;
     println!("🔌 User {} disconnected from WebSocket", user_id);
+}
+
+/// Relays an allow-listed client event (call signaling) to its target user,
+/// after checking the sender and target actually share a DM conversation --
+/// without that, the WS could otherwise be used to ring or message any
+/// user id a client cares to send, not just people already in your DMs.
+async fn handle_client_message(db: &Database, from_user: Uuid, text: &str) {
+    let Ok(mut event) = serde_json::from_str::<ClientEvent>(text) else { return };
+    if !RELAYABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
+        return;
+    }
+
+    let Some(payload_map) = event.payload.as_object_mut() else { return };
+    // `to_user` rides inside the payload (see the `ClientEvent` comment
+    // above); pull it out here and don't forward it, since it'd otherwise
+    // land verbatim in the recipient's own `payload.to_user`, holding
+    // their own id right back at them.
+    let Some(to_user) = payload_map.remove("to_user").and_then(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok())) else {
+        return;
+    };
+    if to_user == from_user {
+        return;
+    }
+
+    let shares_conversation: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM conversation_participants a
+            JOIN conversation_participants b ON a.conversation_id = b.conversation_id
+            WHERE a.user_id = $1 AND b.user_id = $2
+        )
+        "#,
+    )
+    .bind(from_user)
+    .bind(to_user)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap_or(false);
+
+    if !shares_conversation {
+        return;
+    }
+
+    // The recipient needs to know who's calling/signaling -- stamp it in
+    // server-side rather than trusting a client-supplied `from_user`.
+    payload_map.insert("from_user".to_string(), serde_json::Value::String(from_user.to_string()));
+
+    let _ = db.message_tx.send(BroadcastMessage::to_user(&event.event_type, event.payload, to_user));
 }
 
 fn close_message(denied: &AccessDenied) -> Message {

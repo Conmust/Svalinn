@@ -31,6 +31,38 @@ services:
       timeout: 5s
       retries: 5
 
+  # TURN/STUN relay for 1:1 voice/video calls. Only needed for a direct P2P
+  # WebRTC connection to fall back to when both peers are behind a NAT that
+  # can't be traversed directly (common on real networks, especially
+  # mobile) -- most calls will still go peer-to-peer without touching this.
+  # Uses coturn's time-limited shared-secret scheme: the server hands out
+  # short-lived credentials (see routes/calls.rs) derived from TURN_SECRET,
+  # so no per-user TURN accounts are needed.
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    container_name: svalinn-coturn
+    environment:
+      TURN_SECRET: ${TURN_SECRET:-change-me-turn-secret}
+      TURN_REALM: ${TURN_REALM:-svalinn.local}
+    command: >
+      -n
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49160
+      --max-port=49200
+      --realm=${TURN_REALM:-svalinn.local}
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET:-change-me-turn-secret}
+      --no-cli
+      --no-multicast-peers
+      --log-file=stdout
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "5349:5349"
+      - "5349:5349/udp"
+      - "49160-49200:49160-49200/udp"
+
 volumes:
   postgres_data:
   redis_data:

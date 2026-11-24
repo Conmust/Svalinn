@@ -4182,6 +4182,7 @@ dependencies = [
  "redis",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 1.0.69",
