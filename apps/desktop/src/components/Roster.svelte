@@ -123,7 +123,8 @@
     try {
       if (checked) await assignRole(serverId, target.id, role.id);
       else await unassignRole(serverId, target.id, role.id);
-      const roleIds = checked ? [...target.role_ids, role.id] : target.role_ids.filter(id => id !== role.id);
+      const currentRoleIds = target.role_ids ?? [];
+      const roleIds = checked ? [...currentRoleIds, role.id] : currentRoleIds.filter(id => id !== role.id);
       members = members.map(x => (x.id === target.id ? { ...x, role_ids: roleIds } : x));
       managing = { ...target, role_ids: roleIds };
     } catch (e: any) {
@@ -331,7 +332,12 @@
         headers: getAuthHeaders(),
       });
       if (response.ok) {
-        members = await response.json();
+        const data: Member[] = await response.json();
+        // Defensive: a server that hasn't picked up the `role_ids` column
+        // yet (stale process, old deploy) would otherwise omit the field
+        // entirely, crashing the custom-roles checkboxes below on
+        // `undefined.includes(...)`. Normalize so it's always an array.
+        members = data.map(m => ({ ...m, role_ids: m.role_ids ?? [] }));
       }
     } catch (e) {
       console.error('Failed to load members:', e);
@@ -471,7 +477,7 @@
                   <label class="flex items-center gap-2 text-xs text-[#00ff00] cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={m.role_ids.includes(role.id)}
+                      checked={(m.role_ids ?? []).includes(role.id)}
                       disabled={actionBusy}
                       on:change={(e) => handleCustomRoleChange(e, role)}
                       class="accent-[#00ff00]"
