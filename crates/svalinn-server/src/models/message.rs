@@ -17,17 +17,31 @@ pub struct BroadcastMessage {
     /// Not sent to clients.
     #[serde(skip)]
     pub to_user: Option<Uuid>,
+    /// If set, only these users receive the event -- e.g. a channel event
+    /// where the recipient list has already been filtered down to members
+    /// who can see that channel (`VIEW_CHANNEL`), computed by the caller
+    /// since by delivery time (especially for a deleted channel) there
+    /// may be no channel left to re-check permissions against. Not sent
+    /// to clients.
+    #[serde(skip)]
+    pub to_users: Option<Vec<Uuid>>,
 }
 
 impl BroadcastMessage {
     /// An event for every member of a server.
     pub fn to_server(event_type: &str, payload: serde_json::Value, server_id: Uuid) -> Self {
-        Self { event_type: event_type.to_string(), payload, server_id: Some(server_id), to_user: None }
+        Self { event_type: event_type.to_string(), payload, server_id: Some(server_id), to_user: None, to_users: None }
     }
 
     /// An event for one user only.
     pub fn to_user(event_type: &str, payload: serde_json::Value, user_id: Uuid) -> Self {
-        Self { event_type: event_type.to_string(), payload, server_id: None, to_user: Some(user_id) }
+        Self { event_type: event_type.to_string(), payload, server_id: None, to_user: Some(user_id), to_users: None }
+    }
+
+    /// An event for a specific, already-computed set of users -- e.g. only
+    /// the members who can see the channel an event is about.
+    pub fn to_users(event_type: &str, payload: serde_json::Value, user_ids: Vec<Uuid>) -> Self {
+        Self { event_type: event_type.to_string(), payload, server_id: None, to_user: None, to_users: Some(user_ids) }
     }
 }
 

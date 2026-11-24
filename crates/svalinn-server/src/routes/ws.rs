@@ -136,6 +136,10 @@ async fn handle_socket_connection(
                 if target != user_id {
                     continue;
                 }
+            } else if let Some(ref recipients) = broadcast_msg.to_users {
+                if !recipients.contains(&user_id) {
+                    continue;
+                }
             } else if let Some(server_id) = broadcast_msg.server_id {
                 let is_member: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
