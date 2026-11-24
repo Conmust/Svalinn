@@ -44,20 +44,3 @@ impl BroadcastMessage {
         Self { event_type: event_type.to_string(), payload, server_id: None, to_user: None, to_users: Some(user_ids) }
     }
 }
-
-#[derive(Debug, Clone, Serialize)]
-pub struct NewMessagePayload {
-    pub id: Uuid,
-    pub channel_id: Uuid,
-    pub user_id: Uuid,
-    pub username: String,
-    pub content: String,
-    pub attachment_url: Option<String>,
-    pub attachment_filename: Option<String>,
-    pub attachment_mime_type: Option<String>,
-    pub attachment_size: Option<i64>,
-    pub is_edited: bool,
-    pub is_locked: bool,
-    pub is_pinned: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
