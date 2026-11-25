@@ -128,6 +128,132 @@ function readStoredKeypair(): DeviceKeypair | null {
   }
 }
 
+// --- Cross-tab/window setup leadership (confidentiality-review followup
+// cases 12-13: "device-identity-split during overlapping registration") ---
+//
+// `keypairPromise` above only dedupes overlapping `ensureDeviceKeypair()`
+// calls WITHIN one already-running page: it's a plain module-level
+// variable, reset to nothing every time this module is freshly loaded. Two
+// browser tabs on the same origin -- or, before the Tauri single-instance
+// guard added alongside this, two separate launches of the desktop app --
+// are two entirely separate instances of this module, each with its OWN
+// `keypairPromise`, sharing only the one `localStorage` backing store
+// between them. If both reach `ensureDeviceKeypair()` before either has
+// persisted a keypair (the common case: right after first login on a
+// brand-new install, nothing saved yet), each one independently generates
+// a keypair and registers it as a brand-new device with the server --
+// splitting what the user thinks of as one install into two separate
+// device registrations. Only one of the two ever ends up referenced by
+// `localStorage` afterwards (whichever written last); the other is an
+// orphaned registration nobody holds the private key for, and anyone who
+// starts an encrypted session with it can never be decrypted by.
+//
+// The guard below is a simple claim-and-settle mutex built entirely out of
+// `localStorage`, since that's the one thing guaranteed to be shared and
+// available everywhere this runs (unlike, say, the Web Locks API, whose
+// support varies across the different native webviews Tauri uses per
+// platform). It does NOT need to be clever about who "wins" -- only that
+// every tab racing for it agrees on the SAME single winner, which a
+// write-then-settle-then-reread step gives for free: after the settle
+// window, every racing tab reads the exact same final value from the one
+// shared store, even though none of them individually knows whose write
+// happened last.
+const SETUP_CLAIM_STORAGE_KEY = 'svalinn_e2ee_setup_claim';
+/** How long to wait after writing our own claim before checking whether
+ * it's still ours -- just long enough for another tab's near-simultaneous
+ * write (if any) to land in the same shared store first. */
+const SETUP_CLAIM_SETTLE_MS = 75;
+/** A claim older than this is treated as abandoned (the tab that made it
+ * crashed, was closed, or got stuck) rather than still in progress.
+ * Comfortably longer than `ready()`'s and `registerDevice`'s own timeouts
+ * combined (8s + 10s), so a claim never goes stale while its owner is
+ * still legitimately working. */
+const SETUP_CLAIM_STALE_MS = 30_000;
+/** How long a tab that lost the claim will wait for the winning tab's
+ * keypair to actually show up in `localStorage` before giving up and
+ * trying to claim leadership itself. Matches `SETUP_CLAIM_STALE_MS`: no
+ * point waiting longer than it takes for an abandoned claim to expire. */
+const SETUP_CLAIM_WAIT_TIMEOUT_MS = 30_000;
+const SETUP_CLAIM_POLL_MS = 100;
+/** Bounds how many times a tab will retry claiming leadership after a wait
+ * times out, so a doubly-stuck pair of tabs eventually gives up and
+ * proceeds (worst case: today's pre-existing behavior, a second device
+ * registration) rather than one of them hanging forever. */
+const SETUP_CLAIM_MAX_ATTEMPTS = 2;
+
+interface SetupClaim {
+  token: string;
+  claimedAt: number;
+}
+
+function readSetupClaim(): SetupClaim | null {
+  try {
+    const raw = localStorage.getItem(SETUP_CLAIM_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.token !== 'string' || typeof parsed?.claimedAt !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function randomSetupToken(): string {
+  // Just needs to be distinguishable from another tab's token, not
+  // cryptographically unpredictable -- no reason to wait on sodium.ready()
+  // here before either tab even has a keypair yet.
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+}
+
+/** Attempts to become the one tab responsible for generating and
+ * registering a brand-new device keypair. Returns a claim token if this
+ * call won (the caller must pass it to `clearSetupClaim` once setup
+ * finishes, success or failure), or null if another tab's claim is
+ * active. See the block comment above for why the write-then-settle step
+ * is needed instead of a plain check-then-write. */
+async function claimSetupLeadership(): Promise<string | null> {
+  const existing = readSetupClaim();
+  if (existing && Date.now() - existing.claimedAt < SETUP_CLAIM_STALE_MS) {
+    return null;
+  }
+  const token = randomSetupToken();
+  try {
+    localStorage.setItem(SETUP_CLAIM_STORAGE_KEY, JSON.stringify({ token, claimedAt: Date.now() }));
+  } catch {
+    return null; // storage is broken; `checkStorageAvailable()` will have already caught this
+  }
+  await new Promise((resolve) => setTimeout(resolve, SETUP_CLAIM_SETTLE_MS));
+  const settled = readSetupClaim();
+  return settled?.token === token ? token : null;
+}
+
+function clearSetupClaim(token: string): void {
+  try {
+    // Only clear if it's still ours -- if our claim went stale and another
+    // tab has since taken over, clearing it out from under that tab would
+    // reopen the exact race this exists to close.
+    if (readSetupClaim()?.token === token) localStorage.removeItem(SETUP_CLAIM_STORAGE_KEY);
+  } catch {
+    /* best-effort; a leftover claim just expires on its own via SETUP_CLAIM_STALE_MS */
+  }
+}
+
+/** Waits for whichever tab currently holds setup leadership to finish and
+ * persist a keypair, so this tab can adopt the SAME one instead of
+ * generating its own. Returns null (not an error) if nothing showed up
+ * within the timeout -- the caller falls back to trying for leadership
+ * itself, treating the other tab as stuck or gone rather than waiting on
+ * it forever. */
+async function waitForKeypairFromAnotherTab(): Promise<DeviceKeypair | null> {
+  const deadline = Date.now() + SETUP_CLAIM_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const found = readStoredKeypair();
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, SETUP_CLAIM_POLL_MS));
+  }
+  return null;
+}
+
 /**
  * True if this device already has a local keypair (whether generated here
  * or restored via `lib/recovery.ts`). Synchronous, so callers can decide
@@ -160,6 +286,13 @@ function defaultDeviceLabel(): string {
  * localStorage, ...) always gets its own independent keypair and its own
  * `device_id` -- there is no shared "the user's key", only "this device's
  * key".
+ *
+ * Guards against two TABS of the same browser (and, before Tauri's
+ * single-instance plugin, two LAUNCHES of the desktop app) racing to do
+ * this at once and each registering their own separate device for what's
+ * really one install -- see the "Cross-tab/window setup leadership" block
+ * comment above `claimSetupLeadership` for the full scenario
+ * (confidentiality-review followup cases 12-13).
  */
 export function ensureDeviceKeypair(): Promise<DeviceKeypair> {
   if (!keypairPromise) {
@@ -173,34 +306,57 @@ export function ensureDeviceKeypair(): Promise<DeviceKeypair> {
       // would leave an orphaned registration server-side for no benefit.
       checkStorageAvailable();
 
-      await ready();
-      const generated = sodium.crypto_box_keypair();
-      const publicKey = sodium.to_base64(generated.publicKey, sodium.base64_variants.ORIGINAL);
-      const privateKey = sodium.to_base64(generated.privateKey, sodium.base64_variants.ORIGINAL);
-
-      // Register before persisting locally: if registration fails, nothing
-      // is written to localStorage, so the next call starts over instead of
-      // treating this device as "set up" with a key/id the server never saw.
-      let deviceId: string;
-      try {
-        deviceId = await registerDevice(publicKey, defaultDeviceLabel());
-      } catch (err) {
-        throw new DeviceSetupError(
-          err instanceof Error ? `Failed to register this device: ${err.message}` : 'Failed to register this device.'
-        );
+      let claimToken: string | null = null;
+      for (let attempt = 0; attempt < SETUP_CLAIM_MAX_ATTEMPTS && !claimToken; attempt++) {
+        claimToken = await claimSetupLeadership();
+        if (!claimToken) {
+          const theirs = await waitForKeypairFromAnotherTab();
+          if (theirs) return theirs;
+          // Timed out waiting -- the other tab's claim is now stale (see
+          // SETUP_CLAIM_STALE_MS/SETUP_CLAIM_WAIT_TIMEOUT_MS), so loop
+          // around and try to claim leadership ourselves instead of
+          // proceeding unprotected.
+        }
       }
+      // Still no claim after retrying: both attempts found an apparently-
+      // live claim that never produced a keypair. Rather than hang this
+      // tab forever, fall through and attempt setup ourselves -- worst
+      // case this reproduces today's pre-fix behavior (a second device
+      // registration), which is strictly better than leaving the user
+      // stuck on a setup screen indefinitely.
 
       try {
-        localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, publicKey);
-        localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, privateKey);
-        localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
-      } catch {
-        throw new DeviceSetupError(
-          'This device cannot store an encryption key (local storage is unavailable, full, or disabled).'
-        );
-      }
+        await ready();
+        const generated = sodium.crypto_box_keypair();
+        const publicKey = sodium.to_base64(generated.publicKey, sodium.base64_variants.ORIGINAL);
+        const privateKey = sodium.to_base64(generated.privateKey, sodium.base64_variants.ORIGINAL);
 
-      return { publicKey, privateKey, deviceId };
+        // Register before persisting locally: if registration fails, nothing
+        // is written to localStorage, so the next call starts over instead of
+        // treating this device as "set up" with a key/id the server never saw.
+        let deviceId: string;
+        try {
+          deviceId = await registerDevice(publicKey, defaultDeviceLabel());
+        } catch (err) {
+          throw new DeviceSetupError(
+            err instanceof Error ? `Failed to register this device: ${err.message}` : 'Failed to register this device.'
+          );
+        }
+
+        try {
+          localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, publicKey);
+          localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, privateKey);
+          localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
+        } catch {
+          throw new DeviceSetupError(
+            'This device cannot store an encryption key (local storage is unavailable, full, or disabled).'
+          );
+        }
+
+        return { publicKey, privateKey, deviceId };
+      } finally {
+        if (claimToken) clearSetupClaim(claimToken);
+      }
     })().catch((err) => {
       // Don't leave future callers stuck on a permanently rejected promise --
       // let the next call retry from scratch.
