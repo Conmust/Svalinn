@@ -11,6 +11,15 @@
   import { getMyDeviceId } from '../lib/crypto';
   import { deviceEncryptionReady, replaceActiveKeypair, restoreFromBackup, IncorrectPassphraseError } from '../lib/recovery';
   import { fetchKeyBackup, createOrReplaceKeyBackup, deleteKeyBackup, type KeyBackupRecord } from '../lib/recovery';
+  import {
+    requestToken,
+    redeemToken,
+    listPendingTokens,
+    storePendingToken,
+    removePendingToken,
+    BlindTokenError,
+    type PendingToken,
+  } from '../lib/blind-tokens';
 
   const dispatch = createEventDispatcher();
 
@@ -60,6 +69,85 @@
   // until there is, the site owner grants tier changes from a user's
   // profile (see UserProfileModal.svelte), not the user themselves.
   let patronTier: PatronTier = 'free';
+
+  // Anonymous patron-tier redemption (blind tokens) -- see lib/blind-tokens.ts.
+  // Two unrelated flows live here:
+  // - Anyone holding a receipt (handed to them however they paid) can turn
+  //   it into a token and redeem it onto this account.
+  // - The site owner can mint a receipt for someone who just paid them.
+  const BLIND_TOKEN_TIERS = ['patron', 'guild', 'enterprise'] as const;
+  let receiptTierToSpend: string = BLIND_TOKEN_TIERS[0];
+  let receiptTokenInput = '';
+  let blindTokenBusy = false;
+  let blindTokenError = '';
+  let blindTokenMessage = '';
+  let pendingTokens: PendingToken[] = [];
+
+  let mintTier: string = BLIND_TOKEN_TIERS[0];
+  let mintBusy = false;
+  let mintedReceipt: { tier: string; receipt_token: string } | null = null;
+  let mintError = '';
+
+  async function spendReceipt() {
+    blindTokenError = '';
+    blindTokenMessage = '';
+    if (!receiptTokenInput.trim()) {
+      blindTokenError = 'Enter a receipt token first';
+      return;
+    }
+    blindTokenBusy = true;
+    try {
+      const token = await requestToken(receiptTierToSpend, receiptTokenInput.trim());
+      storePendingToken(token);
+      pendingTokens = listPendingTokens();
+      receiptTokenInput = '';
+      blindTokenMessage = `Got a ${receiptTierToSpend} token -- redeem it below whenever you like.`;
+    } catch (err: any) {
+      blindTokenError = err instanceof BlindTokenError ? err.message : 'Failed to request a token';
+    } finally {
+      blindTokenBusy = false;
+    }
+  }
+
+  async function redeemPendingToken(token: PendingToken) {
+    blindTokenError = '';
+    blindTokenMessage = '';
+    blindTokenBusy = true;
+    try {
+      await redeemToken(token);
+      removePendingToken(token);
+      pendingTokens = listPendingTokens();
+      if (PATRON_TIERS.includes(token.tier as PatronTier) && token.tier !== 'free') {
+        // Reflect the upgrade immediately rather than waiting on a refetch.
+        const rank = (t: string) => PATRON_TIERS.indexOf(t as PatronTier);
+        if (rank(token.tier) > rank(patronTier)) patronTier = token.tier as PatronTier;
+      }
+      blindTokenMessage = `Redeemed -- this account is now ${token.tier}.`;
+    } catch (err: any) {
+      blindTokenError = err instanceof BlindTokenError ? err.message : 'Failed to redeem that token';
+    } finally {
+      blindTokenBusy = false;
+    }
+  }
+
+  async function mintReceipt() {
+    mintError = '';
+    mintedReceipt = null;
+    mintBusy = true;
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/admin/blind-token-receipts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tier: mintTier }),
+      });
+      if (!res.ok) throw new Error(await errorFrom(res, 'Failed to mint a receipt'));
+      mintedReceipt = await res.json();
+    } catch (err: any) {
+      mintError = err.message || 'Failed to mint a receipt';
+    } finally {
+      mintBusy = false;
+    }
+  }
 
   // Badge emblem (which icon this tier's badge shows -- see PatronBadge.svelte)
   let badgeEmblem: string | null = null;
@@ -318,6 +406,7 @@
     }
     await loadDevices();
     await loadKeyBackup();
+    pendingTokens = listPendingTokens();
   });
 
   async function errorFrom(res: Response, fallback: string): Promise<string> {
@@ -449,6 +538,70 @@
           <span class="text-xs uppercase tracking-wider text-[#00ff00]">{patronTier}</span>
         </div>
       </section>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Redeem a patron token</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          Have a one-time receipt from however you paid? Spend it here for a token, then redeem the token on
+          whichever account you want upgraded -- the server has no way to connect the two.
+        </p>
+        <div class="flex gap-2">
+          <select bind:value={receiptTierToSpend} class="{input} flex-none w-32">
+            {#each BLIND_TOKEN_TIERS as t}<option value={t}>{t}</option>{/each}
+          </select>
+          <input
+            type="text"
+            placeholder="Receipt token"
+            bind:value={receiptTokenInput}
+            class="{input} flex-1"
+            disabled={blindTokenBusy}
+          />
+          <button type="button" class="text-xs text-[#00ff00] underline disabled:opacity-50 whitespace-nowrap" disabled={blindTokenBusy} on:click={spendReceipt}>
+            {blindTokenBusy ? 'Working...' : 'Get token'}
+          </button>
+        </div>
+
+        {#if pendingTokens.length > 0}
+          <div class="space-y-1">
+            {#each pendingTokens as token (token.preparedMessage)}
+              <div class="flex items-center justify-between gap-2 py-1.5 px-2 border border-[#00aa00]/50 text-xs">
+                <span class="uppercase tracking-wider text-[#00ff00]">{token.tier} token</span>
+                <button type="button" class="text-[#00ff00] underline disabled:opacity-50" disabled={blindTokenBusy} on:click={() => redeemPendingToken(token)}>
+                  Redeem on this account
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#if blindTokenError}<div class="text-xs text-red-500">{'>'} {blindTokenError}</div>{/if}
+        {#if blindTokenMessage}<div class="text-xs text-[#00ff00]">{'>'} {blindTokenMessage}</div>{/if}
+      </section>
+
+      {#if isSiteOwner}
+        <section class="space-y-3">
+          <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Mint a blind-token receipt</h4>
+          <p class="text-[11px] text-[#00aa00]">
+            After confirming a payment through whatever channel (cash, a voucher, anything), mint a one-time
+            receipt here and hand it to whoever paid. It authorizes exactly one token for the chosen tier.
+          </p>
+          <div class="flex gap-2">
+            <select bind:value={mintTier} class="{input} flex-none w-32">
+              {#each BLIND_TOKEN_TIERS as t}<option value={t}>{t}</option>{/each}
+            </select>
+            <button type="button" class="text-xs text-[#00ff00] underline disabled:opacity-50" disabled={mintBusy} on:click={mintReceipt}>
+              {mintBusy ? 'Minting...' : 'Mint receipt'}
+            </button>
+          </div>
+          {#if mintedReceipt}
+            <div class="py-2 px-3 border border-[#00ff00]/50 text-xs break-all">
+              <span class="text-[#00aa00] uppercase tracking-wider">{mintedReceipt.tier} receipt:</span>
+              {mintedReceipt.receipt_token}
+            </div>
+          {/if}
+          {#if mintError}<div class="text-xs text-red-500">{'>'} {mintError}</div>{/if}
+        </section>
+      {/if}
 
       {#if emblemChoices.length > 0}
         <section class="space-y-3">

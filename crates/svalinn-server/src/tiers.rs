@@ -8,7 +8,7 @@ const TIER_ORDER: &[&str] = &["free", "patron", "guild", "enterprise"];
 /// The lowest tier that is allowed to create a server.
 const SERVER_CREATION_MIN_TIER: &str = "guild";
 
-fn tier_rank(tier: &str) -> usize {
+pub(crate) fn tier_rank(tier: &str) -> usize {
     TIER_ORDER.iter().position(|t| *t == tier).unwrap_or(0)
 }
 

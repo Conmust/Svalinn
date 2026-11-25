@@ -1,5 +1,6 @@
 mod access;
 mod badges;
+mod blind_tokens;
 mod db;
 mod disposable_email;
 mod email_privacy;
@@ -90,11 +91,20 @@ async fn main() {
     // topped up with one aggregate number per day.
     stats::spawn_snapshot_job(db.clone());
 
+    // Loads (or mints, first run) each tier's blind-signing keypair.
+    blind_tokens::init_keys(&db)
+        .await
+        .expect("Failed to initialize blind-token keys");
+
     // 5. Build the application router
     let app = Router::new()
         .route("/health", get(routes::health::health_check))
         .route("/api/v1/stats/user-count", get(routes::stats::get_user_count))
         .route("/api/v1/stats/user-count/history", get(routes::stats::get_user_count_history))
+        .route("/api/v1/blind-tokens/skus", get(routes::blind_tokens::list_skus))
+        .route("/api/v1/blind-tokens/blind-sign", post(routes::blind_tokens::blind_sign))
+        .route("/api/v1/blind-tokens/redeem", post(routes::blind_tokens::redeem))
+        .route("/api/v1/admin/blind-token-receipts", post(routes::blind_tokens::mint_receipt))
 
         // --- Auth Routes ---
         .route("/api/v1/auth/register", post(routes::auth::register))

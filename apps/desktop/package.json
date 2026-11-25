@@ -27,7 +27,11 @@
     "vitest": "2.1.9"
   },
   "dependencies": {
+    "@cloudflare/blindrsa-ts": "^0.4.6",
     "@tauri-apps/api": "^2.0.0",
     "libsodium-wrappers-sumo": "0.7.15"
+  },
+  "overrides": {
+    "sjcl": "1.0.9"
   }
 }
