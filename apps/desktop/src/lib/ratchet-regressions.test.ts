@@ -512,7 +512,7 @@ describe('Ratchet regressions (reported by external review)', () => {
   });
 
   describe('Fix E: signed-prekey rotation', () => {
-    it('durability cases 020/064/066-style: a first-contact message bootstrapped against a JUST-rotated-out signed prekey still decrypts', async () => {
+    it('durability cases 020/064: a first-contact message bootstrapped against a JUST-rotated-out signed prekey still decrypts', async () => {
       const alice = await createDeviceHarness();
       const bob = await createDeviceHarness();
 
@@ -537,6 +537,38 @@ describe('Ratchet regressions (reported by external review)', () => {
       // yet), and would otherwise now fail since the responder would
       // blindly use its CURRENT (different) signed prekey.
       expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, queued))).toBe('queued before rotation');
+    });
+
+    it('durability case 066: a first-contact message bootstrapped TWO rotations ago still decrypts (bounded multi-generation retention)', async () => {
+      const alice = await createDeviceHarness();
+      const bob = await createDeviceHarness();
+
+      // Alice's handshake captures Bob's signed prekey from generation 1.
+      const queued = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'queued two rotations ago'));
+      const usedPublicKey = queued.initial?.usedSignedPrekeyPublicKey;
+      expect(usedPublicKey).toBeDefined();
+
+      activate(bob);
+      const generation1Public = bob.storage.getItem('svalinn_ratchet_signed_prekey_public_key');
+      expect(usedPublicKey).toBe(generation1Public);
+
+      // Bob rotates TWICE before the message is actually delivered --
+      // generation 1 is now two rotations back, not just one. A single
+      // retained "previous" generation (the original fix) would no
+      // longer have it; the bounded multi-generation retention does.
+      bob.storage.setItem('svalinn_ratchet_signed_prekey_created_at', '0');
+      await bob.ratchet.ensureRatchetReady(); // rotates to generation 2
+      const generation2Public = bob.storage.getItem('svalinn_ratchet_signed_prekey_public_key');
+      expect(generation2Public).not.toBe(generation1Public);
+      bob.storage.setItem('svalinn_ratchet_signed_prekey_created_at', '0');
+      await bob.ratchet.ensureRatchetReady(); // rotates to generation 3
+      const generation3Public = bob.storage.getItem('svalinn_ratchet_signed_prekey_public_key');
+      expect(generation3Public).not.toBe(generation2Public);
+
+      // Generation 1 is retained in the bounded retired-key list (kept
+      // two generations back, within `SIGNED_PREKEY_RETIRED_KEEP`), so the
+      // message queued against it can still be answered.
+      expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, queued))).toBe('queued two rotations ago');
     });
 
     it('durability-100 cases 082-083: a local-storage failure during rotation never leaves an orphaned key advertised to the server', async () => {
@@ -607,6 +639,97 @@ describe('Ratchet regressions (reported by external review)', () => {
       await bob.ratchet.ensureRatchetReady();
       const afterRetryUnconsumed = [...fakeServer.devices.get(bob.deviceId)!.oneTimePrekeys.values()].filter((c) => !c).length;
       expect(afterRetryUnconsumed).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Fix: backup write-conflict retries instead of silently giving up', () => {
+    it(
+      'durability-100 case 098: a stale backup-conflict on save still lands this device\'s ' +
+        "newest state, rather than only resyncing the timestamp and giving up on it",
+      async () => {
+        const alice = await createDeviceHarness();
+        const bob = await createDeviceHarness();
+
+        const env1 = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'hi'));
+        expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, env1))).toBe('hi');
+
+        // Let Bob's own fire-and-forget backup of the post-message-1 state
+        // land first.
+        activate(bob);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const key = `${bob.deviceId}:${alice.deviceId}`;
+        const afterMsg1 = fakeServer.sessions.get(key);
+        expect(afterMsg1).toBeDefined();
+
+        // Simulate another tab/process on Bob's OWN device concurrently
+        // pushing a newer backup in between -- Bob's local bookkeeping of
+        // `backupUpdatedAt` still points at the OLDER version above, so
+        // his next save is guaranteed to conflict.
+        fakeServer.sessions.set(key, {
+          pickleCiphertext: afterMsg1!.pickleCiphertext,
+          pickleNonce: afterMsg1!.pickleNonce,
+          updatedAt: 'backup-injected-conflict',
+        });
+
+        // Bob processes a SECOND message, advancing his local ratchet
+        // state further. The fire-and-forget backup this triggers will
+        // conflict against the injected version above.
+        const env2 = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'second message'));
+        expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, env2))).toBe('second message');
+
+        // Let the conflict-then-retry settle.
+        activate(bob);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        // The ORIGINAL behavior, on hitting this conflict, only resynced
+        // its local `backupUpdatedAt` bookkeeping to match the server and
+        // gave up -- the server's stored backup would be left exactly at
+        // the injected conflicting value, never advancing to reflect
+        // message 2 at all. The fix retries with the corrected baseline
+        // and actually lands this device's newer state.
+        const afterMsg2 = fakeServer.sessions.get(key);
+        expect(afterMsg2).toBeDefined();
+        expect(afterMsg2!.updatedAt).not.toBe('backup-injected-conflict');
+        expect(afterMsg2!.updatedAt).not.toBe(afterMsg1!.updatedAt);
+      }
+    );
+  });
+
+  describe('Fix: one-time-prekey replenishment also checks local stash health', () => {
+    it('durability-100 case 099: a corrupted local one-time-prekey stash triggers replenishment even though the server count still looks healthy', async () => {
+      const bob = await createDeviceHarness();
+      activate(bob);
+
+      // The server, from Bob's initial `ensureRatchetReady()` call during
+      // harness setup, already has a healthy batch of unconsumed one-time
+      // prekeys on file.
+      const dev = fakeServer.devices.get(bob.deviceId);
+      expect(dev).toBeDefined();
+      const unconsumedBefore = [...dev!.oneTimePrekeys.values()].filter((c) => !c).length;
+      expect(unconsumedBefore).toBeGreaterThan(0);
+
+      // Corrupt Bob's LOCAL one-time-prekey stash directly (simulating a
+      // partial write, a JSON parse failure, or local storage cleared for
+      // just this one key) -- the SERVER still thinks everything's fine,
+      // since nothing told it otherwise.
+      bob.storage.setItem('svalinn_ratchet_one_time_prekeys', 'not valid json{{{');
+
+      // Calling `ensureRatchetReady()` again (e.g. the next app startup)
+      // must notice the local stash is unusable and top it up with a
+      // fresh, genuinely-local batch, even though the server-reported
+      // count alone would say there's nothing to do.
+      await bob.ratchet.ensureRatchetReady();
+
+      const localRaw = bob.storage.getItem('svalinn_ratchet_one_time_prekeys');
+      expect(localRaw).not.toBeNull();
+      const localKeys = JSON.parse(localRaw as string) as unknown[];
+      expect(localKeys.length).toBeGreaterThan(0);
+
+      const unconsumedAfter = [...dev!.oneTimePrekeys.values()].filter((c) => !c).length;
+      expect(unconsumedAfter).toBeGreaterThan(unconsumedBefore);
     });
   });
 });

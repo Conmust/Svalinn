@@ -569,24 +569,24 @@ async function bootstrapSessionAsInitiator(peerDeviceId: string): Promise<Ratche
 async function establishSessionAsResponder(peerDeviceId: string, initial: InitialHandshakeFields): Promise<RatchetState> {
   const currentSignedPrekeyPublic = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
   const currentSignedPrekeyPrivate = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
-  const previousSignedPrekeyPublic = localStorage.getItem(SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY);
-  const previousSignedPrekeyPrivate = localStorage.getItem(SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY);
 
   // The sender's handshake may have been bootstrapped against a signed
   // prekey we've since rotated out (fetched before rotation, delivered
-  // after -- an offline recipient or a slow retry). Answer with whichever
-  // local key it actually used, not blindly whatever is current. See
-  // `ensureSignedPrekey` for why one retired generation is kept around,
-  // and `InitialHandshakeFields.usedSignedPrekeyPublicKey`'s doc for the
+  // after -- an offline recipient, a slow retry, or more than one
+  // rotation's worth of delay). Answer with whichever local key it
+  // actually used, not blindly whatever is current. See
+  // `SIGNED_PREKEY_RETIRED_STORAGE_KEY`'s doc for how many retired
+  // generations are kept around, and
+  // `InitialHandshakeFields.usedSignedPrekeyPublicKey`'s doc for the
   // backward-compatibility fallback when that field is absent.
-  let signedPrekeyPublic: string | null;
-  let signedPrekeyPrivate: string | null;
-  if (initial.usedSignedPrekeyPublicKey && initial.usedSignedPrekeyPublicKey === previousSignedPrekeyPublic) {
-    signedPrekeyPublic = previousSignedPrekeyPublic;
-    signedPrekeyPrivate = previousSignedPrekeyPrivate;
-  } else {
-    signedPrekeyPublic = currentSignedPrekeyPublic;
-    signedPrekeyPrivate = currentSignedPrekeyPrivate;
+  let signedPrekeyPublic: string | null = currentSignedPrekeyPublic;
+  let signedPrekeyPrivate: string | null = currentSignedPrekeyPrivate;
+  if (initial.usedSignedPrekeyPublicKey && initial.usedSignedPrekeyPublicKey !== currentSignedPrekeyPublic) {
+    const retiredMatch = loadRetiredSignedPrekeys().find((r) => r.publicKey === initial.usedSignedPrekeyPublicKey);
+    if (retiredMatch) {
+      signedPrekeyPublic = retiredMatch.publicKey;
+      signedPrekeyPrivate = retiredMatch.privateKey;
+    }
   }
   if (!signedPrekeyPublic || !signedPrekeyPrivate) {
     throw new DeviceSetupError('This device has no local signed prekey to bootstrap a ratchet session with.');
@@ -638,15 +638,18 @@ const SIGNING_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signing_private_key';
 const SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_public_key';
 const SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_private_key';
 const SIGNED_PREKEY_CREATED_AT_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_created_at';
-/** One retired generation back, kept so `establishSessionAsResponder` can
- * still answer a handshake bootstrapped against the key we just rotated
- * out. Deliberately scoped to ONE generation, not a time-based retention
- * window: a message delayed across more than one rotation (the default
- * cadence is weekly) remains unanswerable, same as before this existed.
- * Fully covering arbitrarily long delivery delays would need a longer,
- * multi-generation retention policy -- out of scope here. */
-const SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_previous_public_key';
-const SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_previous_private_key';
+/** A bounded number of retired generations back (see
+ * `SIGNED_PREKEY_RETIRED_KEEP`), kept so `establishSessionAsResponder` can
+ * still answer a handshake bootstrapped against a signed prekey we've
+ * since rotated past -- not just the ONE most-recently-retired key (an
+ * offline recipient or a slow retry can span more than one rotation at
+ * the default weekly cadence; durability-100 case 066). Still a BOUNDED
+ * window, not unlimited retention: a message delayed past
+ * `SIGNED_PREKEY_RETIRED_KEEP` rotations remains unanswerable, trading
+ * storage and exposure window against reach. Each entry is
+ * `{ publicKey, privateKey }`, most-recently-retired first. */
+const SIGNED_PREKEY_RETIRED_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_retired';
+const SIGNED_PREKEY_RETIRED_KEEP = 3;
 const ONE_TIME_PREKEYS_STORAGE_KEY = 'svalinn_ratchet_one_time_prekeys';
 
 const SIGNED_PREKEY_ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -723,6 +726,20 @@ async function ensureSigningIdentity(deviceId: string): Promise<{ publicKey: str
   return { publicKey, privateKey };
 }
 
+interface RetiredSignedPrekey {
+  publicKey: string;
+  privateKey: string;
+}
+
+function loadRetiredSignedPrekeys(): RetiredSignedPrekey[] {
+  try {
+    const raw = localStorage.getItem(SIGNED_PREKEY_RETIRED_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as RetiredSignedPrekey[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 async function ensureSignedPrekey(deviceId: string, signingPrivateKey: Uint8Array): Promise<void> {
   const existingPublic = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
   const existingPrivate = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
@@ -747,12 +764,16 @@ async function ensureSignedPrekey(deviceId: string, signingPrivateKey: Uint8Arra
   try {
     if (existingPublic && existingPrivate) {
       // An actual rotation, not first-ever creation: keep the outgoing key
-      // around for one generation (see the storage key's own doc comment)
-      // so a handshake already bootstrapped against it moments before this
-      // rotation can still be answered instead of silently failing the
-      // moment the server starts advertising a different one.
-      localStorage.setItem(SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY, existingPublic);
-      localStorage.setItem(SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY, existingPrivate);
+      // around for a few generations (see `SIGNED_PREKEY_RETIRED_KEEP`'s
+      // doc comment) so a handshake already bootstrapped against it --
+      // possibly more than one rotation ago, for a slow or offline peer --
+      // can still be answered instead of silently failing the moment the
+      // server starts advertising a different one.
+      const retired = [{ publicKey: existingPublic, privateKey: existingPrivate }, ...loadRetiredSignedPrekeys()].slice(
+        0,
+        SIGNED_PREKEY_RETIRED_KEEP
+      );
+      localStorage.setItem(SIGNED_PREKEY_RETIRED_STORAGE_KEY, JSON.stringify(retired));
     }
     localStorage.setItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY, publicKey);
     localStorage.setItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY, privateKey);
@@ -767,7 +788,27 @@ async function ensureSignedPrekey(deviceId: string, signingPrivateKey: Uint8Arra
 
 async function maintainOneTimePrekeys(deviceId: string): Promise<void> {
   const counts = await fetchPrekeyCounts(deviceId);
-  if (counts.unconsumedOneTimePrekeys >= ONE_TIME_PREKEY_LOW_WATER_MARK) return;
+  const localCount = loadOneTimePrekeys().length;
+  // Replenish when EITHER signal looks low, not just the server's count.
+  // Under normal operation the two track each other closely (each
+  // consumed key is removed from both sides -- see
+  // `findAndConsumeLocalOneTimePrekey`), but the server's count can look
+  // perfectly healthy while this device's own local stash is corrupted or
+  // was silently dropped (a parse failure in `loadOneTimePrekeys`, a
+  // partial write, local storage cleared for just this one key). Every
+  // one of those server-advertised "unconsumed" keys is then a phantom
+  // this device can never actually answer a handshake against (see
+  // `establishSessionAsResponder`'s 3-DH fallback) -- and with nothing
+  // previously comparing the two counts, nothing ever noticed or
+  // self-healed (durability-100 case 099). This doesn't retroactively fix
+  // an already-phantom key already sitting on the server, but it stops
+  // the drift from continuing: a steady stream of fresh, genuinely-usable
+  // keys gradually displaces the old phantom ones as the local FIFO
+  // (`MAX_LOCAL_ONE_TIME_PREKEYS`) and the server's own consumption both
+  // turn over.
+  if (counts.unconsumedOneTimePrekeys >= ONE_TIME_PREKEY_LOW_WATER_MARK && localCount >= ONE_TIME_PREKEY_LOW_WATER_MARK) {
+    return;
+  }
 
   const newKeys: StoredOneTimePrekey[] = [];
   const uploads: PrekeyUpload[] = [];
@@ -980,29 +1021,42 @@ async function backupSession(myDeviceId: string, peerDeviceId: string, state: Ra
   const pickleKey = derivePickleKey(fromB64(privateKey));
   const nonceBytes = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
   const ciphertextBytes = sodium.crypto_secretbox_easy(sodium.from_string(JSON.stringify(state)), nonceBytes, pickleKey);
+  const ciphertextB64 = b64(ciphertextBytes);
+  const nonceB64 = b64(nonceBytes);
 
-  try {
-    const saved = await putRatchetSession(myDeviceId, peerDeviceId, b64(ciphertextBytes), b64(nonceBytes), state.backupUpdatedAt);
-    const current = loadLocalSession(peerDeviceId);
-    if (current) storeLocalSession(peerDeviceId, { ...current, backupUpdatedAt: saved.updatedAt });
-  } catch (err) {
-    if (err instanceof RatchetSessionConflictError) {
-      // Our bookkeeping of the backup's `updated_at` is stale (e.g. another
-      // tab on this same device backed it up in between) -- resync just
-      // that timestamp so the NEXT backup attempt's optimistic-concurrency
-      // check succeeds, rather than conflicting forever. The local
-      // session's actual ratchet state is unaffected either way.
+  // Bounded retry on conflict. A conflict means our bookkeeping of the
+  // backup's `updated_at` is stale (e.g. another tab on this same device
+  // backed it up in between) -- the ORIGINAL fix here just resynced that
+  // timestamp and gave up, which silently dropped THIS state (the one the
+  // caller actually asked to back up, and the most-advanced one this
+  // device has) from ever reaching the server: the backup was left
+  // pointing at whatever the other writer last pushed, invisible until
+  // this device's local storage is later lost and recovery falls back to
+  // that stale backup (durability-100 case 098). Retrying with a
+  // freshly-fetched baseline instead actually lands THIS state, as long
+  // as the conflicting writer has settled down within a few attempts.
+  let expectedUpdatedAt = state.backupUpdatedAt;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const saved = await putRatchetSession(myDeviceId, peerDeviceId, ciphertextB64, nonceB64, expectedUpdatedAt);
+      const current = loadLocalSession(peerDeviceId);
+      if (current) storeLocalSession(peerDeviceId, { ...current, backupUpdatedAt: saved.updatedAt });
+      return;
+    } catch (err) {
+      if (!(err instanceof RatchetSessionConflictError)) throw err;
       try {
         const serverState = await fetchRatchetSession(myDeviceId, peerDeviceId);
-        const current = loadLocalSession(peerDeviceId);
-        if (current) storeLocalSession(peerDeviceId, { ...current, backupUpdatedAt: serverState.updatedAt });
+        expectedUpdatedAt = serverState.updatedAt;
       } catch {
-        /* will just retry blind on the next message */
+        // Can't even read the current backup right now -- nothing more to
+        // try this round. The local session's actual ratchet state is
+        // unaffected either way; the next message's `saveSession` call
+        // retries the whole thing from scratch.
+        return;
       }
-      return;
     }
-    throw err;
   }
+  console.warn('Giving up on backing up this ratchet session after repeated write conflicts (local session is still fine).');
 }
 
 function saveSession(myDeviceId: string, peerDeviceId: string, state: RatchetState): void {
