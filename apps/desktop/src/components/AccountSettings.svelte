@@ -3,6 +3,7 @@
   import { apiFetch, apiBase } from '../lib/api';
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
+  import { clearMessageHistoryCache } from '../lib/message-history';
   import { updateMyAvatar, updateMyBadgeEmblem, allowedEmblems, PATRON_TIERS, type PatronTier } from '../lib/users';
   import { uploadFile } from '../lib/messages';
   import { selfAvatarUrl } from '../lib/selfProfile';
@@ -220,6 +221,34 @@
       devicesError = err.message || 'Failed to remove device';
     } finally {
       devicesBusy = false;
+    }
+  }
+
+  // Local, per-device message history cache (see `message-history.ts`).
+  let historyClearBusy = false;
+  let historyClearError = '';
+  let historyCleared = false;
+
+  async function handleClearMessageHistory() {
+    if (
+      !confirm(
+        'Clear cached message history on THIS device? Messages whose live encryption keys are already gone ' +
+          "won't be readable again until they're sent again. This does not delete anything from the server or " +
+          'from your other devices.'
+      )
+    ) {
+      return;
+    }
+    historyClearBusy = true;
+    historyClearError = '';
+    historyCleared = false;
+    try {
+      await clearMessageHistoryCache();
+      historyCleared = true;
+    } catch (err: any) {
+      historyClearError = err.message || 'Failed to clear the local message history cache';
+    } finally {
+      historyClearBusy = false;
     }
   }
 
@@ -707,6 +736,22 @@
             {/each}
           </ul>
         {/if}
+      </section>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Message history on this device</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          To keep old encrypted messages readable after a reload (even once their original encryption key is gone),
+          this device keeps its own local, encrypted copy of messages you've already decrypted. It never leaves this
+          device and is never sent to the server. Clearing it brings back the stricter guarantee that a message
+          becomes unreadable here the moment its key is gone -- but anything whose key is already gone won't be
+          readable again either way.
+        </p>
+        {#if historyClearError}<div class="text-xs text-red-500">{'>'} {historyClearError}</div>{/if}
+        {#if historyCleared}<div class="text-xs text-[#00ff00]">{'>'} Local message history cache cleared.</div>{/if}
+        <button type="button" class="text-xs text-red-500 underline disabled:opacity-50" disabled={historyClearBusy} on:click={handleClearMessageHistory}>
+          {historyClearBusy ? 'Clearing...' : 'Clear message history on this device'}
+        </button>
       </section>
 
       <section class="space-y-3">

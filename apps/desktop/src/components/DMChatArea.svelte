@@ -19,6 +19,7 @@
     DeviceSetupError,
   } from '../lib/crypto';
   import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
+  import { getCachedPlaintext, cachePlaintext } from '../lib/message-history';
   import { activeDeviceKeypair, deviceEncryptionReady } from '../lib/recovery';
   import { fetchParticipantDevices, type ParticipantDevice } from '../lib/devices';
   import { uploadFile } from '../lib/messages';
@@ -277,6 +278,21 @@
   async function ensureRatchetMessageDecrypted(message: ConversationMessage, mine: MessageRecipientEntry): Promise<void> {
     ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
     try {
+      // Check the local history cache FIRST, before touching the ratchet
+      // at all -- not just an optimization. If this message was originally
+      // received out of order, its key was a single-use entry in the
+      // ratchet's `skippedKeys` map, deleted the moment it was consumed
+      // (see `ratchet.ts`'s header comment); a second decrypt attempt
+      // against the live ratchet would fail outright, even though the
+      // user already legitimately read this message once. See
+      // `message-history.ts`'s header comment for the full trade this
+      // cache makes.
+      const cached = await getCachedPlaintext(message.id);
+      if (cached !== null) {
+        ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: cached } };
+        return;
+      }
+
       let senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
       if (!senderDeviceId) {
         // `participantDevices` is a point-in-time snapshot (fetched once on
@@ -310,6 +326,9 @@
         initial: header.initial,
       };
       const plaintext = await decryptMessage(senderDeviceId, envelope);
+      if (plaintext !== null) {
+        await cachePlaintext(message.id, plaintext);
+      }
       ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: plaintext } };
     } catch (e) {
       console.error('Failed to decrypt a ratchet-encrypted direct message:', e);

@@ -28,6 +28,7 @@
   import { fileUrl } from '../lib/api';
   import { withTimeout, TimeoutError } from '../lib/timeout';
   import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
+  import { getCachedPlaintext, cachePlaintext, deleteCachedPlaintext } from '../lib/message-history';
 
   // --- Encryption error boundary -------------------------------------------
   // Mirrors `DMChatArea.svelte`'s identically-named helper: a broken
@@ -193,6 +194,21 @@
   async function ensureRatchetMessageDecrypted(message: Message, mine: MessageRecipientEntry): Promise<void> {
     ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
     try {
+      // Check the local history cache FIRST, before touching the ratchet
+      // at all -- not just an optimization. If this message was originally
+      // received out of order, its key was a single-use entry in the
+      // ratchet's `skippedKeys` map, deleted the moment it was consumed
+      // (see `ratchet.ts`'s header comment); a second decrypt attempt
+      // against the live ratchet would fail outright, even though the
+      // user already legitimately read this message once. See
+      // `message-history.ts`'s header comment for the full trade this
+      // cache makes.
+      const cached = await getCachedPlaintext(message.id);
+      if (cached !== null) {
+        ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: cached } };
+        return;
+      }
+
       const senderDeviceId = channelMemberDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
       if (!senderDeviceId) {
         ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
@@ -208,6 +224,9 @@
         initial: header.initial,
       };
       const plaintext = await decryptMessage(senderDeviceId, envelope);
+      if (plaintext !== null) {
+        await cachePlaintext(message.id, plaintext);
+      }
       ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: plaintext } };
     } catch (e) {
       console.error('Failed to decrypt a ratchet-encrypted channel message:', e);
@@ -392,6 +411,7 @@
     if (!m) return;
     await run(async () => {
       await deleteMessage(m.id);
+      await deleteCachedPlaintext(m.id);
       rawMessages = rawMessages.filter(x => x.id !== m.id);
     });
   }
@@ -712,6 +732,7 @@
     for (const messageId of selectedMessages) {
       try {
         await deleteMessage(messageId);
+        await deleteCachedPlaintext(messageId);
       } catch (e: any) {
         failures.push(e.message);
       }
