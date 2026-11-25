@@ -424,16 +424,22 @@ function performDhRatchet(state: RatchetState, theirNewDhPublicB64: string): Rat
   };
 }
 
+/** `viaSkippedKey: true` marks a decrypt that consumed a cached
+ * out-of-order message key (`tryDecryptWithSkippedKey`) rather than the
+ * normal in-order chain advance -- see `decryptMessageLocked`'s use of it
+ * to decide whether this save needs to be backed up eagerly. */
+interface RatchetDecryptResult {
+  state: RatchetState;
+  plaintext: string;
+  viaSkippedKey: boolean;
+}
+
 /** Attempts to decrypt a message using an already-cached skipped message
  * key, for a message that arrived out of order relative to ones already
  * processed. Returns null if no cached key matches (the normal case for
  * an in-order message) or if decryption with a matching key still fails
  * (tampered ciphertext). */
-function tryDecryptWithSkippedKey(
-  state: RatchetState,
-  envelope: RatchetEnvelope,
-  ad: Uint8Array
-): { state: RatchetState; plaintext: string } | null {
+function tryDecryptWithSkippedKey(state: RatchetState, envelope: RatchetEnvelope, ad: Uint8Array): RatchetDecryptResult | null {
   const key = `${envelope.dh}:${envelope.n}`;
   const messageKeyB64 = state.skippedKeys[key];
   if (!messageKeyB64) return null;
@@ -447,7 +453,7 @@ function tryDecryptWithSkippedKey(
     );
     const skippedKeys = { ...state.skippedKeys };
     delete skippedKeys[key];
-    return { state: { ...state, skippedKeys }, plaintext: sodium.to_string(plaintextBytes) };
+    return { state: { ...state, skippedKeys }, plaintext: sodium.to_string(plaintextBytes), viaSkippedKey: true };
   } catch {
     return null;
   }
@@ -458,7 +464,7 @@ function tryDecryptWithSkippedKey(
  * plaintext, or null if decryption genuinely failed (tampered ciphertext,
  * wrong key) -- in which case the ORIGINAL state should be kept, since
  * nothing about the session actually advanced. */
-function ratchetDecrypt(state: RatchetState, envelope: RatchetEnvelope): { state: RatchetState; plaintext: string } | null {
+function ratchetDecrypt(state: RatchetState, envelope: RatchetEnvelope): RatchetDecryptResult | null {
   const ad = buildAD(state);
 
   const fromSkipped = tryDecryptWithSkippedKey(state, envelope, ad);
@@ -494,7 +500,7 @@ function ratchetDecrypt(state: RatchetState, envelope: RatchetEnvelope): { state
       // left without the bootstrap data a fresh responder needs).
       working = { ...working, pendingInitialHeader: null };
     }
-    return { state: working, plaintext: sodium.to_string(plaintextBytes) };
+    return { state: working, plaintext: sodium.to_string(plaintextBytes), viaSkippedKey: false };
   } catch {
     return null;
   }
@@ -1073,6 +1079,37 @@ function saveSession(myDeviceId: string, peerDeviceId: string, state: RatchetSta
   });
 }
 
+/** Same as `saveSession`, but AWAITS the backup instead of firing it and
+ * forgetting it. Used specifically right after consuming a cached skipped
+ * message key (see `tryDecryptWithSkippedKey`/`RatchetDecryptResult`):
+ * that key is now gone from local state forever by design (a skipped key
+ * is single-use), so if this device's local storage were lost before an
+ * eventual, fire-and-forget backup caught up, recovery would restore an
+ * OLDER backup that still lists the key as available -- letting a
+ * captured-and-replayed copy of the original ciphertext decrypt a second
+ * time (confidentiality-review followup case 15). Awaiting the backup
+ * here doesn't close that window to zero -- a crash during this very call
+ * is still (far more narrowly) possible, and a full fix needs the server
+ * to track per-message consumption independently of the session backup --
+ * but it shrinks the window from "however long until some unrelated
+ * message happens to trigger a save" down to one network round trip.
+ * Still best-effort like `saveSession`: the local session (the
+ * authoritative copy) is already saved synchronously either way, so a
+ * failed backup attempt here never blocks the caller from getting its
+ * already-decrypted plaintext, only delays returning it slightly longer
+ * than the fire-and-forget path would. */
+async function saveSessionEagerly(myDeviceId: string, peerDeviceId: string, state: RatchetState): Promise<void> {
+  storeLocalSession(peerDeviceId, state);
+  try {
+    await backupSession(myDeviceId, peerDeviceId, state);
+  } catch (err) {
+    console.warn(
+      'Failed to eagerly back up a ratchet session after consuming a skipped message key (local session is still fine):',
+      err
+    );
+  }
+}
+
 /** True if a loaded session was created under a DIFFERENT local identity
  * than the one now active. Its AD and DH math were both derived from the
  * OLD identity key (see `initRatchetAsInitiator`/`initRatchetAsResponder`)
@@ -1274,7 +1311,7 @@ async function decryptMessageLocked(
     }
   }
 
-  let result: { state: RatchetState; plaintext: string } | null;
+  let result: RatchetDecryptResult | null;
   try {
     result = ratchetDecrypt(state, envelope);
   } catch (err) {
@@ -1286,6 +1323,13 @@ async function decryptMessageLocked(
   }
   if (!result) return null;
 
-  saveSession(myDeviceId, peerDeviceId, result.state);
+  if (result.viaSkippedKey) {
+    // See `saveSessionEagerly`'s doc comment: a consumed skipped key is
+    // gone from local state forever, so this one save can't wait for some
+    // later message to flush it -- it's backed up right away.
+    await saveSessionEagerly(myDeviceId, peerDeviceId, result.state);
+  } else {
+    saveSession(myDeviceId, peerDeviceId, result.state);
+  }
   return result.plaintext;
 }
