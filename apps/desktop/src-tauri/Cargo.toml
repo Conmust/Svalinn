@@ -25,6 +25,16 @@ serde_json = "1.0"
 # feature isn't targeted at iOS/Android, so keep it off those builds entirely.
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
+# Desktop-only (the plugin itself isn't meaningful on mobile, which has no
+# concept of "a second copy of this app already running"): refuses to let a
+# second instance of the app start up and instead focuses the existing
+# window. Without this, launching the app twice gave each process its own
+# independent webview and local storage, and on first-ever launch (no
+# device keypair saved yet) both would race to generate-and-register a
+# SEPARATE device identity with the server for what's really one install --
+# see `crypto.ts`'s `ensureDeviceKeypair` doc comment for the full
+# "device-identity-split" scenario this closes off at the root.
+tauri-plugin-single-instance = "2"
 
 [features]
 default = ["custom-protocol"]
