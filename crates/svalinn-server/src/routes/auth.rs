@@ -284,7 +284,10 @@ pub(crate) async fn issue_verification_token(db: &Database, user_id: Uuid) -> Re
 pub(crate) fn send_verification_email(user_id: Uuid, _email: &str, token: &str) -> Option<String> {
     let base = std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "http://localhost:3001".into());
     let link = format!("{base}/api/v1/auth/verify-email?token={token}");
-    println!("✉️  Verification link issued for user {user_id} (TODO: wire up a real email provider to send it)");
+    println!(
+        "✉️  Verification link issued for user {} (TODO: wire up a real email provider to send it)",
+        crate::email_privacy::log_ref(user_id)
+    );
 
     if std::env::var("APP_ENV").as_deref() == Ok("development") {
         Some(link)

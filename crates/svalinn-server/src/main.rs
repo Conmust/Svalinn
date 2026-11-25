@@ -389,7 +389,8 @@ async fn backfill_email_privacy(db: &Database) -> Result<(), sqlx::Error> {
         if let Err(sqlx::Error::Database(d)) = &outcome {
             if d.is_unique_violation() {
                 eprintln!(
-                    "⚠️  Account {user_id} shares an email (case-insensitively) with an already-migrated account; clearing its plaintext email without setting email_hash. It will need a manual email reset to log in again."
+                    "⚠️  Account {} shares an email (case-insensitively) with an already-migrated account; clearing its plaintext email without setting email_hash. It will need a manual email reset to log in again.",
+                    crate::email_privacy::log_ref(user_id)
                 );
                 sqlx::query("UPDATE users SET email = NULL, email_encrypted = $1 WHERE id = $2")
                     .bind(&email_encrypted)

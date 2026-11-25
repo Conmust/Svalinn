@@ -27,12 +27,11 @@
 //! and new rows would stop matching each other -- back up both, but treat
 //! the pepper as the one that must never change once chosen.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 const NONCE_LEN: usize = 12;
 const MIN_PEPPER_LENGTH: usize = 16;
@@ -113,19 +112,22 @@ pub fn is_plausible_format(email: &str) -> bool {
 /// compare two emails for equality; use `blind_index` for that instead.
 pub fn encrypt(email: &str) -> String {
     let cipher = Aes256Gcm::new(encryption_key().into());
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    // Drawn fresh from the OS CSPRNG for every call, never from a fixed or
+    // zeroed buffer -- `generate_nonce` is the crate's own recommended way
+    // to get one (see the aes-gcm docs), and doing it this way (rather than
+    // filling a stack buffer by hand) keeps the "this is genuinely random,
+    // not a placeholder" property visible at the type level.
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
     // Encrypting normalized (not raw) input means decrypt() always returns
     // the same canonical form that was hashed -- display code doesn't need
     // to separately re-normalize before comparing it to anything.
     let ciphertext = cipher
-        .encrypt(nonce, normalize(email).as_bytes())
+        .encrypt(&nonce, normalize(email).as_bytes())
         .expect("AES-GCM encryption with a valid 32-byte key cannot fail");
 
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(nonce.as_slice());
     out.extend_from_slice(&ciphertext);
     base64::engine::general_purpose::STANDARD.encode(out)
 }
@@ -158,6 +160,18 @@ pub fn decrypt(stored: &str) -> Result<String, DecryptError> {
         .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
         .map_err(|_| DecryptError::Cipher)?;
     String::from_utf8(plaintext).map_err(|_| DecryptError::NotUtf8)
+}
+
+/// A short, one-way stand-in for an account id, safe to put in a log line
+/// in its place. Two calls with the same id always produce the same output
+/// (so separate log lines about the same account still visibly correlate),
+/// but the output can't be turned back into the id -- unlike printing the
+/// id itself, which would put a real, lookup-capable account reference into
+/// a log file, exactly the kind of plaintext-in-logs exposure this module
+/// otherwise exists to avoid for email addresses.
+pub fn log_ref(id: uuid::Uuid) -> String {
+    let digest = Sha256::digest(id.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(&digest[..6])
 }
 
 /// A deterministic, keyed stand-in for an email, safe to store and index.
