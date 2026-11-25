@@ -25,8 +25,23 @@ pub struct Rule {
 
 /// Any login attempt from one IP address.
 pub const LOGIN_PER_IP: Rule = Rule { name: "login-ip", limit: 20, window: Duration::from_secs(5 * 60) };
-/// Failed logins for one account, from anywhere. Reset by a successful login.
-pub const LOGIN_FAILURES_PER_ACCOUNT: Rule = Rule { name: "login-account", limit: 5, window: Duration::from_secs(15 * 60) };
+/// Failed logins for one account from one IP address. Reset by a successful
+/// login. This is the real brute-force throttle: it's what actually stops
+/// someone guessing passwords against one account, and it's tight because
+/// it only ever penalizes the IP doing the guessing.
+pub const LOGIN_FAILURES_PER_ACCOUNT_IP: Rule =
+    Rule { name: "login-account-ip", limit: 5, window: Duration::from_secs(15 * 60) };
+/// Failed logins for one account, from anywhere, combined. Reset by a
+/// successful login. Deliberately looser than the per-(account, IP) rule
+/// above: this one is keyed on the account alone, with no IP in the key, so
+/// an attacker who knows nothing but a victim's email can trip it from a
+/// single IP with a handful of wrong passwords -- which would lock the
+/// legitimate owner out of their own account for the window's duration,
+/// with no password or access of any kind required to cause that. Its only
+/// job is to catch a *distributed* brute force (many IPs against the same
+/// account) that the per-IP rule above can't see; it must never be tight
+/// enough for one attacker, from one IP, to deny the real owner a login.
+pub const LOGIN_FAILURES_PER_ACCOUNT: Rule = Rule { name: "login-account", limit: 30, window: Duration::from_secs(15 * 60) };
 /// New accounts from one IP address.
 pub const REGISTER_PER_IP: Rule = Rule { name: "register-ip", limit: 5, window: Duration::from_secs(60 * 60) };
 /// Invite lookups and joins by one user (stops guessing codes).

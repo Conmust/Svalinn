@@ -126,6 +126,25 @@ pub async fn blind_sign(
         .decode(&payload.blinded_message)
         .map_err(|_| AppError::BadRequest("blinded_message is not valid base64".into()))?;
 
+    // Compute the blind signature BEFORE spending the receipt. Signing is a
+    // pure, side-effect-free crypto operation (see `blind_tokens::blind_sign`
+    // -- it only touches the in-memory keypair), so doing it first means a
+    // failure here (a `blinded_message` that decoded as valid base64 but
+    // isn't a well-formed blinded message for this key, or any other
+    // signer-side error) leaves the receipt completely untouched: the
+    // caller can simply retry. Signing-then-consuming (the previous order)
+    // instead burned the receipt on the atomic UPDATE below and THEN found
+    // out signing had failed -- permanently destroying a paid-for receipt
+    // with no token ever issued and no way to retry.
+    //
+    // Two concurrent requests for the same receipt can both reach this
+    // point and both sign successfully; that's fine, since only one of
+    // them will go on to actually consume the receipt in the UPDATE below
+    // -- the loser just did some wasted (not harmful, not double-spent)
+    // signing work.
+    let blind_signature = blind_tokens::blind_sign(&payload.tier, &blinded_message)
+        .map_err(AppError::Internal)?;
+
     let receipt_hash = blind_tokens::hash_receipt_token(&payload.receipt_token);
 
     // Atomically spend the receipt: this UPDATE only touches a row that is
@@ -148,9 +167,6 @@ pub async fn blind_sign(
     if consumed.is_none() {
         return Err(AppError::Forbidden("That receipt is invalid or has already been used".into()));
     }
-
-    let blind_signature = blind_tokens::blind_sign(&payload.tier, &blinded_message)
-        .map_err(AppError::Internal)?;
 
     Ok(Json(BlindSignResponse { blind_signature: B64.encode(blind_signature) }))
 }

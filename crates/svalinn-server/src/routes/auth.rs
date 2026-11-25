@@ -28,7 +28,9 @@ use crate::disposable_email;
 use crate::email_privacy;
 use crate::errors::AppError;
 use crate::extractors::auth::jwt_secret;
-use crate::rate_limit::{ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_PER_IP, REGISTER_PER_IP};
+use crate::rate_limit::{
+    ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_FAILURES_PER_ACCOUNT_IP, LOGIN_PER_IP, REGISTER_PER_IP,
+};
 use crate::sessions::AccessDenied;
 use crate::models::user::{
     AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, User,
@@ -147,18 +149,29 @@ pub async fn login(
     ClientIp(ip): ClientIp,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    // Limit password guessing: every attempt counts per IP address, and failed
-    // attempts count per account (whichever addresses they come from). Keyed
-    // on the blind index (not the raw email) so the in-memory limiter never
-    // holds a plaintext address either, and so "Alice@x.com"/"alice@x.com"
-    // share one counter.
+    // Limit password guessing: every attempt counts per IP address, and
+    // failed attempts count both per (account, IP) -- the real brute-force
+    // throttle -- and per account alone, as a looser backstop against a
+    // distributed attack. Keyed on the blind index (not the raw email) so
+    // the in-memory limiter never holds a plaintext address either, and so
+    // "Alice@x.com"/"alice@x.com" share one counter.
+    //
+    // The per-account-alone rule is deliberately loose (see its doc comment
+    // in rate_limit.rs): an attacker who only knows a victim's email, with
+    // no password, must not be able to lock the real owner out of their own
+    // account just by sending a handful of wrong passwords from one IP. The
+    // tight (account, IP) rule below is what actually stops a brute force,
+    // and it only ever penalizes whichever IP is doing the guessing.
     let ip = ip.to_string();
     let account = email_privacy::blind_index(&payload.email);
+    let account_ip = format!("{account}:{ip}");
     db.limits.check(&LOGIN_PER_IP, &ip)?;
+    db.limits.check(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip)?;
     db.limits.check(&LOGIN_FAILURES_PER_ACCOUNT, &account)?;
     db.limits.record(&LOGIN_PER_IP, &ip);
 
     let invalid = || {
+        db.limits.record(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip);
         db.limits.record(&LOGIN_FAILURES_PER_ACCOUNT, &account);
         AppError::BadRequest("Invalid email or password".into())
     };
@@ -181,6 +194,7 @@ pub async fn login(
     {
         return Err(invalid());
     }
+    db.limits.reset(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip);
     db.limits.reset(&LOGIN_FAILURES_PER_ACCOUNT, &account);
 
     // Only reveal a ban to someone who knows the password.
