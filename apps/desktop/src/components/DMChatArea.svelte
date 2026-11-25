@@ -277,7 +277,25 @@
   async function ensureRatchetMessageDecrypted(message: ConversationMessage, mine: MessageRecipientEntry): Promise<void> {
     ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
     try {
-      const senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      let senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      if (!senderDeviceId) {
+        // `participantDevices` is a point-in-time snapshot (fetched once on
+        // mount/conversation-select -- see `loadParticipantDevices`), with
+        // no live push when the OTHER participant registers a device mid-
+        // session: there's no "device added" WebSocket event, unlike every
+        // other piece of conversation state here. The SEND path already
+        // self-heals from this exact staleness (a 400 naming the unknown
+        // device_id triggers a `loadParticipantDevices()` retry -- see
+        // `isStaleDeviceListError` below); the RECEIVE path had no
+        // equivalent, so a message legitimately encrypted for a just-added
+        // sender device looked permanently undecryptable even though
+        // nothing is actually wrong -- a fresh fetch would have resolved
+        // it. One retry, not a loop: if the device still isn't known after
+        // refetching, it really doesn't exist (removed, or a bogus
+        // sender_public_key), and this message stays undecryptable.
+        await loadParticipantDevices();
+        senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      }
       if (!senderDeviceId) {
         ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
         return;
