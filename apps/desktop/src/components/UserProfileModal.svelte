@@ -77,17 +77,19 @@
 </script>
 
 {#if user}
-  <div 
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm" 
-    on:click={handleClose} 
+  <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+    on:click={handleClose}
     on:keydown={(e) => e.key === 'Escape' && handleClose()}
-    role="dialog" 
+    role="dialog"
     aria-modal="true"
     tabindex="-1"
   >
-    <div 
-      class="relative w-[400px] max-w-[90vw] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] flex flex-col" 
-      on:click|stopPropagation 
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions -->
+    <div
+      class="relative w-[400px] max-w-[90vw] bg-black border-2 border-[#00ff00] shadow-[0_0_30px_rgba(0,255,0,0.4)] flex flex-col"
+      on:click|stopPropagation
       on:keydown|stopPropagation
       role="document"
     >

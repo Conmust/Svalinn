@@ -12,7 +12,7 @@ use crate::models::message::BroadcastMessage;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
-use crate::permissions::{resolve_server, Permission};
+use crate::permissions::{resolve_channel, resolve_server, Permission};
 
 #[derive(Serialize, FromRow)]
 pub struct Channel {
@@ -42,6 +42,13 @@ fn clean_channel_type(channel_type: Option<String>) -> Result<String, AppError> 
 }
 
 /// GET /api/v1/servers/:server_id/channels
+///
+/// Only returns channels the caller can actually view -- a channel
+/// where a role/member overwrite denies `VIEW_CHANNEL` (a private
+/// channel) is simply absent, the same way it's absent from message
+/// reads (`messages::get_channel_messages` already requires
+/// `VIEW_CHANNEL`; this is the list-level counterpart, so a hidden
+/// channel never even shows up to be clicked).
 pub async fn get_server_channels(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
@@ -72,7 +79,14 @@ pub async fn get_server_channels(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(channels))
+    let mut visible = Vec::with_capacity(channels.len());
+    for channel in channels {
+        if resolve_channel(&db, channel.id, user_id).await?.has(Permission::VIEW_CHANNEL) {
+            visible.push(channel);
+        }
+    }
+
+    Ok(Json(visible))
 }
 
 /// POST /api/v1/servers/:server_id/channels
@@ -86,6 +100,28 @@ fn clean_name(name: &str) -> Result<&str, AppError> {
         return Err(AppError::BadRequest("Channel name must be at most 100 characters".into()));
     }
     Ok(name)
+}
+
+/// The server members who currently hold `VIEW_CHANNEL` on this channel --
+/// i.e. who a channel_created/updated/deleted event about it should reach.
+/// Computed up front (before any mutation) so a channel_deleted broadcast
+/// still has someone to check permissions against: by delivery time the
+/// channel row, and its overwrites, no longer exist.
+async fn members_who_can_view(db: &Database, server_id: Uuid, channel_id: Uuid) -> Result<Vec<Uuid>, AppError> {
+    let member_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut visible = Vec::with_capacity(member_ids.len());
+    for user_id in member_ids {
+        if resolve_channel(db, channel_id, user_id).await?.has(Permission::VIEW_CHANNEL) {
+            visible.push(user_id);
+        }
+    }
+    Ok(visible)
 }
 
 /// Renaming and deleting channels needs admin rank or above.
@@ -129,11 +165,14 @@ pub async fn create_channel(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Everyone else's channel list updates straight away.
-    let _ = db.message_tx.send(BroadcastMessage::to_server(
+    // Everyone else's channel list updates straight away -- but only for
+    // members who can actually see this channel (it may be private from
+    // the moment it's created, via its default role's overwrites).
+    let recipients = members_who_can_view(&db, server_id, channel.id).await?;
+    let _ = db.message_tx.send(BroadcastMessage::to_users(
         "channel_created",
         serde_json::json!({ "id": channel.id, "server_id": server_id, "name": channel.name, "channel_type": channel.channel_type, "created_at": channel.created_at }),
-        server_id,
+        recipients,
     ));
 
     Ok(Json(channel))
@@ -158,7 +197,8 @@ pub async fn rename_channel(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let payload = serde_json::json!({ "id": channel_id, "server_id": server_id, "name": name });
-    let _ = db.message_tx.send(BroadcastMessage::to_server("channel_updated", payload.clone(), server_id));
+    let recipients = members_who_can_view(&db, server_id, channel_id).await?;
+    let _ = db.message_tx.send(BroadcastMessage::to_users("channel_updated", payload.clone(), recipients));
     Ok(Json(payload))
 }
 
@@ -170,6 +210,11 @@ pub async fn delete_channel(
 ) -> Result<axum::http::StatusCode, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_channel_admin(&db, server_id, user_id).await?;
+
+    // Who can see this channel right now -- computed before it's deleted,
+    // since afterwards there's no channel (or overwrites) left to check
+    // permissions against.
+    let recipients = members_who_can_view(&db, server_id, channel_id).await?;
 
     // Messages, reactions and read markers go with the channel (ON DELETE
     // CASCADE); collect attachment files first so they can be removed too.
@@ -189,10 +234,10 @@ pub async fn delete_channel(
 
     crate::files::remove_stored_files(&files).await;
 
-    let _ = db.message_tx.send(BroadcastMessage::to_server(
+    let _ = db.message_tx.send(BroadcastMessage::to_users(
         "channel_deleted",
         serde_json::json!({ "id": channel_id, "server_id": server_id }),
-        server_id,
+        recipients,
     ));
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

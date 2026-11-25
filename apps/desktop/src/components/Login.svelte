@@ -67,8 +67,9 @@
     <form on:submit|preventDefault={handleSubmit} class="space-y-4">
       {#if mode === 'register'}
         <div>
-          <label class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Username:</label>
+          <label for="login-username" class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Username:</label>
           <input
+            id="login-username"
             type="text"
             bind:value={username}
             required
@@ -81,8 +82,9 @@
       {/if}
 
       <div>
-        <label class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Email:</label>
+        <label for="login-email" class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Email:</label>
         <input
+          id="login-email"
           type="email"
           bind:value={email}
           required
@@ -93,8 +95,9 @@
       </div>
 
       <div>
-        <label class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Password:</label>
+        <label for="login-password" class="block text-xs text-[#00aa00] mb-1 terminal-glow">{'>'} Password:</label>
         <input
+          id="login-password"
           type="password"
           bind:value={password}
           required

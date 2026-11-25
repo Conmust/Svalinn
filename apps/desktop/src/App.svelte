@@ -14,24 +14,17 @@
   import DMList from './components/DMList.svelte';
   import DMChatArea from './components/DMChatArea.svelte';
   import CallOverlay from './components/CallOverlay.svelte';
+  import VoiceChannelView from './components/VoiceChannelView.svelte';
   import { initCallSignaling } from './lib/calls';
-  import {
-    initVoiceChannelSignaling,
-    fetchVoiceParticipants,
-    voiceParticipants,
-    myVoiceChannelId,
-    joinVoiceChannel,
-    leaveVoiceChannel,
-  } from './lib/voiceChannels';
-  import { fetchServerMembers, type Member } from './lib/members';
+  import { initVoiceSignaling } from './lib/voiceChannel';
   import type { Conversation } from './lib/conversations';
   import type { Channel } from './lib/servers';
 
-  // Registers the WS listeners that drive incoming/outgoing calls. Only
-  // needs to happen once -- `wsClient.on` just adds listeners, independent
-  // of connect/reconnect cycles below.
+  // Registers the WS listeners that drive incoming/outgoing calls and voice
+  // channels. Only needs to happen once -- `wsClient.on` just adds
+  // listeners, independent of connect/reconnect cycles below.
   initCallSignaling();
-  initVoiceChannelSignaling();
+  initVoiceSignaling();
 
   let currentUser = getCurrentUser();
   let activeServer: string | null = null;
@@ -47,26 +40,6 @@
   // the layout at `md` and above, where every pane is always shown as
   // before.
   let mobileView: 'nav' | 'chat' | 'roster' = 'nav';
-
-  // Who's currently in the open voice channel, and whether this device is
-  // one of them. Presence only -- see `lib/voiceChannels.ts`.
-  $: currentVoiceParticipantIds =
-    activeChannel && activeChannel.channel_type === 'voice'
-      ? ($voiceParticipants[activeChannel.id] ?? [])
-      : [];
-  $: isInCurrentVoiceChannel = activeChannel ? $myVoiceChannelId === activeChannel.id : false;
-
-  async function toggleVoiceChannelMembership() {
-    if (!activeChannel) return;
-    if (isInCurrentVoiceChannel) {
-      await leaveVoiceChannel(activeChannel.id);
-    } else {
-      // Only one voice channel at a time -- leave whichever one we're
-      // already in first, same as Discord.
-      if ($myVoiceChannelId) await leaveVoiceChannel($myVoiceChannelId);
-      await joinVoiceChannel(activeChannel.id);
-    }
-  }
 
   // Stay connected whenever logged in, whatever is on screen, so live
   // updates and a ban or revoked session reach the app straight away.
@@ -135,26 +108,11 @@
   let serverUrl = apiBase();
   let editingServer = false;
 
-  // Maps a voice channel participant's user id to their username, for
-  // display -- a participant id with no entry here just falls back to
-  // showing the raw id (members list hasn't loaded yet, or is stale).
-  let serverMembersById: Record<string, Member> = {};
-
   function handleServerSelected(event: CustomEvent<string | null>) {
     activeServer = event.detail;
     activeChannel = null;
     activeConversation = null;
     mobileView = 'nav';
-    if (activeServer) {
-      fetchVoiceParticipants(activeServer);
-      fetchServerMembers(activeServer)
-        .then((members) => {
-          serverMembersById = Object.fromEntries(members.map((m) => [m.id, m]));
-        })
-        .catch(() => {});
-    } else {
-      serverMembersById = {};
-    }
   }
 
   function handleChannelSelected(event: CustomEvent<Channel>) {
@@ -291,43 +249,11 @@
          there's no empty placeholder stranded with no way back to 'nav'. -->
     <div class="flex-1 min-w-0 {mobileView === 'chat' ? 'flex' : 'hidden'} md:flex">
       {#if activeChannel && activeServer && activeChannel.channel_type === 'voice'}
-        <!-- Presence only, so far -- joining shows you in the participant
-             list for everyone in the server, but doesn't connect any audio
-             yet. Full group calls need a media server (SFU) or a small
-             P2P mesh on top of this; see lib/voiceChannels.ts. -->
-        <div class="flex-1 flex flex-col items-center justify-center text-[#00aa00] terminal-glow px-6">
-          <div class="text-4xl mb-4">🔊</div>
-          <div class="text-xl font-bold mb-1">{'>'} {activeChannel.name}</div>
-          <div class="text-xs text-[#006600] mb-6 max-w-sm text-center">
-            Voice channel presence -- call audio isn't wired up yet.
-          </div>
-
-          <button
-            type="button"
-            class="px-6 py-2 border-2 font-semibold uppercase tracking-wider text-sm transition-all mb-6 {isInCurrentVoiceChannel
-              ? 'border-red-500 text-red-400 hover:bg-red-900/40'
-              : 'border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black'}"
-            on:click={toggleVoiceChannelMembership}
-          >
-            {isInCurrentVoiceChannel ? 'Leave' : 'Join'}
-          </button>
-
-          {#if currentVoiceParticipantIds.length > 0}
-            <div class="w-full max-w-xs space-y-1">
-              <div class="text-xs text-[#006600] uppercase tracking-wider mb-2">
-                {currentVoiceParticipantIds.length} connected
-              </div>
-              {#each currentVoiceParticipantIds as participantId (participantId)}
-                <div class="text-sm text-[#00aa00] truncate">
-                  {'>'} {serverMembersById[participantId]?.username ?? participantId}
-                  {participantId === currentUser?.id ? '(you)' : ''}
-                </div>
-              {/each}
-            </div>
-          {:else}
-            <div class="text-xs text-[#006600]">Nobody's connected yet.</div>
-          {/if}
-        </div>
+        <VoiceChannelView
+          channelId={activeChannel.id}
+          channelName={activeChannel.name}
+          serverId={activeServer}
+        />
       {:else if activeChannel && activeServer}
         <ChatArea
           channelId={activeChannel.id}
