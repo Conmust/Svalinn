@@ -887,4 +887,69 @@ describe('Ratchet regressions (reported by external review)', () => {
       expect(replayed).toBeNull();
     });
   });
+
+  describe('Fix: AEAD associated data now binds the ratchet header (confidentiality review: "AEAD associated-data not binding the ratchet header fields")', () => {
+    it(
+      "tampering with a same-chain message's pn field -- otherwise UNUSED and unauthenticated for a message that " +
+        'does not cross a DH ratchet step -- is now caught instead of silently accepted',
+      async () => {
+        const alice = await createDeviceHarness();
+        const bob = await createDeviceHarness();
+
+        // Establish a confirmed session, then send one more message on the
+        // SAME chain (no DH ratchet step needed, since it's still Alice's
+        // turn to send) -- this is deliberately the case where `pn` has NO
+        // effect on which key gets derived: `ratchetDecrypt` only ever
+        // reads `envelope.pn` inside the `envelope.dh !== working.dhrPublic`
+        // branch, which a same-chain message never enters. Before this fix,
+        // `pn` was also absent from the AD, so tampering with it on exactly
+        // this kind of message was a completely free, totally undetected
+        // change -- not merely "likely to fail for an unrelated reason"
+        // like tampering with `dh` or `n` usually was.
+        const hello = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'hi'));
+        await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, hello));
+        const reply = await on(bob, ({ ratchet }) => ratchet.encryptMessage(alice.deviceId, 'hi back'));
+        await on(alice, ({ ratchet }) => ratchet.decryptMessage(bob.deviceId, reply));
+
+        const envelope = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'same chain'));
+        const tampered = { ...envelope, pn: envelope.pn + 999 };
+
+        const result = await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, tampered));
+        expect(result).toBeNull();
+
+        // The untampered original is still perfectly decryptable -- this
+        // isn't a case of the message having become unreadable for some
+        // unrelated reason; only the tampered copy is rejected.
+        const genuine = await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envelope));
+        expect(genuine).toBe('same chain');
+      }
+    );
+
+    it(
+      "a known low-order X25519 point in a message's dh field (e.g. all-zero) -- which libsodium's " +
+        'crypto_scalarmult rejects outright -- is treated as a failed decrypt, not an uncaught exception',
+      async () => {
+        const alice = await createDeviceHarness();
+        const bob = await createDeviceHarness();
+
+        const hello = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'hi'));
+        await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, hello));
+        const reply = await on(bob, ({ ratchet }) => ratchet.encryptMessage(alice.deviceId, 'hi back'));
+        await on(alice, ({ ratchet }) => ratchet.decryptMessage(bob.deviceId, reply));
+
+        // Forces the `envelope.dh !== working.dhrPublic` branch (a
+        // genuine new chain), so the tampered `dh` actually reaches
+        // `performDhRatchet`'s `crypto_scalarmult` call -- a same-chain
+        // message (as in the test above) never gets that far. This
+        // specific malicious `dh` can be delivered to ANY recipient by
+        // anyone, with no interception of real traffic needed: it's not a
+        // modification of a genuine in-flight message, it's a freestanding
+        // crafted envelope.
+        const allZeroDh = alice.ratchet.b64(new Uint8Array(32));
+        const malicious = { ...reply, dh: allZeroDh, n: 0, pn: 0 };
+
+        await expect(on(alice, ({ ratchet }) => ratchet.decryptMessage(bob.deviceId, malicious))).resolves.toBeNull();
+      }
+    );
+  });
 });
