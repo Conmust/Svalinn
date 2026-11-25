@@ -33,6 +33,11 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "disposable_email.rs"]
+mod disposable_email;
+#[path = "email_privacy.rs"]
+mod email_privacy;
+
 const USAGE: &str = "\
 Usage: svalinn-admin <command>
 
@@ -53,6 +58,13 @@ async fn main() {
     let Some(command) = args.first().map(String::as_str) else {
         exit_with(USAGE);
     };
+
+    let app_env = std::env::var("APP_ENV").unwrap_or_default();
+    match email_privacy::init_keys(&app_env) {
+        Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
+        Ok(None) => {}
+        Err(problem) => exit_with(&problem),
+    }
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| exit_with("DATABASE_URL is required"));
     let pool = PgPoolOptions::new()
@@ -89,7 +101,12 @@ fn exit_with(message: &str) -> ! {
 }
 
 async fn find_user(pool: &PgPool, who: &str) -> Result<(Uuid, String), String> {
-    sqlx::query_as("SELECT id, username FROM users WHERE email = $1 OR username = $1")
+    // `who` might be a username or an email; try both, since there's no way
+    // to tell from the string alone (emails are matched by blind index now,
+    // not stored in plaintext -- see email_privacy.rs).
+    let email_hash = email_privacy::blind_index(who);
+    sqlx::query_as("SELECT id, username FROM users WHERE email_hash = $1 OR username = $2")
+        .bind(email_hash)
         .bind(who)
         .fetch_optional(pool)
         .await
@@ -153,8 +170,8 @@ async fn revoke_sessions(pool: &PgPool, who: &str) -> Result<(), String> {
 }
 
 async fn list_banned(pool: &PgPool) -> Result<(), String> {
-    let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>, Option<String>)> = sqlx::query_as(
-        "SELECT username, email, banned_at, ban_reason FROM users WHERE banned_at IS NOT NULL ORDER BY banned_at",
+    let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>, Option<String>)> = sqlx::query_as(
+        "SELECT username, email_encrypted, banned_at, ban_reason FROM users WHERE banned_at IS NOT NULL ORDER BY banned_at",
     )
     .fetch_all(pool)
     .await
@@ -163,7 +180,11 @@ async fn list_banned(pool: &PgPool) -> Result<(), String> {
     if rows.is_empty() {
         println!("No banned accounts.");
     }
-    for (username, email, at, reason) in rows {
+    for (username, email_encrypted, at, reason) in rows {
+        let email = email_encrypted
+            .as_deref()
+            .and_then(|e| email_privacy::decrypt(e).ok())
+            .unwrap_or_else(|| "?".to_string());
         println!("{username} <{email}>  banned {}  {}", at.format("%Y-%m-%d %H:%M UTC"), reason.unwrap_or_default());
     }
     Ok(())
@@ -177,8 +198,11 @@ async fn create_user(pool: &PgPool, username: &str, email: &str, password: &str,
     if !(3..=50).contains(&username.len()) {
         return Err("Username must be 3-50 characters".into());
     }
-    if !email.contains('@') || email.len() > 255 {
+    if !email_privacy::is_plausible_format(email) {
         return Err("Enter a valid email address".into());
+    }
+    if disposable_email::is_disposable(email) {
+        return Err("Please use a permanent email address rather than a disposable/temporary one".into());
     }
     if password.len() < 6 {
         return Err("Password must be at least 6 characters".into());
@@ -190,14 +214,18 @@ async fn create_user(pool: &PgPool, username: &str, email: &str, password: &str,
         .map_err(|e| format!("Password hashing failed: {e}"))?
         .to_string();
 
+    // An operator running this CLI is already vouching for the account, so
+    // it's created pre-verified -- there's no email-sending capability here
+    // to make them click a link anyway.
     sqlx::query(
         r#"
-        INSERT INTO users (username, email, password_hash, display_name, site_role)
-        VALUES ($1, $2, $3, $1, $4)
+        INSERT INTO users (username, email_encrypted, email_hash, password_hash, display_name, site_role, email_verified_at)
+        VALUES ($1, $2, $3, $4, $1, $5, NOW())
         "#,
     )
     .bind(username)
-    .bind(email)
+    .bind(email_privacy::encrypt(email))
+    .bind(email_privacy::blind_index(email))
     .bind(hash)
     .bind(site_owner.then_some("owner"))
     .execute(pool)

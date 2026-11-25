@@ -8,6 +8,8 @@ use uuid::Uuid;
 use sqlx::FromRow;
 
 use crate::db::Database;
+use crate::disposable_email;
+use crate::email_privacy;
 use crate::errors::AppError;
 use crate::extractors::auth::{CurrentSession, CurrentUser};
 use crate::files::{sign_opt, stored_path};
@@ -449,6 +451,7 @@ pub struct Account {
     pub id: Uuid,
     pub username: String,
     pub email: String,
+    pub email_verified: bool,
     pub is_site_owner: bool,
 }
 
@@ -457,14 +460,25 @@ pub async fn get_account(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
 ) -> Result<Json<Account>, AppError> {
-    let (username, email, is_site_owner): (String, String, bool) = sqlx::query_as(
-        "SELECT username, email, COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_one(&db.pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(Json(Account { id: user_id, username, email, is_site_owner }))
+    let (username, email_encrypted, email_verified, is_site_owner): (String, Option<String>, bool, bool) =
+        sqlx::query_as(
+            "SELECT username, email_encrypted, email_verified_at IS NOT NULL, COALESCE(site_role = 'owner', false) FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Decrypting here (rather than returning the blind index or nothing) is
+    // the one legitimate display use for the real address -- showing the
+    // account's own owner their own email back, same as any account
+    // settings page. See email_privacy.rs.
+    let email = email_encrypted
+        .as_deref()
+        .and_then(|e| email_privacy::decrypt(e).ok())
+        .unwrap_or_default();
+
+    Ok(Json(Account { id: user_id, username, email, email_verified, is_site_owner }))
 }
 
 /// Checks the user's current password before a sensitive change. Wrong
@@ -497,32 +511,51 @@ pub struct ChangeEmailRequest {
 }
 
 /// PATCH /api/v1/users/me/email
+///
+/// Re-requires verification on the new address -- same reasoning as
+/// registration (routes::auth::register): an email change is just as good
+/// an evasion vector as a new account if it skipped the same checks.
 pub async fn change_email(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Json(payload): Json<ChangeEmailRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let email = payload.email.trim();
-    let valid = email.len() <= 255
-        && email.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'))
-        && !email.contains(char::is_whitespace);
-    if !valid {
+    if !email_privacy::is_plausible_format(email) {
         return Err(AppError::BadRequest("Enter a valid email address".into()));
+    }
+    if disposable_email::is_disposable(email) {
+        return Err(AppError::BadRequest(
+            "Please use a permanent email address rather than a disposable/temporary one".into(),
+        ));
     }
 
     verify_current_password(&db, user_id, &payload.current_password).await?;
 
-    sqlx::query("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2")
-        .bind(email)
-        .bind(user_id)
-        .execute(&db.pool)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::Database(d) if d.is_unique_violation() => AppError::BadRequest("That email is already in use".into()),
-            e => AppError::Database(e.to_string()),
-        })?;
+    let email_hash = email_privacy::blind_index(email);
+    let email_encrypted = email_privacy::encrypt(email);
 
-    Ok(Json(serde_json::json!({ "email": email })))
+    sqlx::query(
+        "UPDATE users SET email_encrypted = $1, email_hash = $2, email_verified_at = NULL, updated_at = NOW() WHERE id = $3",
+    )
+    .bind(&email_encrypted)
+    .bind(&email_hash)
+    .bind(user_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(d) if d.is_unique_violation() => AppError::BadRequest("That email is already in use".into()),
+        e => AppError::Database(e.to_string()),
+    })?;
+
+    let token = crate::routes::auth::issue_verification_token(&db, user_id).await?;
+    let dev_link = crate::routes::auth::send_verification_email(user_id, email, &token);
+
+    Ok(Json(serde_json::json!({
+        "email": email,
+        "email_verification_required": true,
+        "dev_verification_link": dev_link,
+    })))
 }
 
 #[derive(Deserialize)]

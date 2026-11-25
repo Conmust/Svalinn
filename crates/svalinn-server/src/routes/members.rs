@@ -319,8 +319,38 @@ pub async fn ban_member(
         e => AppError::Database(e.to_string()),
     })?;
 
+    // Also record the banned account's email hash against this server, so a
+    // new account verified under the same real email can't just walk back
+    // in via an invite (see `accept_invite`). Best-effort: a banned user
+    // with no verified email yet (email_hash still NULL) has nothing to
+    // record here, which is fine -- `accept_invite` already requires
+    // verification before anyone can join at all.
+    if let Some(email_hash) = email_hash_of(&db, payload.user_id).await? {
+        sqlx::query(
+            r#"
+            INSERT INTO banned_emails (email_hash, server_id, reason) VALUES ($1, $2, $3)
+            ON CONFLICT (email_hash, server_id) WHERE server_id IS NOT NULL DO UPDATE SET reason = $3
+            "#,
+        )
+        .bind(&email_hash)
+        .bind(server_id)
+        .bind(reason)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
     remove_member(&db, server_id, &server_name, payload.user_id, "banned").await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn email_hash_of(db: &Database, user_id: Uuid) -> Result<Option<String>, AppError> {
+    sqlx::query_scalar("SELECT email_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&db.pool)
+        .await
+        .map(Option::flatten)
+        .map_err(|e| AppError::Database(e.to_string()))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -554,6 +584,37 @@ mod tests {
         }
     }
 
+    /// `email_privacy::init_keys` panics if a test calls encrypt/blind_index
+    /// before it's run; it's idempotent-safe (OnceLock) across tests in this
+    /// module, which all share one test binary. Needs EMAIL_ENCRYPTION_KEY /
+    /// EMAIL_BLIND_INDEX_PEPPER set in the test environment's .env, same as
+    /// DATABASE_URL already is.
+    fn ensure_email_privacy_keys() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            dotenvy::dotenv().ok();
+            crate::email_privacy::init_keys("development").expect("test .env must set EMAIL_ENCRYPTION_KEY/EMAIL_BLIND_INDEX_PEPPER");
+        });
+    }
+
+    async fn create_test_user_with_verified_email(db: &Database, email: &str) -> Uuid {
+        ensure_email_privacy_keys();
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO users (username, email_encrypted, email_hash, email_verified_at, password_hash, display_name)
+            VALUES ($1, $2, $3, NOW(), $4, $1) RETURNING id
+            "#,
+        )
+        .bind(format!("test_{unique}"))
+        .bind(crate::email_privacy::encrypt(email))
+        .bind(crate::email_privacy::blind_index(email))
+        .bind("not-a-real-hash")
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user with verified email")
+    }
+
     async fn nickname_of(db: &Database, server_id: Uuid, user_id: Uuid) -> Option<String> {
         sqlx::query_scalar("SELECT nickname FROM server_members WHERE server_id = $1 AND user_id = $2")
             .bind(server_id)
@@ -737,5 +798,37 @@ mod tests {
         assert_eq!(me.nickname, Some("Boss".to_string()));
 
         cleanup(&db, server_id, &[owner]).await;
+    }
+
+    #[tokio::test]
+    async fn ban_member_records_the_banned_email_hash_for_this_server() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let email = format!("evader_{}@example.invalid", Uuid::new_v4());
+        let evader = create_test_user_with_verified_email(&db, &email).await;
+        join_server(&db, server_id, evader, "member").await;
+
+        ban_member(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(BanRequest { user_id: evader, reason: Some("evasion test".into()) }),
+        )
+        .await
+        .expect("owner should be able to ban a plain member");
+
+        let email_hash = crate::email_privacy::blind_index(&email);
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM banned_emails WHERE server_id = $1 AND email_hash = $2)",
+        )
+        .bind(server_id)
+        .bind(&email_hash)
+        .fetch_one(&db.pool)
+        .await
+        .expect("querying banned_emails failed");
+        assert!(recorded, "banning a member with a verified email should record its blind-index hash");
+
+        cleanup(&db, server_id, &[owner, evader]).await;
     }
 }

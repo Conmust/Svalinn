@@ -1,6 +1,8 @@
 mod access;
 mod badges;
 mod db;
+mod disposable_email;
+mod email_privacy;
 mod errors;
 mod extractors;
 mod files;
@@ -40,7 +42,19 @@ async fn main() {
     // only ever returns a fixed diagnostic string about the secret's
     // *length* (e.g. "JWT_SECRET is shorter than N characters...") -- it
     // never returns, or logs, the secret's actual value.
+    let app_env = std::env::var("APP_ENV").unwrap_or_default();
     match crate::extractors::auth::init_jwt_secret() {
+        Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
+        Ok(None) => {}
+        Err(problem) => {
+            eprintln!("❌ {problem}");
+            std::process::exit(1);
+        }
+    }
+
+    // Same pattern as the JWT secret above: refuse to start without proper
+    // keys for encrypting/blind-indexing emails (see email_privacy.rs).
+    match crate::email_privacy::init_keys(&app_env) {
         Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
         Ok(None) => {}
         Err(problem) => {
@@ -58,6 +72,12 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
+    // One-time backfill: any row still carrying a plaintext `email` (every
+    // account created before this feature existed) gets it encrypted +
+    // blind-indexed, then cleared. Idempotent and cheap once caught up --
+    // the WHERE clause only ever matches rows this hasn't already run on.
+    backfill_email_privacy(&db).await.expect("Failed to backfill legacy plaintext emails");
+
     presence::reset(&db)
         .await
         .expect("Failed to reset online status");
@@ -74,6 +94,7 @@ async fn main() {
         .route("/api/v1/auth/login", post(routes::auth::login))
         .route("/api/v1/auth/refresh", post(routes::auth::refresh))
         .route("/api/v1/auth/logout", post(routes::auth::logout))
+        .route("/api/v1/auth/verify-email", get(routes::auth::verify_email))
         
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))
@@ -292,6 +313,60 @@ async fn main() {
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();
+}
+
+/// Encrypts + blind-indexes every row still holding a plaintext `email`
+/// (i.e. every account created before `email_privacy` existed), then clears
+/// the plaintext column. Safe to run on every boot: a row that's already
+/// been migrated has `email IS NULL` and simply isn't selected again.
+async fn backfill_email_privacy(db: &Database) -> Result<(), sqlx::Error> {
+    let legacy: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, email FROM users WHERE email IS NOT NULL")
+            .fetch_all(&db.pool)
+            .await?;
+
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    println!("🔐 Backfilling {} account(s) to encrypted email storage...", legacy.len());
+
+    for (user_id, email) in legacy {
+        let email_encrypted = crate::email_privacy::encrypt(&email);
+        let email_hash = crate::email_privacy::blind_index(&email);
+
+        // ON CONFLICT: two legacy rows could theoretically carry the same
+        // email differing only by case (the old plaintext column had no
+        // case-insensitive uniqueness) -- normalize() makes them collide on
+        // email_hash. Keep the first, null out email on the rest too so
+        // they don't loop forever, but leave their email_hash unset rather
+        // than silently picking a "winner" to log in as.
+        let outcome = sqlx::query(
+            "UPDATE users SET email = NULL, email_encrypted = $1, email_hash = $2 WHERE id = $3",
+        )
+        .bind(&email_encrypted)
+        .bind(&email_hash)
+        .bind(user_id)
+        .execute(&db.pool)
+        .await;
+
+        if let Err(sqlx::Error::Database(d)) = &outcome {
+            if d.is_unique_violation() {
+                eprintln!(
+                    "⚠️  Account {user_id} shares an email (case-insensitively) with an already-migrated account; clearing its plaintext email without setting email_hash. It will need a manual email reset to log in again."
+                );
+                sqlx::query("UPDATE users SET email = NULL, email_encrypted = $1 WHERE id = $2")
+                    .bind(&email_encrypted)
+                    .bind(user_id)
+                    .execute(&db.pool)
+                    .await?;
+                continue;
+            }
+        }
+        outcome?;
+    }
+
+    println!("✅ Email backfill complete.");
+    Ok(())
 }
 
 /// Origins the desktop app runs from: the Vite dev server, and the Tauri
