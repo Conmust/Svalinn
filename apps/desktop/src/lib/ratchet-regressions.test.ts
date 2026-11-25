@@ -47,12 +47,15 @@ interface FakeSessionBackup {
 const fakeServer = {
   devices: new Map<string, FakeServerDevice>(),
   sessions: new Map<string, FakeSessionBackup>(),
+  // key: `${ownerDeviceId}:${peerDeviceId}`, value: set of `${dhPublicKey}:${messageNumber}`
+  consumedSkippedKeys: new Map<string, Set<string>>(),
   nextDeviceId: 1,
 };
 
 function resetFakeServer(): void {
   fakeServer.devices.clear();
   fakeServer.sessions.clear();
+  fakeServer.consumedSkippedKeys.clear();
   fakeServer.nextDeviceId = 1;
 }
 
@@ -65,6 +68,14 @@ let backupSerial = 0;
  * relying on how many microtask hops each happens to take, which is not a
  * reliable signal either way. */
 let putGate: Promise<void> | null = null;
+
+/** Set from a test to make the NEXT `putRatchetSession` call (only) throw,
+ * simulating a session backup that failed to land -- used to show that the
+ * consumed-skipped-key ledger (`reportConsumedSkippedKey`) still protects
+ * recovery even when the eager backup it normally runs alongside didn't
+ * make it. Auto-resets to false after one failure, same shape as a single
+ * dropped network request rather than a sustained outage. */
+let putRatchetSessionShouldFailOnce = false;
 
 vi.mock('./devices', async () => {
   class RatchetNotSupportedError extends Error {
@@ -160,6 +171,10 @@ vi.mock('./devices', async () => {
     expectedUpdatedAt: string | null
   ) {
     if (putGate) await putGate;
+    if (putRatchetSessionShouldFailOnce) {
+      putRatchetSessionShouldFailOnce = false;
+      throw new Error('simulated network failure for a session backup write');
+    }
     const key = `${deviceId}:${peerDeviceId}`;
     const existing = fakeServer.sessions.get(key);
     if (expectedUpdatedAt !== null) {
@@ -187,6 +202,26 @@ vi.mock('./devices', async () => {
     fetchPrekeyBundle,
     fetchRatchetSession,
     putRatchetSession,
+    async reportConsumedSkippedKey(deviceId: string, peerDeviceId: string, dhPublicKey: string, messageNumber: number): Promise<void> {
+      const key = `${deviceId}:${peerDeviceId}`;
+      let slots = fakeServer.consumedSkippedKeys.get(key);
+      if (!slots) {
+        slots = new Set<string>();
+        fakeServer.consumedSkippedKeys.set(key, slots);
+      }
+      slots.add(`${dhPublicKey}:${messageNumber}`);
+    },
+    async fetchConsumedSkippedKeys(
+      deviceId: string,
+      peerDeviceId: string
+    ): Promise<{ dhPublicKey: string; messageNumber: number }[]> {
+      const slots = fakeServer.consumedSkippedKeys.get(`${deviceId}:${peerDeviceId}`);
+      if (!slots) return [];
+      return [...slots].map((slot) => {
+        const sep = slot.lastIndexOf(':');
+        return { dhPublicKey: slot.slice(0, sep), messageNumber: Number(slot.slice(sep + 1)) };
+      });
+    },
     RatchetNotSupportedError,
     NoRatchetSessionError,
     RatchetSessionConflictError,
@@ -796,6 +831,60 @@ describe('Ratchet regressions (reported by external review)', () => {
       putGate = null;
       expect(await decryptPromise).toBe('out of order first');
       expect(settled).toBe(true);
+    });
+  });
+
+  describe('Fix (confidentiality case 15, step 2): the consumed-skipped-key ledger survives a failed backup', () => {
+    it('a replayed out-of-order ciphertext cannot decrypt again after recovery, even when the eager backup for its consumption failed', async () => {
+      const alice = await createDeviceHarness();
+      const bob = await createDeviceHarness();
+
+      // Establish a confirmed session.
+      const hello = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'hi'));
+      await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, hello));
+      const reply = await on(bob, ({ ratchet }) => ratchet.encryptMessage(alice.deviceId, 'hi back'));
+      await on(alice, ({ ratchet }) => ratchet.decryptMessage(bob.deviceId, reply));
+
+      const envA = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'secret first'));
+      const envB = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'out of order second'));
+
+      // Deliver B first: Bob caches a skipped key for A's position, and
+      // this (ordinary, fire-and-forget) backup settles normally -- this
+      // is what will become the STALE backup, still listing A's key as
+      // available, once A is consumed without ever making it into a
+      // newer one.
+      expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envB))).toBe('out of order second');
+      activate(bob);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Simulate the eager backup itself failing (a dropped network
+      // request) for exactly the write that would have recorded A's
+      // consumption. The consumption ledger report runs independently
+      // (`Promise.allSettled` in `saveSessionEagerly`) and is NOT gated by
+      // this, so it still succeeds.
+      putRatchetSessionShouldFailOnce = true;
+      expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envA))).toBe('secret first');
+
+      // Bob's local storage is now lost (crash, reinstall, cleared cache)
+      // -- the only backup the server has for this session pair is the
+      // STALE one from before A was ever consumed.
+      bob.storage = new FakeLocalStorage();
+
+      // A later message arrives after recovery -- this forces
+      // `loadOrRecoverSession` to pull the stale backup and, per the fix,
+      // cross-check its `skippedKeys` against the ledger before trusting
+      // it.
+      const envC = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'after recovery'));
+      expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envC))).toBe('after recovery');
+
+      // The actual regression check: replaying the ORIGINAL out-of-order
+      // ciphertext for A must NOT decrypt a second time. Before this fix,
+      // the recovered (stale) backup would still list A's key as
+      // available, and this would succeed again with 'secret first' --
+      // exactly the case 15 vulnerability.
+      const replayed = await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envA));
+      expect(replayed).toBeNull();
     });
   });
 });

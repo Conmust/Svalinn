@@ -40,11 +40,14 @@ import {
   fetchPrekeyBundle,
   fetchRatchetSession,
   putRatchetSession,
+  reportConsumedSkippedKey,
+  fetchConsumedSkippedKeys,
   RatchetNotSupportedError,
   NoRatchetSessionError,
   RatchetSessionConflictError,
   type PrekeyUpload,
   type PrekeyBundle,
+  type ConsumedSkippedKey,
 } from './devices';
 
 export { RatchetNotSupportedError };
@@ -432,6 +435,12 @@ interface RatchetDecryptResult {
   state: RatchetState;
   plaintext: string;
   viaSkippedKey: boolean;
+  /** Set only when `viaSkippedKey` is true: identifies exactly which
+   * cached slot was consumed, in the same `(dhPublicKey, messageNumber)`
+   * terms the server-side consumption ledger (migration 0041) uses -- see
+   * `saveSessionEagerly`'s use of it to report the consumption, and
+   * `stripConsumedSkippedKeys`'s use of the ledger on recovery. */
+  consumedSkippedKeySlot?: { dhPublicKey: string; messageNumber: number };
 }
 
 /** Attempts to decrypt a message using an already-cached skipped message
@@ -453,7 +462,12 @@ function tryDecryptWithSkippedKey(state: RatchetState, envelope: RatchetEnvelope
     );
     const skippedKeys = { ...state.skippedKeys };
     delete skippedKeys[key];
-    return { state: { ...state, skippedKeys }, plaintext: sodium.to_string(plaintextBytes), viaSkippedKey: true };
+    return {
+      state: { ...state, skippedKeys },
+      plaintext: sodium.to_string(plaintextBytes),
+      viaSkippedKey: true,
+      consumedSkippedKeySlot: { dhPublicKey: envelope.dh, messageNumber: envelope.n },
+    };
   } catch {
     return null;
   }
@@ -1080,33 +1094,53 @@ function saveSession(myDeviceId: string, peerDeviceId: string, state: RatchetSta
 }
 
 /** Same as `saveSession`, but AWAITS the backup instead of firing it and
- * forgetting it. Used specifically right after consuming a cached skipped
- * message key (see `tryDecryptWithSkippedKey`/`RatchetDecryptResult`):
- * that key is now gone from local state forever by design (a skipped key
- * is single-use), so if this device's local storage were lost before an
- * eventual, fire-and-forget backup caught up, recovery would restore an
- * OLDER backup that still lists the key as available -- letting a
- * captured-and-replayed copy of the original ciphertext decrypt a second
- * time (confidentiality-review followup case 15). Awaiting the backup
- * here doesn't close that window to zero -- a crash during this very call
- * is still (far more narrowly) possible, and a full fix needs the server
- * to track per-message consumption independently of the session backup --
- * but it shrinks the window from "however long until some unrelated
- * message happens to trigger a save" down to one network round trip.
+ * forgetting it, and ALSO reports the specific skipped-key slot that was
+ * just consumed to the server-side consumption ledger (migration 0041,
+ * `reportConsumedSkippedKey`). Used specifically right after consuming a
+ * cached skipped message key (see
+ * `tryDecryptWithSkippedKey`/`RatchetDecryptResult`): that key is now gone
+ * from local state forever by design (a skipped key is single-use), so if
+ * this device's local storage were lost before an eventual, fire-and-forget
+ * backup caught up, recovery would restore an OLDER backup that still
+ * lists the key as available -- letting a captured-and-replayed copy of
+ * the original ciphertext decrypt a second time (confidentiality-review
+ * followup case 15).
+ *
+ * Two independent, concurrent mitigations, run together via
+ * `Promise.allSettled` (neither is allowed to block or fail the other):
+ * the eager backup narrows the window during which a stale backup could
+ * even be the one recovery finds; the ledger report means that even if a
+ * stale backup IS the one recovered, `loadOrRecoverSession`'s
+ * `stripConsumedSkippedKeys` can still catch and strip the stale entry, as
+ * long as this report itself landed. Only if BOTH are lost (e.g. local
+ * storage is wiped while fully offline, before either request ever
+ * leaves the device) does the residual gap remain -- closing that fully
+ * would need the server consulted synchronously as part of every decrypt,
+ * which isn't compatible with offline-first E2EE messaging.
+ *
  * Still best-effort like `saveSession`: the local session (the
  * authoritative copy) is already saved synchronously either way, so a
- * failed backup attempt here never blocks the caller from getting its
+ * failure in either call here never blocks the caller from getting its
  * already-decrypted plaintext, only delays returning it slightly longer
  * than the fire-and-forget path would. */
-async function saveSessionEagerly(myDeviceId: string, peerDeviceId: string, state: RatchetState): Promise<void> {
+async function saveSessionEagerly(
+  myDeviceId: string,
+  peerDeviceId: string,
+  state: RatchetState,
+  consumedSlot: { dhPublicKey: string; messageNumber: number }
+): Promise<void> {
   storeLocalSession(peerDeviceId, state);
-  try {
-    await backupSession(myDeviceId, peerDeviceId, state);
-  } catch (err) {
-    console.warn(
-      'Failed to eagerly back up a ratchet session after consuming a skipped message key (local session is still fine):',
-      err
-    );
+  const results = await Promise.allSettled([
+    backupSession(myDeviceId, peerDeviceId, state),
+    reportConsumedSkippedKey(myDeviceId, peerDeviceId, consumedSlot.dhPublicKey, consumedSlot.messageNumber),
+  ]);
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.warn(
+        'Failed to eagerly persist a consumed skipped message key (session backup and/or consumption ledger; local session is still fine):',
+        result.reason
+      );
+    }
   }
 }
 
@@ -1121,6 +1155,50 @@ async function saveSessionEagerly(myDeviceId: string, peerDeviceId: string, stat
  * forcing every pre-existing session to re-handshake on upgrade. */
 function belongsToAnotherIdentity(state: RatchetState, myIdentityPublicKeyB64: string): boolean {
   return Boolean(state.myIdentityPublicKey) && state.myIdentityPublicKey !== myIdentityPublicKeyB64;
+}
+
+/** Cross-checks a just-recovered session's `skippedKeys` map against the
+ * server-side consumed-skipped-key ledger (migration 0041) before trusting
+ * it, and strips anything the ledger confirms this device already
+ * consumed. This is what actually CLOSES most of the gap that the eager
+ * backup in `saveSessionEagerly` only narrows: the ledger is written
+ * per-consumption, independently of the whole-session backup blob, so it
+ * can't be stale in the same way the backup itself can be (see that
+ * function's doc comment for the full picture of the two mitigations
+ * together).
+ *
+ * Fails CLOSED, not open: if the ledger can't be fetched at all, this
+ * drops every cached skipped key rather than trusting an unverified map.
+ * The cost of that is availability, not security -- any message that
+ * genuinely still needs one of those keys simply can't be decrypted until
+ * it's re-sent or the chain naturally catches up, the same outcome as a
+ * skipped key that aged out past `RatchetTooManySkippedMessagesError`'s
+ * cap. The alternative -- trusting the map when the check itself couldn't
+ * even run -- would silently defeat the whole mitigation on exactly the
+ * kind of network hiccup it exists to guard against. */
+async function stripConsumedSkippedKeys(
+  myDeviceId: string,
+  peerDeviceId: string,
+  skippedKeys: Record<string, string>
+): Promise<Record<string, string>> {
+  if (Object.keys(skippedKeys).length === 0) return skippedKeys;
+  let consumed: ConsumedSkippedKey[];
+  try {
+    consumed = await fetchConsumedSkippedKeys(myDeviceId, peerDeviceId);
+  } catch (err) {
+    console.warn(
+      "Could not verify a recovered session's cached skipped keys against the server-side consumption ledger; dropping all of them to be safe:",
+      err
+    );
+    return {};
+  }
+  if (consumed.length === 0) return skippedKeys;
+  const consumedSlots = new Set(consumed.map((c) => `${c.dhPublicKey}:${c.messageNumber}`));
+  const filtered: Record<string, string> = {};
+  for (const [slot, key] of Object.entries(skippedKeys)) {
+    if (!consumedSlots.has(slot)) filtered[slot] = key;
+  }
+  return filtered;
 }
 
 /** Loads a session's local state, falling back to recovering it from the
@@ -1152,7 +1230,8 @@ async function loadOrRecoverSession(
     const plaintextBytes = sodium.crypto_secretbox_open_easy(fromB64(backup.pickleCiphertext), fromB64(backup.pickleNonce), pickleKey);
     const parsed: unknown = JSON.parse(sodium.to_string(plaintextBytes));
     if (!isValidRatchetState(parsed) || belongsToAnotherIdentity(parsed, myIdentityPublicKeyB64)) return null;
-    const state: RatchetState = { ...parsed, backupUpdatedAt: backup.updatedAt };
+    const skippedKeys = await stripConsumedSkippedKeys(myDeviceId, peerDeviceId, parsed.skippedKeys);
+    const state: RatchetState = { ...parsed, skippedKeys, backupUpdatedAt: backup.updatedAt };
     storeLocalSession(peerDeviceId, state);
     return state;
   } catch (err) {
@@ -1323,11 +1402,12 @@ async function decryptMessageLocked(
   }
   if (!result) return null;
 
-  if (result.viaSkippedKey) {
+  if (result.viaSkippedKey && result.consumedSkippedKeySlot) {
     // See `saveSessionEagerly`'s doc comment: a consumed skipped key is
     // gone from local state forever, so this one save can't wait for some
-    // later message to flush it -- it's backed up right away.
-    await saveSessionEagerly(myDeviceId, peerDeviceId, result.state);
+    // later message to flush it -- it's backed up, and reported to the
+    // consumption ledger, right away.
+    await saveSessionEagerly(myDeviceId, peerDeviceId, result.state, result.consumedSkippedKeySlot);
   } else {
     saveSession(myDeviceId, peerDeviceId, result.state);
   }

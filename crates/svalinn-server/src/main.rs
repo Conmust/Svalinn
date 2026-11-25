@@ -191,6 +191,10 @@ async fn main() {
             get(routes::ratchet::get_ratchet_session).put(routes::ratchet::put_ratchet_session),
         )
         .route(
+            "/api/v1/ratchet-sessions/:device_a_id/:device_b_id/consumed-skipped-keys",
+            get(routes::ratchet::list_consumed_skipped_keys).post(routes::ratchet::report_consumed_skipped_key),
+        )
+        .route(
             "/api/v1/users/me/key-backup",
             get(routes::users::get_key_backup)
                 .put(routes::users::put_key_backup)
