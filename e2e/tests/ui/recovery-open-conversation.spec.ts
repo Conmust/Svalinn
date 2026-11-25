@@ -64,7 +64,7 @@ test.describe('recovery while a DM conversation is already open (no reload)', ()
   // itself, not just the identity key -- which is security-sensitive and
   // not something to patch hastily. Tracked for a follow-up, not patched
   // here.
-  test.fixme('already-open conversation: new send uses recovered key AND old history addressed to the recovered device becomes readable, with no reload', async ({ browser }) => {
+  test('already-open conversation: new send uses recovered key AND old history addressed to the recovered device becomes readable, with no reload', async ({ browser }) => {
     const carol = await register('openconv_c');
     const dave = await register('openconv_d');
     const passphrase = 'already-open-conversation-passphrase-555';

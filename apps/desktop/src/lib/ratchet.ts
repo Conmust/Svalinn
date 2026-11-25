@@ -702,6 +702,101 @@ export async function ensureRatchetReady(): Promise<void> {
   await maintainOneTimePrekeys(deviceId);
 }
 
+// --- Ratchet identity material for the passphrase recovery backup --------
+//
+// `lib/recovery.ts`'s passphrase backup historically only carried
+// `crypto.ts`'s core X25519 identity keypair (the one `ensureDeviceKeypair()`
+// manages). This module's OWN signing identity + current signed prekey live
+// in the SEPARATE localStorage keys above -- generated once per BROWSER the
+// first time `ensureRatchetReady()` ever runs there, and never regenerated
+// just because `crypto.ts`'s active identity keypair later gets swapped out
+// (by `replaceActiveKeypair()`, the manual "Recover from backup" escape
+// hatch, or by a brand-new device's own first-run recovery choice).
+// Recovering the core identity key alone does NOT give a device access to
+// the SIGNED PREKEY PRIVATE KEY that a past sender's X3DH handshake
+// actually used: that private key only ever lived in the ORIGINAL device's
+// own browser storage, and nothing backed it up. Exporting/importing it
+// alongside the core identity key closes that gap -- see
+// `recovery.ts`'s `createOrReplaceKeyBackup` and `restoreFromBackup`.
+//
+// The one-time prekey stash needs the same treatment, for the same
+// reason: an X3DH handshake that consumed one of this device's one-time
+// prekeys needs that SPECIFIC prekey's private key to complete the 4-DH
+// computation (not just the signed prekey's), and that private key also
+// only ever lived locally. Without it, a recovered device can still
+// decrypt messages whose handshake happened to skip the one-time-prekey
+// step (3-DH only), but silently gets a DIFFERENT, non-matching shared
+// secret for any that didn't -- the current stash is included wholesale
+// (it's already bounded to `MAX_LOCAL_ONE_TIME_PREKEYS`) so whichever one
+// an old, not-yet-received message referenced is there to be found.
+
+export interface RatchetIdentityBackup {
+  signingPublicKey: string;
+  signingPrivateKey: string;
+  signedPrekeyPublicKey: string;
+  signedPrekeyPrivateKey: string;
+  signedPrekeyCreatedAt: string;
+  oneTimePrekeys: StoredOneTimePrekey[];
+}
+
+/** Reads this browser's current ratchet signing identity + signed prekey
+ * + one-time prekey stash, for inclusion in a passphrase recovery backup.
+ * Returns null if this device has never completed `ensureRatchetReady()`
+ * -- nothing to export yet; callers should simply omit this material from
+ * the backup rather than treat that as an error. */
+export function exportRatchetIdentityForBackup(): RatchetIdentityBackup | null {
+  const signingPublicKey = localStorage.getItem(SIGNING_PUBLIC_KEY_STORAGE_KEY);
+  const signingPrivateKey = localStorage.getItem(SIGNING_PRIVATE_KEY_STORAGE_KEY);
+  const signedPrekeyPublicKey = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
+  const signedPrekeyPrivateKey = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
+  const signedPrekeyCreatedAt = localStorage.getItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY);
+  if (!signingPublicKey || !signingPrivateKey || !signedPrekeyPublicKey || !signedPrekeyPrivateKey || !signedPrekeyCreatedAt) {
+    return null;
+  }
+  return {
+    signingPublicKey,
+    signingPrivateKey,
+    signedPrekeyPublicKey,
+    signedPrekeyPrivateKey,
+    signedPrekeyCreatedAt,
+    oneTimePrekeys: loadOneTimePrekeys(),
+  };
+}
+
+/** Writes recovered ratchet identity material into this browser's local
+ * storage. The signing identity and signed prekey OVERWRITE whatever this
+ * browser had generated for itself before recovery -- see this section's
+ * header comment for why that's exactly what lets a recovered device
+ * respond to old messages that were X3DH-bootstrapped against the
+ * ORIGINAL device's signed prekey. The one-time prekey stash is MERGED
+ * (deduped by public key, bounded the same way `maintainOneTimePrekeys`
+ * already bounds it) rather than replaced outright, so a key this browser
+ * had already generated for itself isn't discarded for no reason. Callers
+ * should run this BEFORE anything that might call `ensureRatchetReady()`
+ * (e.g. `settleDeviceReady`'s fire-and-forget call), so its "already
+ * fresh, nothing to do" check sees the recovered material rather than
+ * racing to regenerate-and-republish a prekey this device just received
+ * from backup. Best-effort, matching every other localStorage write in
+ * this file: a failure here just means recovery falls back to today's
+ * (non-matching, this-browser's-own) behavior, not a crash. */
+export function importRecoveredRatchetIdentity(material: RatchetIdentityBackup): void {
+  try {
+    localStorage.setItem(SIGNING_PUBLIC_KEY_STORAGE_KEY, material.signingPublicKey);
+    localStorage.setItem(SIGNING_PRIVATE_KEY_STORAGE_KEY, material.signingPrivateKey);
+    localStorage.setItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY, material.signedPrekeyPublicKey);
+    localStorage.setItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY, material.signedPrekeyPrivateKey);
+    localStorage.setItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY, material.signedPrekeyCreatedAt);
+
+    const existing = loadOneTimePrekeys();
+    const existingKeys = new Set(existing.map((k) => k.publicKey));
+    const merged = [...existing, ...material.oneTimePrekeys.filter((k) => !existingKeys.has(k.publicKey))];
+    const bounded = merged.length > MAX_LOCAL_ONE_TIME_PREKEYS ? merged.slice(merged.length - MAX_LOCAL_ONE_TIME_PREKEYS) : merged;
+    storeOneTimePrekeys(bounded);
+  } catch (err) {
+    console.warn("Failed to import recovered ratchet identity material (falling back to this device's own):", err);
+  }
+}
+
 // --- Session persistence (local cache + best-effort encrypted backup) -----
 
 function sessionStorageKey(peerDeviceId: string): string {

@@ -33,7 +33,12 @@ import {
   CryptoLibraryError,
   type DeviceKeypair,
 } from './crypto';
-import { ensureRatchetReady } from './ratchet';
+import {
+  ensureRatchetReady,
+  exportRatchetIdentityForBackup,
+  importRecoveredRatchetIdentity,
+  type RatchetIdentityBackup,
+} from './ratchet';
 import { withTimeout, TimeoutError } from './timeout';
 
 /** Same bound as `lib/crypto.ts`'s own `ready()` -- this module loads
@@ -96,11 +101,18 @@ export interface KeyBackupRecord {
 /** The plaintext this module encrypts/decrypts. Carrying `deviceId` and
  * `publicKey` alongside the private key (rather than backing up the
  * private key alone) is what lets recovery restore the SAME device
- * identity -- see `restoreFromBackup` below for why that matters. */
+ * identity -- see `restoreFromBackup` below for why that matters.
+ *
+ * `ratchetIdentity` is optional and additive: a backup created before
+ * this field existed simply won't have it, and decrypts/restores exactly
+ * as before (no ratchet material to restore, same as today's behavior).
+ * See `ratchet.ts`'s `exportRatchetIdentityForBackup` for why it needs to
+ * travel alongside the core identity key at all. */
 interface BackupPayload {
   privateKey: string;
   publicKey: string;
   deviceId: string;
+  ratchetIdentity?: RatchetIdentityBackup;
 }
 
 function deriveKey(passphrase: string, salt: Uint8Array, params: KdfParams): Uint8Array {
@@ -158,7 +170,17 @@ export async function createOrReplaceKeyBackup(
   };
   const key = deriveKey(passphrase, salt, params);
 
-  const payload: BackupPayload = { privateKey, publicKey, deviceId };
+  // `ensureRatchetReady()` is idempotent (see its own doc comment) --
+  // calling it here defensively, rather than assuming some earlier
+  // fire-and-forget call already finished, closes a real ordering gap:
+  // `settleDeviceReady()` kicks it off in the background and does NOT wait
+  // for it before this device is considered "ready" elsewhere, so a backup
+  // created soon after a device's first launch could otherwise race ahead
+  // of its own signing identity / signed prekey ever being generated, and
+  // silently ship with no ratchet material to restore later.
+  await ensureRatchetReady();
+  const ratchetIdentity = exportRatchetIdentityForBackup();
+  const payload: BackupPayload = { privateKey, publicKey, deviceId, ...(ratchetIdentity ? { ratchetIdentity } : {}) };
   const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
   const ciphertext = sodium.crypto_secretbox_easy(sodium.from_string(JSON.stringify(payload)), nonce, key);
   sodium.memzero(key);
@@ -219,7 +241,7 @@ export class IncorrectPassphraseError extends Error {
 export async function decryptKeyBackup(
   record: KeyBackupRecord,
   passphrase: string
-): Promise<{ publicKey: string; privateKey: string; deviceId: string }> {
+): Promise<{ publicKey: string; privateKey: string; deviceId: string; ratchetIdentity?: RatchetIdentityBackup }> {
   await ready();
 
   let combined: Uint8Array;
@@ -254,7 +276,12 @@ export async function decryptKeyBackup(
     throw new IncorrectPassphraseError();
   }
 
-  return { publicKey: payload.publicKey, privateKey: payload.privateKey, deviceId: payload.deviceId };
+  return {
+    publicKey: payload.publicKey,
+    privateKey: payload.privateKey,
+    deviceId: payload.deviceId,
+    ratchetIdentity: payload.ratchetIdentity,
+  };
 }
 
 /**
@@ -303,6 +330,13 @@ export async function restoreFromBackup(passphrase: string): Promise<DeviceKeypa
 
   const keypair: DeviceKeypair = { publicKey: recovered.publicKey, privateKey: recovered.privateKey, deviceId };
   adoptRecoveredKeypair(keypair);
+  // Must happen BEFORE either caller resolves the device-ready gate
+  // (`resolveRecoveryChoice`/`replaceActiveKeypair`), since that's what
+  // can trigger `ensureRatchetReady()` -- see `importRecoveredRatchetIdentity`'s
+  // own comment for why ordering matters here.
+  if (recovered.ratchetIdentity) {
+    importRecoveredRatchetIdentity(recovered.ratchetIdentity);
+  }
   return keypair;
 }
 
