@@ -48,12 +48,15 @@ interface FakeSessionBackup {
 const fakeServer = {
   devices: new Map<string, FakeServerDevice>(),
   sessions: new Map<string, FakeSessionBackup>(), // key: `${ownerDeviceId}:${peerDeviceId}`
+  // key: `${ownerDeviceId}:${peerDeviceId}`, value: set of `${dhPublicKey}:${messageNumber}`
+  consumedSkippedKeys: new Map<string, Set<string>>(),
   nextDeviceId: 1,
 };
 
 function resetFakeServer(): void {
   fakeServer.devices.clear();
   fakeServer.sessions.clear();
+  fakeServer.consumedSkippedKeys.clear();
   fakeServer.nextDeviceId = 1;
 }
 
@@ -165,6 +168,33 @@ vi.mock('./devices', async () => {
     return { pickleCiphertext, pickleNonce, updatedAt };
   }
 
+  async function reportConsumedSkippedKey(
+    deviceId: string,
+    peerDeviceId: string,
+    dhPublicKey: string,
+    messageNumber: number
+  ): Promise<void> {
+    const key = `${deviceId}:${peerDeviceId}`;
+    let slots = fakeServer.consumedSkippedKeys.get(key);
+    if (!slots) {
+      slots = new Set<string>();
+      fakeServer.consumedSkippedKeys.set(key, slots);
+    }
+    slots.add(`${dhPublicKey}:${messageNumber}`);
+  }
+
+  async function fetchConsumedSkippedKeys(
+    deviceId: string,
+    peerDeviceId: string
+  ): Promise<{ dhPublicKey: string; messageNumber: number }[]> {
+    const slots = fakeServer.consumedSkippedKeys.get(`${deviceId}:${peerDeviceId}`);
+    if (!slots) return [];
+    return [...slots].map((slot) => {
+      const sep = slot.lastIndexOf(':');
+      return { dhPublicKey: slot.slice(0, sep), messageNumber: Number(slot.slice(sep + 1)) };
+    });
+  }
+
   return {
     registerDevice,
     fetchMyDevices: async () => [],
@@ -179,6 +209,8 @@ vi.mock('./devices', async () => {
     fetchPrekeyBundle,
     fetchRatchetSession,
     putRatchetSession,
+    reportConsumedSkippedKey,
+    fetchConsumedSkippedKeys,
     RatchetNotSupportedError,
     NoRatchetSessionError,
     RatchetSessionConflictError,

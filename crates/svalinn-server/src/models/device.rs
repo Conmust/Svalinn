@@ -162,3 +162,20 @@ pub struct PutRatchetSessionRequest {
     #[serde(default)]
     pub expected_updated_at: Option<DateTime<Utc>>,
 }
+
+/// Request body for reporting one skipped message key as consumed --
+/// see `report_consumed_skipped_key` and migration 0041's doc comment on
+/// why this ledger exists alongside the whole-session backup above.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportConsumedSkippedKeyRequest {
+    pub dh_public_key: String,
+    pub message_number: i32,
+}
+
+/// One row of the consumed-skipped-key ledger, as returned to the owning
+/// device during recovery -- see `list_consumed_skipped_keys`.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct ConsumedSkippedKey {
+    pub dh_public_key: String,
+    pub message_number: i32,
+}

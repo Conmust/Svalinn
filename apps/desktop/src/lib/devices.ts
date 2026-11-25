@@ -309,6 +309,60 @@ export async function putRatchetSession(
   return { pickleCiphertext: body.pickle_ciphertext, pickleNonce: body.pickle_nonce, updatedAt: body.updated_at };
 }
 
+/** One skipped message key this device has reported consuming, as
+ * returned by `fetchConsumedSkippedKeys` -- see migration 0041's doc
+ * comment on why this ledger exists independently of the session backup
+ * above. */
+export interface ConsumedSkippedKey {
+  dhPublicKey: string;
+  messageNumber: number;
+}
+
+/** Records that `myDeviceId` has consumed one specific skipped message key
+ * from `peerDeviceId` -- called alongside (not instead of) the usual
+ * eager session backup whenever a decrypt is satisfied by a cached
+ * skipped key (see `ratchet.ts`'s `saveSessionEagerly` and
+ * `reportSkippedKeyConsumed`). Idempotent server-side: reporting the same
+ * slot twice is a harmless no-op, so a caller doesn't need to dedupe
+ * before calling this. */
+export async function reportConsumedSkippedKey(
+  myDeviceId: string,
+  peerDeviceId: string,
+  dhPublicKey: string,
+  messageNumber: number
+): Promise<void> {
+  const response = await apiFetch(
+    `${apiBase()}/api/v1/ratchet-sessions/${myDeviceId}/${peerDeviceId}/consumed-skipped-keys`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ dh_public_key: dhPublicKey, message_number: messageNumber }),
+    }
+  );
+  if (!response.ok) {
+    throw new Error('Failed to report a consumed skipped message key');
+  }
+}
+
+/** Fetches every skipped message key `myDeviceId` has ever reported
+ * consuming from `peerDeviceId`, so a session recovered from a (possibly
+ * stale) backup can have any of these stripped from its `skippedKeys` map
+ * before being trusted -- see `ratchet.ts`'s `loadOrRecoverSession`. */
+export async function fetchConsumedSkippedKeys(myDeviceId: string, peerDeviceId: string): Promise<ConsumedSkippedKey[]> {
+  const response = await apiFetch(
+    `${apiBase()}/api/v1/ratchet-sessions/${myDeviceId}/${peerDeviceId}/consumed-skipped-keys`,
+    { headers: getAuthHeaders() }
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch the consumed-skipped-key ledger');
+  }
+  const body = await response.json();
+  return (body as Array<{ dh_public_key: string; message_number: number }>).map((row) => ({
+    dhPublicKey: row.dh_public_key,
+    messageNumber: row.message_number,
+  }));
+}
+
 /** Lists every registered device of every CURRENT member of a channel's
  * server -- what a client needs before composing an encrypted channel
  * send: encrypt once per device in this list (the sending device

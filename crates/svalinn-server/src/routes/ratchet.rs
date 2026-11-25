@@ -14,6 +14,7 @@
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Json,
 };
 use uuid::Uuid;
@@ -21,7 +22,9 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::errors::AppError;
 use crate::extractors::auth::CurrentUser;
-use crate::models::device::{PrekeyBundle, PutRatchetSessionRequest, RatchetSessionPickle};
+use crate::models::device::{
+    ConsumedSkippedKey, PrekeyBundle, PutRatchetSessionRequest, RatchetSessionPickle, ReportConsumedSkippedKeyRequest,
+};
 
 /// GET /api/v1/devices/:device_id/prekey-bundle
 ///
@@ -243,6 +246,78 @@ pub async fn put_ratchet_session(
     Ok(Json(pickle))
 }
 
+/// POST /api/v1/ratchet-sessions/:device_id/:peer_device_id/consumed-skipped-keys
+///
+/// Records that `device_id` has consumed one specific skipped message key
+/// from `peer_device_id` -- see migration 0041's doc comment for why this
+/// ledger exists independently of the whole-session backup above. Called
+/// right alongside (not instead of) the usual eager session backup
+/// (`ratchet.ts`'s `saveSessionEagerly`) whenever a decrypt is satisfied by
+/// a cached skipped key, so that even a backup that hasn't caught up yet
+/// can't reintroduce a key this device already knows it used.
+///
+/// Idempotent: reporting the same `(dh_public_key, message_number)` twice
+/// (e.g. a retried request after a dropped response) is a no-op, not an
+/// error -- there's nothing more to record the second time. `device_id`
+/// must belong to the caller, same ownership rule as the session backup
+/// endpoints: only a device's own owner should be able to write (or read)
+/// what that device has consumed.
+pub async fn report_consumed_skipped_key(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path((device_id, peer_device_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<ReportConsumedSkippedKeyRequest>,
+) -> Result<StatusCode, AppError> {
+    require_owns_device(&db, user_id, device_id).await?;
+
+    if payload.dh_public_key.trim().is_empty() {
+        return Err(AppError::BadRequest("dh_public_key is required".into()));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO ratchet_consumed_skipped_keys (device_id, peer_device_id, dh_public_key, message_number)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (device_id, peer_device_id, dh_public_key, message_number) DO NOTHING
+        "#,
+    )
+    .bind(device_id)
+    .bind(peer_device_id)
+    .bind(&payload.dh_public_key)
+    .bind(payload.message_number)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/v1/ratchet-sessions/:device_id/:peer_device_id/consumed-skipped-keys
+///
+/// Lists every skipped key `device_id` has ever reported consuming from
+/// `peer_device_id`, so a client recovering from a (possibly stale)
+/// session backup can strip any of these out of the restored
+/// `skippedKeys` map before trusting it. `device_id` must belong to the
+/// caller.
+pub async fn list_consumed_skipped_keys(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path((device_id, peer_device_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<ConsumedSkippedKey>>, AppError> {
+    require_owns_device(&db, user_id, device_id).await?;
+
+    let rows: Vec<ConsumedSkippedKey> = sqlx::query_as(
+        "SELECT dh_public_key, message_number FROM ratchet_consumed_skipped_keys WHERE device_id = $1 AND peer_device_id = $2",
+    )
+    .bind(device_id)
+    .bind(peer_device_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +528,91 @@ mod tests {
         match write_result {
             Err(AppError::Forbidden(_)) => {}
             other => panic!("expected Forbidden for a write to a device_id the caller doesn't own, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, alice).await;
+        cleanup_test_user(&db, bob).await;
+    }
+
+    #[tokio::test]
+    async fn consumed_skipped_key_ledger_is_append_only_and_idempotent() {
+        let db = test_db().await;
+        let alice = create_test_user(&db).await;
+        let bob = create_test_user(&db).await;
+        let alice_device = register_test_device(&db, alice, 50, "Alice's Laptop").await;
+        let bob_device = register_test_device(&db, bob, 51, "Bob's Phone").await;
+
+        // Nothing reported yet -- an empty list, not an error.
+        let empty = list_consumed_skipped_keys(State(db.clone()), CurrentUser(alice), Path((alice_device, bob_device)))
+            .await
+            .expect("listing with nothing recorded yet should still succeed")
+            .0;
+        assert!(empty.is_empty());
+
+        let report = |dh: &str, n: i32| {
+            report_consumed_skipped_key(
+                State(db.clone()),
+                CurrentUser(alice),
+                Path((alice_device, bob_device)),
+                Json(ReportConsumedSkippedKeyRequest { dh_public_key: dh.into(), message_number: n }),
+            )
+        };
+
+        report("dh-key-a", 3).await.expect("reporting a consumed skipped key should succeed");
+        report("dh-key-a", 7).await.expect("a second, different slot under the same dh key should also succeed");
+        // Reporting the exact same slot again (e.g. a retried request after
+        // a dropped response) must be a harmless no-op, not an error and
+        // not a duplicate row.
+        report("dh-key-a", 3).await.expect("reporting the same slot twice should be idempotent, not an error");
+
+        let recorded = list_consumed_skipped_keys(State(db.clone()), CurrentUser(alice), Path((alice_device, bob_device)))
+            .await
+            .expect("listing should succeed")
+            .0;
+        assert_eq!(recorded.len(), 2, "the duplicate report must not have created a third row");
+        let slots: std::collections::HashSet<(String, i32)> =
+            recorded.into_iter().map(|r| (r.dh_public_key, r.message_number)).collect();
+        assert!(slots.contains(&("dh-key-a".to_string(), 3)));
+        assert!(slots.contains(&("dh-key-a".to_string(), 7)));
+
+        // Bob's own ledger for the same directed pair label is independent
+        // -- nothing Alice reported leaks into a query under Bob's device.
+        let bobs_view =
+            list_consumed_skipped_keys(State(db.clone()), CurrentUser(bob), Path((bob_device, alice_device)))
+                .await
+                .expect("Bob listing his own (empty) ledger should succeed")
+                .0;
+        assert!(bobs_view.is_empty(), "Bob's ledger must not see what Alice reported for her own device");
+
+        cleanup_test_user(&db, alice).await;
+        cleanup_test_user(&db, bob).await;
+    }
+
+    #[tokio::test]
+    async fn cannot_read_or_report_another_users_device_consumed_skipped_keys() {
+        let db = test_db().await;
+        let alice = create_test_user(&db).await;
+        let bob = create_test_user(&db).await;
+        let alice_device = register_test_device(&db, alice, 60, "Alice's Laptop").await;
+        let bob_device = register_test_device(&db, bob, 61, "Bob's Phone").await;
+
+        let read_result =
+            list_consumed_skipped_keys(State(db.clone()), CurrentUser(bob), Path((alice_device, bob_device))).await;
+        match read_result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden for a user who doesn't own device_id, got {other:?}"),
+        }
+
+        let write_result = report_consumed_skipped_key(
+            State(db.clone()),
+            CurrentUser(bob),
+            Path((alice_device, bob_device)),
+            Json(ReportConsumedSkippedKeyRequest { dh_public_key: "dh-key".into(), message_number: 1 }),
+        )
+        .await;
+        match write_result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected Forbidden for a report against a device_id the caller doesn't own, got {other:?}"),
         }
 
         cleanup_test_user(&db, alice).await;
