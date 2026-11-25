@@ -181,12 +181,45 @@ function canonicalPair(a: Uint8Array, b: Uint8Array): { low: Uint8Array; high: U
   return { low: a, high: b };
 }
 
-function buildAD(state: RatchetState): Uint8Array {
+/** Big-endian 4-byte encoding, for mixing a plain JS number (always well
+ * within uint32 range here -- message counts, not anything attacker-sized)
+ * into associated data in a fixed, unambiguous width. */
+function encodeUint32(n: number): Uint8Array {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, n, false);
+  return out;
+}
+
+/** Builds the AEAD associated data for one message: the session's fixed
+ * identity-pair bytes PLUS this specific message's own ratchet header
+ * (`dh`, `pn`, `n`) -- binding the header into the same authenticated-data
+ * the ciphertext itself is checked against, so tampering with any header
+ * field is caught by Poly1305 the same way tampering with the ciphertext
+ * already is, rather than relying on it happening to also break key
+ * derivation (which it usually -- not always, and not by design -- already
+ * did before this). `header` is deliberately the caller's own explicit
+ * values, not read off `state`: on receive, that's the INCOMING envelope's
+ * header (the thing being authenticated), not this device's own current
+ * ratchet position, which is exactly the distinction that makes this
+ * binding meaningful. See `ratchetEncrypt`/`ratchetDecrypt` for the two
+ * call sites. */
+function buildAD(state: RatchetState, header: { dh: string; pn: number; n: number }): Uint8Array {
   const low = fromB64(state.adLow);
   const high = fromB64(state.adHigh);
-  const out = new Uint8Array(low.length + high.length);
-  out.set(low, 0);
-  out.set(high, low.length);
+  const dhBytes = fromB64(header.dh);
+  const pnBytes = encodeUint32(header.pn);
+  const nBytes = encodeUint32(header.n);
+  const out = new Uint8Array(low.length + high.length + dhBytes.length + pnBytes.length + nBytes.length);
+  let offset = 0;
+  out.set(low, offset);
+  offset += low.length;
+  out.set(high, offset);
+  offset += high.length;
+  out.set(dhBytes, offset);
+  offset += dhBytes.length;
+  out.set(pnBytes, offset);
+  offset += pnBytes.length;
+  out.set(nBytes, offset);
   return out;
 }
 
@@ -366,7 +399,7 @@ function ratchetEncrypt(
   const { chainKey: nextChainKey, messageKey } = kdfChainKey(fromB64(state.chainKeySend));
   const n = state.sendCount;
   const pn = state.previousChainLength;
-  const ad = buildAD(state);
+  const ad = buildAD(state, { dh: state.dhsPublic, pn, n });
   const nonceBytes = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
   const ciphertextBytes = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
     sodium.from_string(plaintext),
@@ -479,17 +512,36 @@ function tryDecryptWithSkippedKey(state: RatchetState, envelope: RatchetEnvelope
  * wrong key) -- in which case the ORIGINAL state should be kept, since
  * nothing about the session actually advanced. */
 function ratchetDecrypt(state: RatchetState, envelope: RatchetEnvelope): RatchetDecryptResult | null {
-  const ad = buildAD(state);
+  const ad = buildAD(state, { dh: envelope.dh, pn: envelope.pn, n: envelope.n });
 
   const fromSkipped = tryDecryptWithSkippedKey(state, envelope, ad);
   if (fromSkipped) return fromSkipped;
 
-  let working = state;
-  if (envelope.dh !== working.dhrPublic) {
-    working = skipMessageKeys(working, envelope.pn);
-    working = performDhRatchet(working, envelope.dh);
+  let working: RatchetState;
+  try {
+    working = state;
+    if (envelope.dh !== working.dhrPublic) {
+      working = skipMessageKeys(working, envelope.pn);
+      working = performDhRatchet(working, envelope.dh);
+    }
+    working = skipMessageKeys(working, envelope.n);
+  } catch (err) {
+    if (err instanceof RatchetTooManySkippedMessagesError) throw err; // the caller special-cases this one
+    // Anything else here means `envelope.dh` (or another header field)
+    // doesn't describe a usable ratchet step -- most concretely, a known
+    // low-order X25519 point (e.g. all-zero) in `envelope.dh`, which
+    // libsodium's `crypto_scalarmult` rejects outright as a "weak public
+    // key" rather than returning a value at all. `dh`/`pn`/`n` are now
+    // authenticated by `buildAD` above (confidentiality-review followup:
+    // "AEAD associated-data not binding the ratchet header fields"), so a
+    // genuine peer's own math can never land here -- only a deliberately
+    // malformed header can, delivered to ANY recipient without needing to
+    // intercept anything, since this runs before the AEAD tag is ever
+    // checked. Treated exactly like any other tampered/corrupted message:
+    // decryption failed, full stop, same as the AEAD-level catch below --
+    // not a crash, not a special case a caller needs to know about.
+    return null;
   }
-  working = skipMessageKeys(working, envelope.n);
 
   if (!working.chainKeyRecv) return null; // malformed/out-of-protocol state; nothing sane to decrypt with
   const { chainKey: nextChainKey, messageKey } = kdfChainKey(fromB64(working.chainKeyRecv));
