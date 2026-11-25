@@ -412,6 +412,21 @@ pub async fn unban_member(
     if removed == 0 {
         return Err(AppError::NotFound("That user isn't banned from this server".into()));
     }
+
+    // ban_member also records the account's email hash in banned_emails, so
+    // a new account under the same email can't evade the ban (see
+    // `accept_invite`). Lifting the ban has to clear that too, or the
+    // account we just unbanned still can't get back in through an invite
+    // -- `banned_emails` would be blocking the very account `server_bans`
+    // no longer does.
+    if let Some(email_hash) = email_hash_of(&db, target).await? {
+        sqlx::query("DELETE FROM banned_emails WHERE server_id = $1 AND email_hash = $2")
+            .bind(server_id)
+            .bind(&email_hash)
+            .execute(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

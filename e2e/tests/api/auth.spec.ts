@@ -82,18 +82,40 @@ test.describe('login tokens', () => {
 });
 
 test.describe('rate limits', () => {
-  test('locks an account after 5 wrong passwords, without affecting others', async () => {
+  test('locks an account from one IP after 5 wrong passwords, without locking the real owner out from elsewhere or affecting others', async () => {
     const u = await register('rl');
     const ip = randomIp();
     for (let i = 0; i < 5; i++) expect((await login(u.email, 'wrong', ip)).status).toBe(400);
 
-    const locked = await login(u.email, 'wrong', randomIp()); // from anywhere
+    // The 6th attempt from the SAME ip is locked -- this is the real
+    // brute-force throttle, keyed on (account, ip).
+    const locked = await login(u.email, 'wrong', ip);
     expect(locked.status).toBe(429);
     expect(Number(locked.headers.get('retry-after'))).toBeGreaterThan(800);
-    expect((await login(u.email, u.password, randomIp())).status).toBe(429); // even the right password
+    expect((await login(u.email, u.password, ip)).status).toBe(429); // even the right password, same ip
 
+    // But the real owner, logging in from anywhere else, is never locked
+    // out just because someone else has been guessing their password from
+    // one IP -- that was the vulnerability this throttle used to have.
+    expect((await login(u.email, u.password, randomIp())).status).toBe(200);
+
+    // And an unrelated account is unaffected by the same ip being throttled.
     const other = await register('rl');
     expect((await login(other.email, other.password, ip)).status).toBe(200);
+  });
+
+  test('a distributed guess still locks the account even though no single IP hits the per-IP limit', async () => {
+    const u = await register('rl');
+    // One wrong guess from each of many IPs -- never enough from any one
+    // of them to trip the tight (account, ip) rule, but the looser,
+    // account-wide backstop (limit 30) still catches it eventually.
+    let locked: Awaited<ReturnType<typeof login>> | null = null;
+    for (let i = 0; i < 31 && !locked; i++) {
+      const res = await login(u.email, 'wrong', randomIp());
+      if (res.status === 429) locked = res;
+      else expect(res.status).toBe(400);
+    }
+    expect(locked?.status).toBe(429);
   });
 
   test('limits logins per IP address', async () => {

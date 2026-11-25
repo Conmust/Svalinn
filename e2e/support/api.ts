@@ -2,7 +2,7 @@
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import pg from 'pg';
-import { API_URL, DATABASE_URL, JWT_SECRET, ROOT, exe } from './config';
+import { API_URL, DATABASE_URL, EMAIL_BLIND_INDEX_PEPPER, EMAIL_ENCRYPTION_KEY, JWT_SECRET, ROOT, exe } from './config';
 import { genKeypair, encryptForRecipient, encryptFileForFanout, wrapFileKey, type TestDeviceKeypair } from './crypto';
 
 export const API = `${API_URL}/api/v1`;
@@ -79,7 +79,15 @@ export async function register(prefix = 'user', password = 'secret123'): Promise
   const ip = randomIp();
   const res = await send<any>('POST', '/auth/register', { body: { username, email, password }, ip });
   if (res.status !== 200) throw new Error(`register failed: ${res.status} ${JSON.stringify(res.body)}`);
-  return { ...res.body, email, password, ip };
+  const user = { ...res.body, email, password, ip };
+  // Joining a server now requires a verified email (see routes/invites.rs).
+  // Real verification happens by clicking the emailed link; test users
+  // skip straight to "verified" via the same direct-DB escape hatch
+  // `sql()` already provides for things the API has no self-service path
+  // for (see `createServer`'s tier bump) -- this suite isn't exercising
+  // the verification flow itself, just everything that's gated on it.
+  await sql('UPDATE users SET email_verified_at = NOW() WHERE id = $1', [user.user.id]);
+  return user;
 }
 
 export async function login(email: string, password: string, ip = randomIp()): Promise<Res> {
@@ -226,7 +234,18 @@ export async function poll<T>(get: () => T | null | undefined, timeoutMs: number
 /** Runs the svalinn-admin tool against the test database. */
 export function admin(...args: string[]): string {
   try {
-    return execFileSync(exe('svalinn-admin'), args, { cwd: ROOT, env: { ...process.env, DATABASE_URL }, encoding: 'utf8' }).trim();
+    // Must agree with the webServer's own copy of these two (SERVER_ENV in
+    // config.ts) -- svalinn-admin computes the same email_hash/encrypted
+    // email the running server does, and a different pepper here would
+    // make every account this CLI creates permanently unable to log in
+    // (right email_hash column, wrong value in it) with no error to say
+    // why. Pass them explicitly rather than hoping dotenv/ambient env
+    // happens to agree.
+    return execFileSync(exe('svalinn-admin'), args, {
+      cwd: ROOT,
+      env: { ...process.env, DATABASE_URL, EMAIL_ENCRYPTION_KEY, EMAIL_BLIND_INDEX_PEPPER },
+      encoding: 'utf8',
+    }).trim();
   } catch (e: any) {
     return `${e.stdout ?? ''}${e.stderr ?? ''}`.trim();
   }
