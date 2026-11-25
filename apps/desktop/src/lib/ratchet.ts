@@ -702,6 +702,101 @@ export async function ensureRatchetReady(): Promise<void> {
   await maintainOneTimePrekeys(deviceId);
 }
 
+// --- Ratchet identity material for the passphrase recovery backup --------
+//
+// `lib/recovery.ts`'s passphrase backup historically only carried
+// `crypto.ts`'s core X25519 identity keypair (the one `ensureDeviceKeypair()`
+// manages). This module's OWN signing identity + current signed prekey live
+// in the SEPARATE localStorage keys above -- generated once per BROWSER the
+// first time `ensureRatchetReady()` ever runs there, and never regenerated
+// just because `crypto.ts`'s active identity keypair later gets swapped out
+// (by `replaceActiveKeypair()`, the manual "Recover from backup" escape
+// hatch, or by a brand-new device's own first-run recovery choice).
+// Recovering the core identity key alone does NOT give a device access to
+// the SIGNED PREKEY PRIVATE KEY that a past sender's X3DH handshake
+// actually used: that private key only ever lived in the ORIGINAL device's
+// own browser storage, and nothing backed it up. Exporting/importing it
+// alongside the core identity key closes that gap -- see
+// `recovery.ts`'s `createOrReplaceKeyBackup` and `restoreFromBackup`.
+//
+// The one-time prekey stash needs the same treatment, for the same
+// reason: an X3DH handshake that consumed one of this device's one-time
+// prekeys needs that SPECIFIC prekey's private key to complete the 4-DH
+// computation (not just the signed prekey's), and that private key also
+// only ever lived locally. Without it, a recovered device can still
+// decrypt messages whose handshake happened to skip the one-time-prekey
+// step (3-DH only), but silently gets a DIFFERENT, non-matching shared
+// secret for any that didn't -- the current stash is included wholesale
+// (it's already bounded to `MAX_LOCAL_ONE_TIME_PREKEYS`) so whichever one
+// an old, not-yet-received message referenced is there to be found.
+
+export interface RatchetIdentityBackup {
+  signingPublicKey: string;
+  signingPrivateKey: string;
+  signedPrekeyPublicKey: string;
+  signedPrekeyPrivateKey: string;
+  signedPrekeyCreatedAt: string;
+  oneTimePrekeys: StoredOneTimePrekey[];
+}
+
+/** Reads this browser's current ratchet signing identity + signed prekey
+ * + one-time prekey stash, for inclusion in a passphrase recovery backup.
+ * Returns null if this device has never completed `ensureRatchetReady()`
+ * -- nothing to export yet; callers should simply omit this material from
+ * the backup rather than treat that as an error. */
+export function exportRatchetIdentityForBackup(): RatchetIdentityBackup | null {
+  const signingPublicKey = localStorage.getItem(SIGNING_PUBLIC_KEY_STORAGE_KEY);
+  const signingPrivateKey = localStorage.getItem(SIGNING_PRIVATE_KEY_STORAGE_KEY);
+  const signedPrekeyPublicKey = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
+  const signedPrekeyPrivateKey = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
+  const signedPrekeyCreatedAt = localStorage.getItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY);
+  if (!signingPublicKey || !signingPrivateKey || !signedPrekeyPublicKey || !signedPrekeyPrivateKey || !signedPrekeyCreatedAt) {
+    return null;
+  }
+  return {
+    signingPublicKey,
+    signingPrivateKey,
+    signedPrekeyPublicKey,
+    signedPrekeyPrivateKey,
+    signedPrekeyCreatedAt,
+    oneTimePrekeys: loadOneTimePrekeys(),
+  };
+}
+
+/** Writes recovered ratchet identity material into this browser's local
+ * storage. The signing identity and signed prekey OVERWRITE whatever this
+ * browser had generated for itself before recovery -- see this section's
+ * header comment for why that's exactly what lets a recovered device
+ * respond to old messages that were X3DH-bootstrapped against the
+ * ORIGINAL device's signed prekey. The one-time prekey stash is MERGED
+ * (deduped by public key, bounded the same way `maintainOneTimePrekeys`
+ * already bounds it) rather than replaced outright, so a key this browser
+ * had already generated for itself isn't discarded for no reason. Callers
+ * should run this BEFORE anything that might call `ensureRatchetReady()`
+ * (e.g. `settleDeviceReady`'s fire-and-forget call), so its "already
+ * fresh, nothing to do" check sees the recovered material rather than
+ * racing to regenerate-and-republish a prekey this device just received
+ * from backup. Best-effort, matching every other localStorage write in
+ * this file: a failure here just means recovery falls back to today's
+ * (non-matching, this-browser's-own) behavior, not a crash. */
+export function importRecoveredRatchetIdentity(material: RatchetIdentityBackup): void {
+  try {
+    localStorage.setItem(SIGNING_PUBLIC_KEY_STORAGE_KEY, material.signingPublicKey);
+    localStorage.setItem(SIGNING_PRIVATE_KEY_STORAGE_KEY, material.signingPrivateKey);
+    localStorage.setItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY, material.signedPrekeyPublicKey);
+    localStorage.setItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY, material.signedPrekeyPrivateKey);
+    localStorage.setItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY, material.signedPrekeyCreatedAt);
+
+    const existing = loadOneTimePrekeys();
+    const existingKeys = new Set(existing.map((k) => k.publicKey));
+    const merged = [...existing, ...material.oneTimePrekeys.filter((k) => !existingKeys.has(k.publicKey))];
+    const bounded = merged.length > MAX_LOCAL_ONE_TIME_PREKEYS ? merged.slice(merged.length - MAX_LOCAL_ONE_TIME_PREKEYS) : merged;
+    storeOneTimePrekeys(bounded);
+  } catch (err) {
+    console.warn("Failed to import recovered ratchet identity material (falling back to this device's own):", err);
+  }
+}
+
 // --- Session persistence (local cache + best-effort encrypted backup) -----
 
 function sessionStorageKey(peerDeviceId: string): string {
@@ -835,8 +930,68 @@ export async function encryptMessage(peerDeviceId: string, plaintext: string): P
  * `decryptFromSender` contract: a bad/tampered message degrades to "can't
  * show this one" rather than crashing the conversation. */
 export async function decryptMessage(peerDeviceId: string, envelope: RatchetEnvelope): Promise<string | null> {
-  const { deviceId: myDeviceId } = await ensureDeviceKeypair();
+  const { deviceId: myDeviceId, publicKey: myIdentityPublicKeyB64 } = await ensureDeviceKeypair();
   let state = await loadOrRecoverSession(myDeviceId, peerDeviceId);
+
+  // Mutual X3DH initiation collision: both sides of a brand-new (device,
+  // peer device) pair can simultaneously find no session and self-initiate
+  // toward each other before either has received anything back. Each
+  // derives a DIFFERENT shared secret (initiator math run independently in
+  // each direction isn't symmetric across two unrelated handshakes), so
+  // `state` here -- our own un-replied initiator attempt -- has nothing to
+  // do with the secret this incoming message was actually encrypted under.
+  // Blindly reusing it (the pre-fix behavior) decrypt-fails every time.
+  //
+  // Resolve with a deterministic tie-break both sides can compute
+  // independently, with no coordination: compare identity public keys
+  // (the same canonical byte-ordering `canonicalPair` uses for AD). The
+  // side that loses discards its own attempt and adopts the winner's
+  // handshake as canonical (falls through to the normal responder-bootstrap
+  // path below). The side that wins keeps its own session untouched for
+  // future sends, but still owes the peer a decrypt of this one race
+  // message -- it derives a one-off responder session purely to read it,
+  // and never persists that derivation, so the two sides converge on a
+  // single matching chain afterward instead of drifting onto two
+  // unrelated ones (which is exactly what naively re-bootstrapping on
+  // every `initial` block, regardless of who's unaffected, would cause).
+  //
+  // Scoped tightly to an actual race: only when the existing session has
+  // never RECEIVED a real message yet (`chainKeyRecv === null`), which is
+  // the genuine invariant -- not `sendCount === 0`. In practice, each side
+  // finishes sending its own race message (bumping `sendCount` to 1) well
+  // before the peer's colliding message arrives over the network, so a
+  // `sendCount === 0` requirement here would almost never actually fire
+  // in the realistic timing this is meant to catch. `chainKeyRecv` stays
+  // null regardless of how many unanswered messages we've sent, and that's
+  // exactly the state that means "this session has never been confirmed
+  // by an actual reply" -- which is also implied by the peer's message
+  // still carrying `initial` fields at all (the sender clears those after
+  // its own first message, so a still-present `initial` means the SENDER
+  // hasn't heard back from us either). A session with any genuine
+  // received traffic (`chainKeyRecv` set) is never second-guessed here,
+  // whatever headers show up on top of it.
+  const isRaceCandidate = !!state && !!envelope.initial && state.chainKeyRecv === null;
+
+  if (isRaceCandidate && envelope.initial) {
+    const myIdentityPublicKey = fromB64(myIdentityPublicKeyB64);
+    const peerIdentityPublicKey = fromB64(envelope.initial.identityPublicKey);
+    const iAmCanonical = canonicalPair(myIdentityPublicKey, peerIdentityPublicKey).low === myIdentityPublicKey;
+
+    if (iAmCanonical) {
+      try {
+        const throwaway = await establishSessionAsResponder(peerDeviceId, envelope.initial);
+        const oneOff = ratchetDecrypt(throwaway, envelope);
+        return oneOff ? oneOff.plaintext : null;
+      } catch (err) {
+        console.warn('Failed to decrypt the losing side of a mutual X3DH initiation race:', err);
+        return null;
+      }
+    }
+    // We lose the tie: discard our own un-replied initiator attempt and
+    // fall through to establish fresh as responder below, which becomes
+    // our new canonical session.
+    state = null;
+  }
 
   if (!state) {
     if (!envelope.initial) {
