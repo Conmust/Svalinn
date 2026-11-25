@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Svalinn — Community Growth</title>
+<style>
+  :root {
+    --terminal-bg: #0a0e0a;
+    --terminal-surface: #000000;
+    --terminal-border: #00ff00;
+    --terminal-text: #00ff00;
+    --terminal-text-dim: #00aa00;
+    --terminal-accent: #00ff00;
+    --terminal-glow: 0 0 10px #00ff00;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: var(--terminal-bg);
+    background-image:
+      repeating-linear-gradient(0deg, rgba(0,255,0,0.03) 0px, rgba(0,255,0,0.03) 1px, transparent 1px, transparent 2px);
+    color: var(--terminal-text);
+    font-family: 'Courier New', 'Consolas', 'Monaco', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 20px 80px;
+  }
+  .wrap { width: 100%; max-width: 760px; }
+  .brand {
+    text-align: center;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--terminal-text-dim);
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+  h1 {
+    text-align: center;
+    font-size: 15px;
+    font-weight: normal;
+    letter-spacing: 0.08em;
+    margin: 0 0 36px;
+    color: var(--terminal-text);
+    opacity: 0.85;
+  }
+  .panel {
+    border: 1px solid var(--terminal-border);
+    background: rgba(0,0,0,0.5);
+    padding: 36px 24px;
+    text-align: center;
+    margin-bottom: 28px;
+  }
+  .count {
+    font-size: clamp(48px, 11vw, 92px);
+    line-height: 1;
+    font-weight: bold;
+    text-shadow: var(--terminal-glow);
+    transition: opacity 0.2s ease;
+  }
+  .count.pulse { animation: pulse 0.5s ease; }
+  @keyframes pulse {
+    0% { text-shadow: 0 0 2px #00ff00; transform: scale(1); }
+    40% { text-shadow: 0 0 24px #00ff00, 0 0 48px #00ff00; transform: scale(1.04); }
+    100% { text-shadow: var(--terminal-glow); transform: scale(1); }
+  }
+  .label {
+    margin-top: 10px;
+    color: var(--terminal-text-dim);
+    font-size: 13px;
+    letter-spacing: 0.05em;
+  }
+  .meta {
+    margin-top: 18px;
+    font-size: 11px;
+    color: var(--terminal-text-dim);
+    opacity: 0.7;
+  }
+  .chart-panel {
+    border: 1px solid var(--terminal-border);
+    background: rgba(0,0,0,0.5);
+    padding: 20px;
+  }
+  .chart-title {
+    font-size: 12px;
+    letter-spacing: 0.05em;
+    color: var(--terminal-text-dim);
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .range-buttons button {
+    background: transparent;
+    border: 1px solid var(--terminal-border);
+    color: var(--terminal-text);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 9px;
+    margin-left: 6px;
+    cursor: pointer;
+    opacity: 0.6;
+  }
+  .range-buttons button.active,
+  .range-buttons button:hover {
+    opacity: 1;
+    background: rgba(0,255,0,0.08);
+  }
+  svg.chart { width: 100%; height: 220px; display: block; overflow: visible; }
+  .axis-label { font-size: 9px; fill: var(--terminal-text-dim); opacity: 0.8; }
+  .gridline { stroke: var(--terminal-border); stroke-opacity: 0.12; }
+  .line-path { fill: none; stroke: var(--terminal-text); stroke-width: 2; }
+  .area-path { fill: var(--terminal-accent); opacity: 0.08; }
+  .dot { fill: var(--terminal-bg); stroke: var(--terminal-text); stroke-width: 1.5; }
+  .error, .loading {
+    text-align: center;
+    color: var(--terminal-text-dim);
+    font-size: 13px;
+    padding: 20px;
+  }
+  .footer {
+    text-align: center;
+    margin-top: 28px;
+    font-size: 11px;
+    color: var(--terminal-text-dim);
+    opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">Svalinn</div>
+    <h1>&gt; community growth_</h1>
+
+    <div class="panel">
+      <div class="count" id="count">—</div>
+      <div class="label">accounts created — no one tracked to get this number</div>
+      <div class="meta" id="asof">loading…</div>
+    </div>
+
+    <div class="chart-panel">
+      <div class="chart-title">
+        <span>signups over time</span>
+        <span class="range-buttons" id="rangeButtons">
+          <button data-days="7">7d</button>
+          <button data-days="30" class="active">30d</button>
+          <button data-days="90">90d</button>
+        </span>
+      </div>
+      <div id="chartHost"><div class="loading">loading…</div></div>
+    </div>
+
+    <div class="footer">this page only ever shows one aggregate number — never who signed up</div>
+  </div>
+
+<script>
+  // Point this at your deployed server. The desktop app defaults to
+  // http://localhost:3001 for local dev; set it to your real domain
+  // before publishing this page anywhere.
+  const API_BASE = 'http://localhost:3001';
+
+  // How often the live counter polls for a fresh number. "Semi-regular"
+  // is the point -- this is a public vanity counter, not a monitoring
+  // dashboard, so there's no reason to hammer the server.
+  const POLL_INTERVAL_MS = 60_000;
+
+  const countEl = document.getElementById('count');
+  const asofEl = document.getElementById('asof');
+  const chartHost = document.getElementById('chartHost');
+  const rangeButtons = document.getElementById('rangeButtons');
+
+  let lastCount = null;
+  let currentDays = 30;
+
+  function formatNumber(n) {
+    return n.toLocaleString('en-US');
+  }
+
+  function formatTime(iso) {
+    const d = new Date(iso);
+    return 'as of ' + d.toLocaleString('en-US', {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    });
+  }
+
+  async function refreshCount() {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/stats/user-count`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      countEl.textContent = formatNumber(data.total_users);
+      asofEl.textContent = formatTime(data.as_of);
+      if (lastCount !== null && data.total_users !== lastCount) {
+        countEl.classList.remove('pulse');
+        void countEl.offsetWidth; // restart animation
+        countEl.classList.add('pulse');
+      }
+      lastCount = data.total_users;
+    } catch (err) {
+      console.error('Failed to refresh user count:', err);
+      if (lastCount === null) {
+        countEl.textContent = '—';
+        asofEl.textContent = 'unavailable right now';
+      }
+    }
+  }
+
+  function buildChart(points) {
+    if (!points.length) {
+      chartHost.innerHTML = '<div class="loading">no history yet</div>';
+      return;
+    }
+
+    const width = 680;
+    const height = 220;
+    const padL = 36, padR = 12, padT = 12, padB = 24;
+    const innerW = width - padL - padR;
+    const innerH = height - padT - padB;
+
+    const values = points.map(p => p.total_users);
+    const minV = Math.min(...values);
+    const maxV = Math.max(...values);
+    const range = Math.max(maxV - minV, 1);
+    const yPad = range * 0.1;
+
+    function x(i) {
+      return padL + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW);
+    }
+    function y(v) {
+      return padT + innerH - ((v - (minV - yPad)) / (range + yPad * 2)) * innerH;
+    }
+
+    const linePoints = points.map((p, i) => `${x(i)},${y(p.total_users)}`).join(' ');
+    const areaPoints = `${x(0)},${padT + innerH} ${linePoints} ${x(points.length - 1)},${padT + innerH}`;
+
+    const gridLines = [0, 0.25, 0.5, 0.75, 1].map(f => {
+      const yy = padT + innerH * f;
+      return `<line class="gridline" x1="${padL}" x2="${width - padR}" y1="${yy}" y2="${yy}" />`;
+    }).join('');
+
+    const dots = points.map((p, i) =>
+      `<circle class="dot" cx="${x(i)}" cy="${y(p.total_users)}" r="2.5"><title>${p.date}: ${formatNumber(p.total_users)}</title></circle>`
+    ).join('');
+
+    const step = Math.max(1, Math.ceil(points.length / 6));
+    const labels = points.map((p, i) => {
+      if (i % step !== 0 && i !== points.length - 1) return '';
+      const d = new Date(p.date + 'T00:00:00Z');
+      const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      return `<text class="axis-label" x="${x(i)}" y="${height - 4}" text-anchor="middle">${label}</text>`;
+    }).join('');
+
+    chartHost.innerHTML = `
+      <svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+        ${gridLines}
+        <polygon class="area-path" points="${areaPoints}" />
+        <polyline class="line-path" points="${linePoints}" />
+        ${dots}
+        ${labels}
+      </svg>
+    `;
+  }
+
+  async function refreshHistory(days) {
+    chartHost.innerHTML = '<div class="loading">loading…</div>';
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/stats/user-count/history?days=${days}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      buildChart(data.points);
+    } catch (err) {
+      console.error('Failed to load history:', err);
+      chartHost.innerHTML = '<div class="error">couldn\'t load history right now</div>';
+    }
+  }
+
+  rangeButtons.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-days]');
+    if (!btn) return;
+    currentDays = Number(btn.dataset.days);
+    [...rangeButtons.querySelectorAll('button')].forEach(b => b.classList.toggle('active', b === btn));
+    refreshHistory(currentDays);
+  });
+
+  refreshCount();
+  refreshHistory(currentDays);
+  setInterval(refreshCount, POLL_INTERVAL_MS);
+  // The daily history only changes once a day server-side, so there's no
+  // need to poll it as often as the live count -- refetch every 10 minutes.
+  setInterval(() => refreshHistory(currentDays), 10 * 60_000);
+</script>
+</body>
+</html>

@@ -11,6 +11,7 @@ mod permissions;
 mod presence;
 mod rate_limit;
 mod sessions;
+mod stats;
 mod tiers;
 mod voice;
 mod routes;
@@ -85,9 +86,15 @@ async fn main() {
     // Close live connections as soon as a user is banned or a session revoked.
     sessions::spawn_watchers(db.clone());
 
+    // Keeps the public signup-count history (for community growth charts)
+    // topped up with one aggregate number per day.
+    stats::spawn_snapshot_job(db.clone());
+
     // 5. Build the application router
     let app = Router::new()
         .route("/health", get(routes::health::health_check))
+        .route("/api/v1/stats/user-count", get(routes::stats::get_user_count))
+        .route("/api/v1/stats/user-count/history", get(routes::stats::get_user_count_history))
 
         // --- Auth Routes ---
         .route("/api/v1/auth/register", post(routes::auth::register))
