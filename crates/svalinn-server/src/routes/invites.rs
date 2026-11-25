@@ -243,6 +243,37 @@ pub async fn accept_invite(
         return Err(AppError::Forbidden("You are banned from this server.".into()));
     }
 
+    // A brand-new account (different user_id) can't be matched above, but
+    // if it's verified under an email that was already banned from this
+    // server (see `members::ban_member`), it's almost certainly the same
+    // person evading the ban -- block it the same way. A different real
+    // email entirely isn't caught by this; that's a harder problem than an
+    // email check alone can solve.
+    let (email_hash, email_verified): (Option<String>, bool) =
+        sqlx::query_as("SELECT email_hash, email_verified_at IS NOT NULL FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if !email_verified {
+        return Err(AppError::Forbidden(
+            "Verify your email before joining servers. Check your inbox for the verification link.".into(),
+        ));
+    }
+    if let Some(email_hash) = email_hash {
+        let email_banned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM banned_emails WHERE server_id = $1 AND email_hash = $2)",
+        )
+        .bind(server_id)
+        .bind(&email_hash)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if email_banned {
+            return Err(AppError::Forbidden("You are banned from this server.".into()));
+        }
+    }
+
     let joined = sqlx::query(
         "INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (server_id, user_id) DO NOTHING",
     )

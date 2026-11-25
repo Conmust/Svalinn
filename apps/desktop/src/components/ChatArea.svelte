@@ -7,6 +7,7 @@
   import ConfirmModal from './ConfirmModal.svelte';
   import {
     type Message,
+    type MessageRecipientEntry,
     deleteMessage, hideMessage, unhideMessage, lockMessage, unlockMessage,
     pinMessage, unpinMessage, addReaction, removeReaction,
     fetchChannelMessages, sendChannelMessage, SendChannelMessageError,
@@ -26,6 +27,7 @@
   import { fetchChannelMemberDevices, type ParticipantDevice } from '../lib/devices';
   import { fileUrl } from '../lib/api';
   import { withTimeout, TimeoutError } from '../lib/timeout';
+  import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
 
   // --- Encryption error boundary -------------------------------------------
   // Mirrors `DMChatArea.svelte`'s identically-named helper: a broken
@@ -115,6 +117,16 @@
   const createdObjectUrls: string[] = [];
   const ATTACHMENT_FETCH_TIMEOUT_MS = 30_000;
 
+  /** Per-message decryption state for a message sent via `ratchet.ts`,
+   * mirroring `DMChatArea.svelte`'s identical mechanism -- see there for
+   * the full rationale. A channel member only has a ratchet session with
+   * SOME other members (whoever has bootstrapped one), so unlike a DM
+   * this is routinely a mix of ratchet- and legacy-encrypted entries
+   * within the very same message's `recipients` array. */
+  type RatchetDecryptState = { status: 'loading' } | { status: 'done'; text: string | null };
+  let ratchetDecryptState: Record<string, RatchetDecryptState> = {};
+  const RATCHET_DECRYPTING_PLACEHOLDER = 'Decrypting…';
+
   // Decrypting a message depends on whether it went through the fan-out
   // send path: not encrypted -> show `content` (and `attachment_url`) as
   // -is; encrypted -> look for the entry in `recipients` addressed to THIS
@@ -132,7 +144,11 @@
   // passed in explicitly (rather than closed over) purely so Svelte's
   // reactivity tracker sees it referenced directly in the `$:` block below
   // and re-runs this whenever it changes.
-  function toDisplayMessage(message: Message, attachmentState: Record<string, AttachmentState>): Message {
+  function toDisplayMessage(
+    message: Message,
+    attachmentState: Record<string, AttachmentState>,
+    ratchetState: Record<string, RatchetDecryptState>
+  ): Message {
     try {
       let displayed = message;
       if (message.is_encrypted) {
@@ -143,6 +159,13 @@
           const mine = myDeviceId ? recipients.find(r => r.device_id === myDeviceId) : undefined;
           if (!mine) {
             displayed = { ...message, content: SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER };
+          } else if (mine.ratchet_header_json) {
+            // Decrypted asynchronously by `ensureRatchetMessageDecrypted`,
+            // kicked off by the reactive block below -- same lazy pattern
+            // as `ensureAttachmentDecrypted` for files. This function
+            // itself stays synchronous.
+            const state = ratchetState[message.id];
+            displayed = { ...message, content: !state || state.status === 'loading' ? RATCHET_DECRYPTING_PLACEHOLDER : (state.text ?? DECRYPT_FAILED_PLACEHOLDER) };
           } else {
             const decrypted = decryptFromSender(mine.ciphertext, mine.nonce, mine.sender_public_key, myPrivateKey);
             displayed = { ...message, content: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
@@ -162,18 +185,66 @@
     }
   }
 
-  // Re-derived whenever the raw messages, our key, or an attachment's
-  // decryption state changes. The `map` itself is also guarded, as the
-  // last line of defense against anything escaping `toDisplayMessage`
-  // (see the identical note in `DMChatArea.svelte`).
+  /** Decrypts one ratchet-encrypted channel message's text, mirroring
+   * `DMChatArea.svelte`'s identical function -- see there for the full
+   * rationale. Needs `channelMemberDevices` (not `participantDevices`,
+   * since a channel has many members) to map the entry's
+   * `sender_public_key` back to a device id. */
+  async function ensureRatchetMessageDecrypted(message: Message, mine: MessageRecipientEntry): Promise<void> {
+    ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
+    try {
+      const senderDeviceId = channelMemberDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      if (!senderDeviceId) {
+        ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
+        return;
+      }
+      const header = JSON.parse(mine.ratchet_header_json as string);
+      const envelope: RatchetEnvelope = {
+        dh: header.dh,
+        pn: header.pn,
+        n: header.n,
+        ciphertext: mine.ciphertext,
+        nonce: mine.nonce,
+        initial: header.initial,
+      };
+      const plaintext = await decryptMessage(senderDeviceId, envelope);
+      ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: plaintext } };
+    } catch (e) {
+      console.error('Failed to decrypt a ratchet-encrypted channel message:', e);
+      ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
+    }
+  }
+
+  // Re-derived whenever the raw messages, our key, an attachment's
+  // decryption state, or a ratchet decryption's state changes. The `map`
+  // itself is also guarded, as the last line of defense against anything
+  // escaping `toDisplayMessage` (see the identical note in
+  // `DMChatArea.svelte`).
   let messages: Message[] = [];
   $: {
     try {
-      messages = rawMessages.map(m => toDisplayMessage(m, attachmentState));
+      messages = rawMessages.map(m => toDisplayMessage(m, attachmentState, ratchetDecryptState));
     } catch (e) {
       console.error('Unexpected error building the channel message list:', e);
       messages = [];
       if (!panelError) panelError = 'Encrypted messaging is currently unavailable due to an unexpected error.';
+    }
+  }
+
+  // Kicks off `ensureRatchetMessageDecrypted` for any ratchet-encrypted
+  // message not yet attempted. Gated on `channelMemberDevices` actually
+  // being loaded (needed to resolve a sender's device id), same as
+  // `DMChatArea.svelte`'s identical block.
+  $: {
+    if (myDeviceId && channelMemberDevices.length > 0) {
+      for (const m of rawMessages) {
+        if (!m.is_encrypted) continue;
+        const recipients = Array.isArray(m.recipients) ? m.recipients : [];
+        const mine = recipients.find(r => r.device_id === myDeviceId);
+        if (mine?.ratchet_header_json && !ratchetDecryptState[m.id]) {
+          void ensureRatchetMessageDecrypted(m, mine);
+        }
+      }
     }
   }
 
@@ -484,6 +555,37 @@
     if (fileInput) fileInput.value = '';
   }
 
+  // Encrypts `content` for one recipient device, mirroring
+  // `DMChatArea.svelte`'s identical function -- see there for the full
+  // rationale (prefer the ratchet when the device supports it, fall back
+  // to the legacy per-device key otherwise, and never ratchet this
+  // device's own self-entry).
+  async function encryptForDevice(
+    d: ParticipantDevice,
+    content: string
+  ): Promise<{ deviceId: string; ciphertext: string; nonce: string; ratchetHeaderJson?: string }> {
+    if (d.device_id === myDeviceId) {
+      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
+      return { deviceId: d.device_id, ciphertext, nonce };
+    }
+    try {
+      const envelope = await encryptMessage(d.device_id, content);
+      return {
+        deviceId: d.device_id,
+        ciphertext: envelope.ciphertext,
+        nonce: envelope.nonce,
+        ratchetHeaderJson: JSON.stringify({ dh: envelope.dh, pn: envelope.pn, n: envelope.n, initial: envelope.initial }),
+      };
+    } catch (err) {
+      // A channel routinely has members who haven't bootstrapped a
+      // ratchet session yet (unlike a DM's single fixed peer) -- this
+      // fallback is the normal case here, not an edge case.
+      if (!(err instanceof RatchetNotSupportedError)) throw err;
+      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
+      return { deviceId: d.device_id, ciphertext, nonce };
+    }
+  }
+
   // Encrypts `content` once per device in `devices` -- including this
   // device's own current device, with no special-casing (see
   // `DMChatArea.svelte`'s identical function for the full rationale: the
@@ -496,32 +598,27 @@
     file: File | null
   ): Promise<Message> {
     if (!file) {
-      const encryptedFor = devices.map(d => {
-        const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
-        return { deviceId: d.device_id, ciphertext, nonce };
-      });
+      const encryptedFor = await Promise.all(devices.map(d => encryptForDevice(d, content)));
       return sendChannelMessage(channelId, null, { encryptedFor, senderDeviceId: myDeviceId as string });
     }
 
     // Hybrid encryption, same as the DM attachment flow: the file is
     // encrypted ONCE with a fresh random symmetric key, then that small
-    // key is wrapped once per recipient device.
+    // key is wrapped once per recipient device. The wrapped key stays on
+    // the legacy scheme regardless of the text path -- see
+    // `DMChatArea.svelte`'s identical note for why.
     const fileBytes = new Uint8Array(await file.arrayBuffer());
     const { ciphertext: fileCiphertext, nonce: attachmentNonce, fileKey } = encryptFileForFanout(fileBytes);
     const encryptedBlob = new File([fileCiphertext.slice()], file.name, { type: 'application/octet-stream' });
     const uploaded = await uploadFile(encryptedBlob);
 
-    const encryptedFor = devices.map(d => {
-      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
-      const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
-      return {
-        deviceId: d.device_id,
-        ciphertext,
-        nonce,
-        attachmentKeyCiphertext: wrapped.ciphertext,
-        attachmentKeyNonce: wrapped.nonce,
-      };
-    });
+    const encryptedFor = await Promise.all(
+      devices.map(async d => {
+        const textResult = await encryptForDevice(d, content);
+        const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+        return { ...textResult, attachmentKeyCiphertext: wrapped.ciphertext, attachmentKeyNonce: wrapped.nonce };
+      })
+    );
 
     return sendChannelMessage(
       channelId,

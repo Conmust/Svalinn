@@ -7,7 +7,13 @@ use uuid::Uuid;
 pub struct User {
     pub id: Uuid,
     pub username: String,
-    pub email: String,
+    /// Legacy plaintext column. NULL for every account going forward (and
+    /// for any pre-existing account after the startup backfill clears it)
+    /// -- see `email_privacy` and `main::backfill_email_privacy`. Kept as
+    /// `Option` (not read anywhere) purely so `SELECT *`/`RETURNING *`
+    /// against `users` still decodes into this struct.
+    #[serde(skip_serializing)]
+    pub email: Option<String>,
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub is_online: bool,
@@ -105,6 +111,18 @@ pub struct AuthResponse {
     /// Long-lived token for `POST /api/v1/auth/refresh`.
     pub refresh_token: String,
     pub user: PublicUser,
+    /// The verification link, present only when `APP_ENV=development` and
+    /// only right after registration -- there's no real email provider
+    /// wired up yet (see `routes::auth::send_verification_email`), so this
+    /// is how a local dev/test client gets at it without one. Never set in
+    /// any other environment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_verification_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyEmailRequest {
+    pub token: String,
 }
 
 #[derive(Debug, Serialize)]

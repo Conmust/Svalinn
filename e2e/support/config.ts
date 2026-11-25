@@ -16,10 +16,22 @@ export const DATABASE_URL =
 /** Known to the tests so they can forge tokens and signed links. Test-only. */
 export const JWT_SECRET = 'e2e-test-secret-not-for-production-0123456789';
 
+/**
+ * email_privacy::init_keys refuses to start the server without these.
+ * Test-only, fixed so a run's encrypted-email fixtures stay readable across
+ * processes in the same run; not used anywhere outside this test database.
+ */
+export const EMAIL_ENCRYPTION_KEY =
+  process.env.E2E_EMAIL_ENCRYPTION_KEY ?? 'sjaP9fNPQiOdj5s23kGjy6bCtQj3tcO+DQfxmcuAuWo=';
+export const EMAIL_BLIND_INDEX_PEPPER =
+  process.env.E2E_EMAIL_BLIND_INDEX_PEPPER ?? 'e2e-test-pepper-not-a-real-secret-0123456789';
+
 /** Environment for the server under test. */
 export const SERVER_ENV: Record<string, string> = {
   DATABASE_URL,
   JWT_SECRET,
+  EMAIL_ENCRYPTION_KEY,
+  EMAIL_BLIND_INDEX_PEPPER,
   APP_ENV: 'test',
   HOST: '127.0.0.1',
   PORT: String(API_PORT),

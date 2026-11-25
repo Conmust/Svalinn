@@ -1,0 +1,16 @@
+-- Carries one recipient device's Double Ratchet envelope metadata
+-- alongside its existing `ciphertext`/`nonce` columns, when that message
+-- was sent via `ratchet.ts` instead of the legacy stateless per-device
+-- path (`crypto.ts`). Additive, nullable -- every row from before this
+-- migration (and every row from a sender who hasn't adopted the ratchet
+-- yet) simply has NULL here, same pattern as migration 0038's
+-- `ratchet_version` column right next to it.
+--
+-- Stored as one JSON blob rather than separate columns for `dh`/`pn`/`n`/
+-- `initial` (see `ratchet.ts`'s `RatchetEnvelope`) because this is pure
+-- opaque-to-the-server routing metadata -- the server never reads or
+-- queries into it, only stores and returns it verbatim to the recipient
+-- device, exactly like `ciphertext` itself. A JSON column avoids a
+-- four-plus-column spread for fields that only ever travel and get
+-- parsed together, client-side, as one unit.
+ALTER TABLE message_recipients ADD COLUMN IF NOT EXISTS ratchet_header_json TEXT;

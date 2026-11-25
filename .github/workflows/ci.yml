@@ -32,6 +32,16 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://svalinn:svalinn_dev@localhost:5432/svalinn_test
+      # register_then_login_succeeds_case_insensitively_and_verify_email_works_once
+      # asserts on the dev-only verification link, same as a local checkout
+      # using .env.example's default.
+      APP_ENV: development
+      # Test-only values (not real secrets) so email_privacy::init_keys
+      # doesn't refuse to start in CI. Generated once with `openssl rand`;
+      # safe to be public since nothing they protect exists outside this
+      # ephemeral test database.
+      EMAIL_ENCRYPTION_KEY: sjaP9fNPQiOdj5s23kGjy6bCtQj3tcO+DQfxmcuAuWo=
+      EMAIL_BLIND_INDEX_PEPPER: ci-test-pepper-not-a-real-secret-0123456789
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

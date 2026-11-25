@@ -10,7 +10,11 @@
 //! last refresh. Presenting a retired token again means it was probably
 //! copied, so the whole session (token family) is revoked.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::SaltString;
 use jsonwebtoken::{encode, Header, EncodingKey};
@@ -20,13 +24,21 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::disposable_email;
+use crate::email_privacy;
 use crate::errors::AppError;
 use crate::extractors::auth::jwt_secret;
-use crate::rate_limit::{ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_PER_IP, REGISTER_PER_IP};
+use crate::rate_limit::{
+    ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_FAILURES_PER_ACCOUNT_IP, LOGIN_PER_IP, REGISTER_PER_IP,
+};
 use crate::sessions::AccessDenied;
 use crate::models::user::{
     AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, User,
+    VerifyEmailRequest,
 };
+
+/// How long an emailed verification link stays usable.
+const EMAIL_VERIFICATION_TTL_HOURS: i64 = 48;
 
 /// How long an access token (JWT) is valid.
 pub const ACCESS_TOKEN_TTL_SECONDS: i64 = 5 * 60;
@@ -51,12 +63,38 @@ pub async fn register(
     if payload.password.len() < 6 {
         return Err(AppError::BadRequest("Password must be at least 6 characters".into()));
     }
+    if !email_privacy::is_plausible_format(&payload.email) {
+        return Err(AppError::BadRequest("Enter a valid email address".into()));
+    }
+    if disposable_email::is_disposable(&payload.email) {
+        return Err(AppError::BadRequest(
+            "Please use a permanent email address rather than a disposable/temporary one".into(),
+        ));
+    }
+
+    let email_hash = email_privacy::blind_index(&payload.email);
+
+    // A platform-wide ban (users.banned_at) records the banned email here
+    // (see the migration's trigger) -- catches the same real email trying
+    // to come back under a new username even after the original account is
+    // deleted. A *different* real email isn't caught by this at all; that's
+    // the disposable-domain check's job, not this one's.
+    let globally_banned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM banned_emails WHERE email_hash = $1 AND server_id IS NULL)",
+    )
+    .bind(&email_hash)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if globally_banned {
+        return Err(AppError::Forbidden("This email address is not eligible to register.".into()));
+    }
 
     // Check if user already exists
     let existing: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE email = $1 OR username = $2"
+        "SELECT COUNT(*) FROM users WHERE email_hash = $1 OR username = $2"
     )
-    .bind(&payload.email)
+    .bind(&email_hash)
     .bind(&payload.username)
     .fetch_one(&db.pool)
     .await
@@ -73,25 +111,37 @@ pub async fn register(
         .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))?
         .to_string();
 
-    // Insert user
+    let email_encrypted = email_privacy::encrypt(&payload.email);
+
+    // Insert user. `email` itself is left NULL -- only the encrypted form
+    // and the blind index are stored; see `email_privacy`.
     let user: User = sqlx::query_as(
         r#"
-        INSERT INTO users (username, email, password_hash, display_name)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO users (username, email_encrypted, email_hash, password_hash, display_name)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         "#
     )
     .bind(&payload.username)
-    .bind(&payload.email)
+    .bind(&email_encrypted)
+    .bind(&email_hash)
     .bind(&password_hash)
     .bind(&payload.username)
     .fetch_one(&db.pool)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .map_err(|e| match e {
+        sqlx::Error::Database(d) if d.is_unique_violation() => {
+            AppError::BadRequest("Email or username already exists".into())
+        }
+        e => AppError::Database(e.to_string()),
+    })?;
+
+    let verification_token = issue_verification_token(&db, user.id).await?;
+    let dev_link = send_verification_email(user.id, &payload.email, &verification_token);
 
     // Only accounts actually created count towards the limit.
     db.limits.record(&REGISTER_PER_IP, &ip);
-    start_session(&db, user).await
+    start_session(&db, user, dev_link).await
 }
 
 pub async fn login(
@@ -99,21 +149,35 @@ pub async fn login(
     ClientIp(ip): ClientIp,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    // Limit password guessing: every attempt counts per IP address, and failed
-    // attempts count per account (whichever addresses they come from).
+    // Limit password guessing: every attempt counts per IP address, and
+    // failed attempts count both per (account, IP) -- the real brute-force
+    // throttle -- and per account alone, as a looser backstop against a
+    // distributed attack. Keyed on the blind index (not the raw email) so
+    // the in-memory limiter never holds a plaintext address either, and so
+    // "Alice@x.com"/"alice@x.com" share one counter.
+    //
+    // The per-account-alone rule is deliberately loose (see its doc comment
+    // in rate_limit.rs): an attacker who only knows a victim's email, with
+    // no password, must not be able to lock the real owner out of their own
+    // account just by sending a handful of wrong passwords from one IP. The
+    // tight (account, IP) rule below is what actually stops a brute force,
+    // and it only ever penalizes whichever IP is doing the guessing.
     let ip = ip.to_string();
-    let account = payload.email.trim().to_string();
+    let account = email_privacy::blind_index(&payload.email);
+    let account_ip = format!("{account}:{ip}");
     db.limits.check(&LOGIN_PER_IP, &ip)?;
+    db.limits.check(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip)?;
     db.limits.check(&LOGIN_FAILURES_PER_ACCOUNT, &account)?;
     db.limits.record(&LOGIN_PER_IP, &ip);
 
     let invalid = || {
+        db.limits.record(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip);
         db.limits.record(&LOGIN_FAILURES_PER_ACCOUNT, &account);
         AppError::BadRequest("Invalid email or password".into())
     };
 
-    let Some(user): Option<User> = sqlx::query_as("SELECT * FROM users WHERE email = $1")
-        .bind(&payload.email)
+    let Some(user): Option<User> = sqlx::query_as("SELECT * FROM users WHERE email_hash = $1")
+        .bind(&account)
         .fetch_optional(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -130,6 +194,7 @@ pub async fn login(
     {
         return Err(invalid());
     }
+    db.limits.reset(&LOGIN_FAILURES_PER_ACCOUNT_IP, &account_ip);
     db.limits.reset(&LOGIN_FAILURES_PER_ACCOUNT, &account);
 
     // Only reveal a ban to someone who knows the password.
@@ -143,7 +208,92 @@ pub async fn login(
         return Err(AppError::Forbidden(AccessDenied::Banned(reason).message()));
     }
 
-    start_session(&db, user).await
+    start_session(&db, user, None).await
+}
+
+/// GET /api/v1/auth/verify-email?token=...
+///
+/// A GET (not POST) deliberately, so it works when clicked straight out of
+/// an email client's browser, not just from the app. Marks the account's
+/// email verified; joining a server (`accept_invite`) requires this -- see
+/// that function's comment for why.
+pub async fn verify_email(
+    State(db): State<Database>,
+    Query(payload): Query<VerifyEmailRequest>,
+) -> Result<StatusCode, AppError> {
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let token_hash = hash_token(&payload.token);
+
+    let row: Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT user_id, expires_at, used_at FROM email_verification_tokens WHERE token_hash = $1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(db_err)?;
+
+    let Some((user_id, expires_at, used_at)) = row else {
+        return Err(AppError::BadRequest("That verification link is invalid.".into()));
+    };
+    if used_at.is_some() {
+        return Err(AppError::BadRequest("That verification link has already been used.".into()));
+    }
+    if expires_at <= Utc::now() {
+        return Err(AppError::BadRequest("That verification link has expired. Request a new one.".into()));
+    }
+
+    sqlx::query("UPDATE email_verification_tokens SET used_at = NOW() WHERE token_hash = $1")
+        .bind(&token_hash)
+        .execute(&db.pool)
+        .await
+        .map_err(db_err)?;
+    sqlx::query("UPDATE users SET email_verified_at = NOW() WHERE id = $1 AND email_verified_at IS NULL")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(db_err)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Generates a one-time verification token, stores only its hash (same
+/// pattern as refresh tokens), and returns the raw token to send/log.
+pub(crate) async fn issue_verification_token(db: &Database, user_id: Uuid) -> Result<String, AppError> {
+    let token = new_refresh_token(); // same shape (32 random bytes, hex) suits this fine too
+    let expires_at = Utc::now() + Duration::hours(EMAIL_VERIFICATION_TTL_HOURS);
+
+    sqlx::query(
+        "INSERT INTO email_verification_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(hash_token(&token))
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(token)
+}
+
+/// Stub until a real transactional-email provider is chosen and wired up:
+/// logs that a verification link was issued, by user id only -- deliberately
+/// never the email address itself, since a log line is also a plaintext
+/// storage location and the whole point of this feature is to not have one.
+/// In development, also returns the link itself so a local client/tester
+/// can use it without needing a real inbox; `None` everywhere else.
+pub(crate) fn send_verification_email(user_id: Uuid, _email: &str, token: &str) -> Option<String> {
+    let base = std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "http://localhost:3001".into());
+    let link = format!("{base}/api/v1/auth/verify-email?token={token}");
+    println!(
+        "✉️  Verification link issued for user {} (TODO: wire up a real email provider to send it)",
+        crate::email_privacy::log_ref(user_id)
+    );
+
+    if std::env::var("APP_ENV").as_deref() == Ok("development") {
+        Some(link)
+    } else {
+        None
+    }
 }
 
 /// POST /api/v1/auth/refresh  `{ "refresh_token": "..." }`
@@ -267,7 +417,13 @@ pub async fn logout(
 }
 
 /// Issues both tokens for a newly logged-in user, starting a new token family.
-async fn start_session(db: &Database, user: User) -> Result<Json<AuthResponse>, AppError> {
+/// `dev_verification_link` is only ever `Some` right after a fresh
+/// registration in a dev environment -- see `send_verification_email`.
+async fn start_session(
+    db: &Database,
+    user: User,
+    dev_verification_link: Option<String>,
+) -> Result<Json<AuthResponse>, AppError> {
     let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
     let mut tx = db.pool.begin().await.map_err(db_err)?;
 
@@ -287,6 +443,7 @@ async fn start_session(db: &Database, user: User) -> Result<Json<AuthResponse>, 
         expires_in: ACCESS_TOKEN_TTL_SECONDS,
         refresh_token,
         user: user.into(),
+        dev_verification_link,
     }))
 }
 
@@ -377,6 +534,7 @@ fn generate_jwt(user_id: Uuid, username: &str, session_id: Uuid) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn refresh_tokens_are_random_and_hashed() {
@@ -386,5 +544,123 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(hash_token(&a), hash_token(&a));
         assert_ne!(hash_token(&a), a);
+    }
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    /// Both secrets are read once per test binary (OnceLock); idempotent
+    /// across this module's tests. Needs JWT_SECRET, EMAIL_ENCRYPTION_KEY
+    /// and EMAIL_BLIND_INDEX_PEPPER set in the test environment's .env.
+    fn ensure_test_secrets() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            dotenvy::dotenv().ok();
+            let _ = crate::extractors::auth::init_jwt_secret();
+            crate::email_privacy::init_keys("development")
+                .expect("test .env must set EMAIL_ENCRYPTION_KEY/EMAIL_BLIND_INDEX_PEPPER");
+        });
+    }
+
+    fn test_ip() -> ClientIp {
+        ClientIp(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+    }
+
+    async fn cleanup_user(db: &Database, username: &str) {
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1").bind(username).execute(&db.pool).await;
+    }
+
+    #[tokio::test]
+    async fn register_rejects_a_disposable_email_domain() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+
+        let result = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest {
+                username: username.clone(),
+                email: "someone@mailinator.com".into(),
+                password: "password123".into(),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::BadRequest(msg)) => assert!(msg.contains("disposable"), "unexpected message: {msg}"),
+            other => panic!("expected a BadRequest rejecting the disposable domain, got {other:?}"),
+        }
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn register_rejects_an_email_with_an_active_global_ban() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let email = format!("globally-banned-{}@example.invalid", Uuid::new_v4());
+        let email_hash = email_privacy::blind_index(&email);
+        sqlx::query("INSERT INTO banned_emails (email_hash, server_id, reason) VALUES ($1, NULL, 'test')")
+            .bind(&email_hash)
+            .execute(&db.pool)
+            .await
+            .expect("failed to seed banned_emails");
+
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let result = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await;
+
+        match result {
+            Err(AppError::Forbidden(_)) => {}
+            other => panic!("expected a Forbidden for a globally-banned email, got {other:?}"),
+        }
+
+        sqlx::query("DELETE FROM banned_emails WHERE email_hash = $1").bind(&email_hash).execute(&db.pool).await.ok();
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn register_then_login_succeeds_case_insensitively_and_verify_email_works_once() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("Reg-Login-{}@Example.Invalid", Uuid::new_v4());
+
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let token = reg.0.dev_verification_link.clone().expect("dev env should return a verification link");
+        let raw_token = token.rsplit_once("token=").map(|(_, t)| t.to_string()).expect("link should carry a token");
+
+        // Login works with different case than what was registered.
+        let _ = login(
+            State(db.clone()),
+            test_ip(),
+            Json(LoginRequest { email: email.to_lowercase(), password: "password123".into() }),
+        )
+        .await
+        .expect("login should succeed with the same email in a different case");
+
+        verify_email(State(db.clone()), Query(VerifyEmailRequest { token: raw_token.clone() }))
+            .await
+            .expect("first verification should succeed");
+
+        match verify_email(State(db.clone()), Query(VerifyEmailRequest { token: raw_token })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for an already-used token, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
     }
 }

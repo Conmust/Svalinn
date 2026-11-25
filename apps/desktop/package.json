@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
     "tauri": "tauri"
   },
   "devDependencies": {
@@ -22,10 +23,15 @@
     "tailwindcss": "^3.4.0",
     "tslib": "^2.6.2",
     "typescript": "^5.3.3",
-    "vite": "^5.0.10"
+    "vite": "^5.0.10",
+    "vitest": "2.1.9"
   },
   "dependencies": {
+    "@cloudflare/blindrsa-ts": "^0.4.6",
     "@tauri-apps/api": "^2.0.0",
     "libsodium-wrappers-sumo": "0.7.15"
+  },
+  "overrides": {
+    "sjcl": "1.0.9"
   }
 }

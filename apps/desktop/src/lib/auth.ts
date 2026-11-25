@@ -34,11 +34,11 @@ export async function login(email: string, password: string): Promise<User> {
   }
 
   const data = await response.json();
-  
+
   // Store the tokens and user
   storeTokens(data.token, data.refresh_token);
   localStorage.setItem('user', JSON.stringify(data.user));
-  
+
   return data.user;
 }
 
@@ -55,11 +55,26 @@ export async function register(username: string, email: string, password: string
   }
 
   const data = await response.json();
-  
+
   // Store the tokens and user
   storeTokens(data.token, data.refresh_token);
   localStorage.setItem('user', JSON.stringify(data.user));
-  
+
+  // `dev_verification_link` is only ever present when the server is running
+  // with APP_ENV=development (see svalinn-server's routes::auth) -- there's
+  // no real email provider wired up yet, so the server hands the link back
+  // directly instead of mailing it. Following it automatically here means
+  // joining a server works right away in local testing, the same as it
+  // will once a real "click the email link" flow exists; this is a no-op
+  // in any other environment, since the field is simply absent there.
+  if (data.dev_verification_link) {
+    try {
+      await fetch(data.dev_verification_link);
+    } catch {
+      // Best-effort only -- registration itself already succeeded.
+    }
+  }
+
   return data.user;
 }
 

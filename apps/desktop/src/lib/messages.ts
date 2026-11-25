@@ -18,6 +18,11 @@ export interface MessageRecipientEntry {
   sender_public_key: string;
   attachment_key_ciphertext?: string | null;
   attachment_key_nonce?: string | null;
+  /** This entry's Double Ratchet envelope metadata (`ratchet.ts`'s
+   * `RatchetEnvelope`, minus `ciphertext`/`nonce`, as a JSON string), when
+   * it was encrypted via `ratchet.ts` rather than the legacy stateless
+   * per-device path (`crypto.ts`). `null`/absent for a legacy entry. */
+  ratchet_header_json?: string | null;
 }
 
 export interface Message {
@@ -123,6 +128,10 @@ export interface SendChannelMessageOptions {
      * when `attachmentNonce` is set; must be omitted otherwise. */
     attachmentKeyCiphertext?: string;
     attachmentKeyNonce?: string;
+    /** This entry's Double Ratchet envelope metadata, when it was
+     * encrypted via `ratchet.ts`'s `encryptMessage` rather than
+     * `crypto.ts`'s `encryptForRecipient` -- see `MessageRecipientEntry`. */
+    ratchetHeaderJson?: string;
   }>;
   /** The id of THIS device (the one that did the encrypting), so the
    * server can resolve and record its public key on every
@@ -173,6 +182,7 @@ export async function sendChannelMessage(
           nonce: r.nonce,
           attachment_key_ciphertext: r.attachmentKeyCiphertext ?? null,
           attachment_key_nonce: r.attachmentKeyNonce ?? null,
+          ratchet_header_json: r.ratchetHeaderJson ?? null,
         })),
         sender_device_id: options.senderDeviceId,
       }),

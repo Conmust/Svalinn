@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod blind_tokens;
 pub mod calls;
 pub mod conversations;
 pub mod devices;
@@ -14,4 +15,6 @@ pub mod uploads;
 pub mod emojis;
 pub mod channels;
 pub mod invites;
+pub mod ratchet;
 pub mod roles;
+pub mod stats;

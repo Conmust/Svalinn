@@ -78,6 +78,11 @@ export interface MessageRecipientEntry {
    * message has an encrypted attachment. `null`/absent otherwise. */
   attachment_key_ciphertext?: string | null;
   attachment_key_nonce?: string | null;
+  /** This entry's Double Ratchet envelope metadata (`ratchet.ts`'s
+   * `RatchetEnvelope`, minus `ciphertext`/`nonce`, as a JSON string), when
+   * it was encrypted via `ratchet.ts` rather than the legacy stateless
+   * per-device path (`crypto.ts`). `null`/absent for a legacy entry. */
+  ratchet_header_json?: string | null;
 }
 
 /** A direct message, as returned by the conversation message endpoints. */
@@ -171,6 +176,10 @@ export interface SendDirectMessageOptions {
      * when `attachmentNonce` is set; must be omitted otherwise. */
     attachmentKeyCiphertext?: string;
     attachmentKeyNonce?: string;
+    /** This entry's Double Ratchet envelope metadata, when it was
+     * encrypted via `ratchet.ts`'s `encryptMessage` rather than
+     * `crypto.ts`'s `encryptForRecipient` -- see `MessageRecipientEntry`. */
+    ratchetHeaderJson?: string;
   }>;
   /** Required alongside `encryptedFor`: the id of THIS device (the one
    * that did the encrypting), so the server can resolve and record its
@@ -231,6 +240,7 @@ export async function sendDirectMessage(
               nonce: r.nonce,
               attachment_key_ciphertext: r.attachmentKeyCiphertext ?? null,
               attachment_key_nonce: r.attachmentKeyNonce ?? null,
+              ratchet_header_json: r.ratchetHeaderJson ?? null,
             }))
           : null,
         sender_device_id: usingFanout ? options.senderDeviceId ?? null : null,

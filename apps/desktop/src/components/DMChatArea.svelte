@@ -3,6 +3,7 @@
   import { wsClient } from '../lib/websocket';
   import {
     type ConversationMessage,
+    type MessageRecipientEntry,
     fetchConversationMessages,
     sendDirectMessage,
     SendDirectMessageError,
@@ -17,6 +18,7 @@
     CryptoLibraryError,
     DeviceSetupError,
   } from '../lib/crypto';
+  import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
   import { activeDeviceKeypair, deviceEncryptionReady } from '../lib/recovery';
   import { fetchParticipantDevices, type ParticipantDevice } from '../lib/devices';
   import { uploadFile } from '../lib/messages';
@@ -108,6 +110,17 @@
   /** Object URLs created for decrypted attachments, revoked on destroy so
    * this component never leaks them for the lifetime of the whole app. */
   const createdObjectUrls: string[] = [];
+
+  /** Per-message decryption state for a message sent via `ratchet.ts`
+   * (one recipient entry carrying `ratchet_header_json`), keyed by message
+   * id. Needed because `ratchet.ts`'s `decryptMessage` is async (it may
+   * need to recover a session from its server-side backup, or bootstrap
+   * one as responder) while `toDisplayMessage` below runs synchronously
+   * inside a reactive block -- same lazy-populate-then-rerender pattern as
+   * `attachmentState` above, just for message text instead of a file. */
+  type RatchetDecryptState = { status: 'loading' } | { status: 'done'; text: string | null };
+  let ratchetDecryptState: Record<string, RatchetDecryptState> = {};
+  const RATCHET_DECRYPTING_PLACEHOLDER = 'Decrypting…';
 
   /** Set the moment ANY part of this panel's setup hits an unrecoverable
    * failure (crypto library, device setup, or an unexpected exception
@@ -208,7 +221,7 @@
   // degrades to a placeholder on that row alone; it's deliberately NOT
   // escalated to `panelError` (which would take out the whole
   // conversation), since nothing about every other message is affected.
-  function toDisplayMessage(message: ConversationMessage): DisplayMessage {
+  function toDisplayMessage(message: ConversationMessage, ratchetState: Record<string, RatchetDecryptState>): DisplayMessage {
     try {
       if (!message.is_encrypted) {
         return { ...message, displayContent: message.content ?? '' };
@@ -234,11 +247,73 @@
       if (!mine) {
         return { ...message, displayContent: SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER };
       }
+      if (mine.ratchet_header_json) {
+        // Decrypted asynchronously by `ensureRatchetMessageDecrypted`,
+        // kicked off by the reactive block below -- this function itself
+        // stays synchronous and just reads whatever's been populated so
+        // far, same pattern `ensureAttachmentDecrypted` uses for files.
+        const state = ratchetState[message.id];
+        if (!state || state.status === 'loading') {
+          return { ...message, displayContent: RATCHET_DECRYPTING_PLACEHOLDER };
+        }
+        return { ...message, displayContent: state.text ?? DECRYPT_FAILED_PLACEHOLDER };
+      }
       const decrypted = decryptFromSender(mine.ciphertext, mine.nonce, mine.sender_public_key, myPrivateKey);
       return { ...message, displayContent: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
     } catch (e) {
       console.error('Unexpected error while preparing a DM for display:', e);
       return { ...message, displayContent: UNEXPECTED_MESSAGE_ERROR_PLACEHOLDER };
+    }
+  }
+
+  /** Decrypts one ratchet-encrypted message's text and stores the result in
+   * `ratchetDecryptState`, triggering `toDisplayMessage` to re-render it on
+   * the next reactive pass (see the `messages` derivation below, which
+   * reads `ratchetDecryptState` directly so Svelte tracks it as a
+   * dependency). Needs `participantDevices` to map the entry's
+   * `sender_public_key` back to a device id -- `ratchet.ts`'s
+   * `decryptMessage` is keyed by device id, not public key, since a
+   * session is per (device, peer device), not per public key. */
+  async function ensureRatchetMessageDecrypted(message: ConversationMessage, mine: MessageRecipientEntry): Promise<void> {
+    ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
+    try {
+      let senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      if (!senderDeviceId) {
+        // `participantDevices` is a point-in-time snapshot (fetched once on
+        // mount/conversation-select -- see `loadParticipantDevices`), with
+        // no live push when the OTHER participant registers a device mid-
+        // session: there's no "device added" WebSocket event, unlike every
+        // other piece of conversation state here. The SEND path already
+        // self-heals from this exact staleness (a 400 naming the unknown
+        // device_id triggers a `loadParticipantDevices()` retry -- see
+        // `isStaleDeviceListError` below); the RECEIVE path had no
+        // equivalent, so a message legitimately encrypted for a just-added
+        // sender device looked permanently undecryptable even though
+        // nothing is actually wrong -- a fresh fetch would have resolved
+        // it. One retry, not a loop: if the device still isn't known after
+        // refetching, it really doesn't exist (removed, or a bogus
+        // sender_public_key), and this message stays undecryptable.
+        await loadParticipantDevices();
+        senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+      }
+      if (!senderDeviceId) {
+        ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
+        return;
+      }
+      const header = JSON.parse(mine.ratchet_header_json as string);
+      const envelope: RatchetEnvelope = {
+        dh: header.dh,
+        pn: header.pn,
+        n: header.n,
+        ciphertext: mine.ciphertext,
+        nonce: mine.nonce,
+        initial: header.initial,
+      };
+      const plaintext = await decryptMessage(senderDeviceId, envelope);
+      ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: plaintext } };
+    } catch (e) {
+      console.error('Failed to decrypt a ratchet-encrypted direct message:', e);
+      ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
     }
   }
 
@@ -255,11 +330,29 @@
   let messages: DisplayMessage[] = [];
   $: {
     try {
-      messages = rawMessages.map(toDisplayMessage);
+      messages = rawMessages.map(m => toDisplayMessage(m, ratchetDecryptState));
     } catch (e) {
       console.error('Unexpected error building the DM message list:', e);
       messages = [];
       if (!panelError) panelError = 'Encrypted messaging is currently unavailable due to an unexpected error.';
+    }
+  }
+
+  // Kicks off `ensureRatchetMessageDecrypted` for any ratchet-encrypted
+  // message not yet attempted. Gated on `participantDevices` actually
+  // being loaded (needed to resolve a sender's device id -- see that
+  // function) so a message isn't permanently marked "failed" just because
+  // this ran before `loadParticipantDevices()` finished.
+  $: {
+    if (myDeviceId && participantDevices.length > 0) {
+      for (const m of rawMessages) {
+        if (!m.is_encrypted || (m.content !== null && m.content !== undefined)) continue;
+        const recipients = Array.isArray(m.recipients) ? m.recipients : [];
+        const mine = recipients.find(r => r.device_id === myDeviceId);
+        if (mine?.ratchet_header_json && !ratchetDecryptState[m.id]) {
+          void ensureRatchetMessageDecrypted(m, mine);
+        }
+      }
     }
   }
 
@@ -483,6 +576,46 @@
     }, 150);
   }
 
+  // Encrypts `content` for one recipient device, preferring the Double
+  // Ratchet (`ratchet.ts`) when that device supports it -- forward secrecy
+  // and post-compromise security beat the legacy stateless scheme whenever
+  // it's available -- and falling back to the legacy per-device key
+  // (`crypto.ts`) when it doesn't (no published signed prekey yet).
+  // `ratchetHeaderJson` carries the envelope's non-ciphertext fields (`dh`/
+  // `pn`/`n`, plus `initial` on a brand-new session's first message) as one
+  // opaque JSON blob the server only stores and returns verbatim -- see
+  // migration 0040.
+  async function encryptForDevice(
+    d: ParticipantDevice,
+    content: string
+  ): Promise<{ deviceId: string; ciphertext: string; nonce: string; ratchetHeaderJson?: string }> {
+    // This device's own entry (the sending device's required copy of its
+    // own sent message -- see `encryptAndSend`'s doc comment) is excluded
+    // from the ratchet: `ratchet.ts`'s session model is keyed by (device,
+    // peer device), and "this device talking to itself" would otherwise
+    // bootstrap a degenerate self-session that consumes one of this
+    // device's own one-time prekeys for no real benefit -- the plaintext
+    // never actually travels anywhere a ratchet session would protect. The
+    // legacy per-device key already covers this case exactly as well.
+    if (d.device_id === myDeviceId) {
+      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
+      return { deviceId: d.device_id, ciphertext, nonce };
+    }
+    try {
+      const envelope = await encryptMessage(d.device_id, content);
+      return {
+        deviceId: d.device_id,
+        ciphertext: envelope.ciphertext,
+        nonce: envelope.nonce,
+        ratchetHeaderJson: JSON.stringify({ dh: envelope.dh, pn: envelope.pn, n: envelope.n, initial: envelope.initial }),
+      };
+    } catch (err) {
+      if (!(err instanceof RatchetNotSupportedError)) throw err;
+      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
+      return { deviceId: d.device_id, ciphertext, nonce };
+    }
+  }
+
   // Encrypts `content` and sends it to EVERY device in `devices` --
   // including this device's own current device. There's no
   // special-casing of "my own device" here:
@@ -498,12 +631,11 @@
     file: File | null
   ): Promise<ConversationMessage> {
     // No attachment: exactly the original behavior, one ciphertext per
-    // device, nothing attachment-related sent at all.
+    // device, nothing attachment-related sent at all -- just now routed
+    // through `encryptForDevice` instead of calling `encryptForRecipient`
+    // directly, so each device gets the ratchet when it supports one.
     if (!file) {
-      const encryptedFor = devices.map(d => {
-        const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
-        return { deviceId: d.device_id, ciphertext, nonce };
-      });
+      const encryptedFor = await Promise.all(devices.map(d => encryptForDevice(d, content)));
       return sendDirectMessage(conversationId, null, null, {
         encryptedFor,
         senderDeviceId: myDeviceId as string,
@@ -528,17 +660,20 @@
     const encryptedBlob = new File([fileCiphertext.slice()], file.name, { type: 'application/octet-stream' });
     const uploaded = await uploadFile(encryptedBlob);
 
-    const encryptedFor = devices.map(d => {
-      const { ciphertext, nonce } = encryptForRecipient(content, d.public_key, myPrivateKey as string);
-      const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
-      return {
-        deviceId: d.device_id,
-        ciphertext,
-        nonce,
-        attachmentKeyCiphertext: wrapped.ciphertext,
-        attachmentKeyNonce: wrapped.nonce,
-      };
-    });
+    // The attachment's wrapped file key stays on the legacy per-device
+    // X25519 scheme regardless of whether the message TEXT goes through
+    // the ratchet -- it's a one-shot key wrap for a blob that's already
+    // uploaded and shared across every recipient, not an evolving message
+    // stream, so there's no forward-secrecy benefit to ratcheting it, and
+    // keeping it independent avoids coupling the attachment path to
+    // whether a session happens to exist yet.
+    const encryptedFor = await Promise.all(
+      devices.map(async d => {
+        const textResult = await encryptForDevice(d, content);
+        const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+        return { ...textResult, attachmentKeyCiphertext: wrapped.ciphertext, attachmentKeyNonce: wrapped.nonce };
+      })
+    );
 
     return sendDirectMessage(
       conversationId,
