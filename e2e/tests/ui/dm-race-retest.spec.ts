@@ -154,7 +154,7 @@ test.describe('independent retest of the self-echo race fix', () => {
   // UI-layer patch -- getting it wrong risks silently breaking message
   // confidentiality or integrity rather than just failing a test. Tracked
   // for a follow-up, not patched here.
-  test.fixme('3. CONCURRENT sends from two devices of the SAME sender, overlapping in-flight windows: neither message is lost or swapped', async ({ browser }) => {
+  test('3. CONCURRENT sends from two devices of the SAME sender, overlapping in-flight windows: neither message is lost or swapped', async ({ browser }) => {
     const { a, b, aPage, bPage } = await openDmPair(browser);
     const aPhone = await openSecondDevice(browser, a, b.user.username, aPage);
 

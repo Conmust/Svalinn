@@ -835,8 +835,68 @@ export async function encryptMessage(peerDeviceId: string, plaintext: string): P
  * `decryptFromSender` contract: a bad/tampered message degrades to "can't
  * show this one" rather than crashing the conversation. */
 export async function decryptMessage(peerDeviceId: string, envelope: RatchetEnvelope): Promise<string | null> {
-  const { deviceId: myDeviceId } = await ensureDeviceKeypair();
+  const { deviceId: myDeviceId, publicKey: myIdentityPublicKeyB64 } = await ensureDeviceKeypair();
   let state = await loadOrRecoverSession(myDeviceId, peerDeviceId);
+
+  // Mutual X3DH initiation collision: both sides of a brand-new (device,
+  // peer device) pair can simultaneously find no session and self-initiate
+  // toward each other before either has received anything back. Each
+  // derives a DIFFERENT shared secret (initiator math run independently in
+  // each direction isn't symmetric across two unrelated handshakes), so
+  // `state` here -- our own un-replied initiator attempt -- has nothing to
+  // do with the secret this incoming message was actually encrypted under.
+  // Blindly reusing it (the pre-fix behavior) decrypt-fails every time.
+  //
+  // Resolve with a deterministic tie-break both sides can compute
+  // independently, with no coordination: compare identity public keys
+  // (the same canonical byte-ordering `canonicalPair` uses for AD). The
+  // side that loses discards its own attempt and adopts the winner's
+  // handshake as canonical (falls through to the normal responder-bootstrap
+  // path below). The side that wins keeps its own session untouched for
+  // future sends, but still owes the peer a decrypt of this one race
+  // message -- it derives a one-off responder session purely to read it,
+  // and never persists that derivation, so the two sides converge on a
+  // single matching chain afterward instead of drifting onto two
+  // unrelated ones (which is exactly what naively re-bootstrapping on
+  // every `initial` block, regardless of who's unaffected, would cause).
+  //
+  // Scoped tightly to an actual race: only when the existing session has
+  // never RECEIVED a real message yet (`chainKeyRecv === null`), which is
+  // the genuine invariant -- not `sendCount === 0`. In practice, each side
+  // finishes sending its own race message (bumping `sendCount` to 1) well
+  // before the peer's colliding message arrives over the network, so a
+  // `sendCount === 0` requirement here would almost never actually fire
+  // in the realistic timing this is meant to catch. `chainKeyRecv` stays
+  // null regardless of how many unanswered messages we've sent, and that's
+  // exactly the state that means "this session has never been confirmed
+  // by an actual reply" -- which is also implied by the peer's message
+  // still carrying `initial` fields at all (the sender clears those after
+  // its own first message, so a still-present `initial` means the SENDER
+  // hasn't heard back from us either). A session with any genuine
+  // received traffic (`chainKeyRecv` set) is never second-guessed here,
+  // whatever headers show up on top of it.
+  const isRaceCandidate = !!state && !!envelope.initial && state.chainKeyRecv === null;
+
+  if (isRaceCandidate && envelope.initial) {
+    const myIdentityPublicKey = fromB64(myIdentityPublicKeyB64);
+    const peerIdentityPublicKey = fromB64(envelope.initial.identityPublicKey);
+    const iAmCanonical = canonicalPair(myIdentityPublicKey, peerIdentityPublicKey).low === myIdentityPublicKey;
+
+    if (iAmCanonical) {
+      try {
+        const throwaway = await establishSessionAsResponder(peerDeviceId, envelope.initial);
+        const oneOff = ratchetDecrypt(throwaway, envelope);
+        return oneOff ? oneOff.plaintext : null;
+      } catch (err) {
+        console.warn('Failed to decrypt the losing side of a mutual X3DH initiation race:', err);
+        return null;
+      }
+    }
+    // We lose the tie: discard our own un-replied initiator attempt and
+    // fall through to establish fresh as responder below, which becomes
+    // our new canonical session.
+    state = null;
+  }
 
   if (!state) {
     if (!envelope.initial) {
