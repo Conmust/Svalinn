@@ -83,6 +83,13 @@ export interface MessageRecipientEntry {
    * it was encrypted via `ratchet.ts` rather than the legacy stateless
    * per-device path (`crypto.ts`). `null`/absent for a legacy entry. */
   ratchet_header_json?: string | null;
+  /** Same idea as `ratchet_header_json` above, but for the ATTACHMENT key:
+   * when present, `attachment_key_ciphertext`/`attachment_key_nonce` hold
+   * the ratchet's own envelope fields (the file key, base64-encoded,
+   * passed through `ratchet.ts`'s `encryptMessage` like ordinary message
+   * text) rather than the legacy static `crypto_box_easy` wrap. See
+   * migration 0044. */
+  attachment_key_ratchet_header_json?: string | null;
 }
 
 /** A direct message, as returned by the conversation message endpoints. */
@@ -180,6 +187,11 @@ export interface SendDirectMessageOptions {
      * encrypted via `ratchet.ts`'s `encryptMessage` rather than
      * `crypto.ts`'s `encryptForRecipient` -- see `MessageRecipientEntry`. */
     ratchetHeaderJson?: string;
+    /** Same idea as `ratchetHeaderJson` above, but for the attachment key
+     * -- set when `attachmentKeyCiphertext`/`attachmentKeyNonce` are the
+     * ratchet's own envelope fields rather than the legacy static wrap.
+     * See `MessageRecipientEntry`. */
+    attachmentKeyRatchetHeaderJson?: string;
   }>;
   /** Required alongside `encryptedFor`: the id of THIS device (the one
    * that did the encrypting), so the server can resolve and record its
@@ -241,6 +253,7 @@ export async function sendDirectMessage(
               attachment_key_ciphertext: r.attachmentKeyCiphertext ?? null,
               attachment_key_nonce: r.attachmentKeyNonce ?? null,
               ratchet_header_json: r.ratchetHeaderJson ?? null,
+              attachment_key_ratchet_header_json: r.attachmentKeyRatchetHeaderJson ?? null,
             }))
           : null,
         sender_device_id: usingFanout ? options.senderDeviceId ?? null : null,

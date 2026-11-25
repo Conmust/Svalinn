@@ -27,7 +27,7 @@
   import { fetchChannelMemberDevices, type ParticipantDevice } from '../lib/devices';
   import { fileUrl } from '../lib/api';
   import { withTimeout, TimeoutError } from '../lib/timeout';
-  import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
+  import { encryptMessage, decryptMessage, RatchetNotSupportedError, b64, fromB64, type RatchetEnvelope } from '../lib/ratchet';
   import { getCachedPlaintext, cachePlaintext, deleteCachedPlaintext } from '../lib/message-history';
 
   // --- Encryption error boundary -------------------------------------------
@@ -294,7 +294,40 @@
         fail(SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER);
         return;
       }
-      const fileKey = unwrapFileKey(mine.attachment_key_ciphertext, mine.attachment_key_nonce, mine.sender_public_key, myPrivateKey);
+
+      // The ratchet's message keys are single-use and deleted the instant
+      // they're consumed (forward secrecy), so a second ratchet-decrypt
+      // attempt for this same attachment key would fail outright -- see
+      // `DMChatArea.svelte`'s identical note. Reuses the same local
+      // history cache, namespaced so it never collides with this
+      // message's own text-plaintext cache entry.
+      const attachmentKeyCacheId = `${message.id}:attachment-key`;
+      let fileKey: Uint8Array | null = null;
+      const cachedKeyB64 = await getCachedPlaintext(attachmentKeyCacheId);
+      if (cachedKeyB64 !== null) {
+        fileKey = fromB64(cachedKeyB64);
+      } else if (mine.attachment_key_ratchet_header_json) {
+        const senderDeviceId = channelMemberDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
+        if (senderDeviceId) {
+          const header = JSON.parse(mine.attachment_key_ratchet_header_json);
+          const envelope: RatchetEnvelope = {
+            dh: header.dh,
+            pn: header.pn,
+            n: header.n,
+            ciphertext: mine.attachment_key_ciphertext,
+            nonce: mine.attachment_key_nonce,
+            initial: header.initial,
+          };
+          const keyB64 = await decryptMessage(senderDeviceId, envelope);
+          if (keyB64 !== null) {
+            await cachePlaintext(attachmentKeyCacheId, keyB64);
+            fileKey = fromB64(keyB64);
+          }
+        }
+      } else {
+        // Legacy static wrap (migration 0032, pre-0044).
+        fileKey = unwrapFileKey(mine.attachment_key_ciphertext, mine.attachment_key_nonce, mine.sender_public_key, myPrivateKey);
+      }
       if (!fileKey) {
         fail(DECRYPT_FAILED_PLACEHOLDER);
         return;
@@ -412,6 +445,7 @@
     await run(async () => {
       await deleteMessage(m.id);
       await deleteCachedPlaintext(m.id);
+      await deleteCachedPlaintext(`${m.id}:attachment-key`);
       rawMessages = rawMessages.filter(x => x.id !== m.id);
     });
   }
@@ -606,6 +640,34 @@
     }
   }
 
+  // Wraps an attachment's symmetric file key for one recipient device,
+  // preferring the Double Ratchet exactly like `encryptForDevice` does for
+  // text, and falling back to the legacy static `wrapFileKey` scheme
+  // (`crypto.ts`, raw-bytes `crypto_box_easy`) the same way too -- see
+  // migration 0044. Deliberately a SEPARATE function from `encryptForDevice`
+  // -- see `DMChatArea.svelte`'s identical function for why its static
+  // fallback must keep `wrapFileKey`'s raw-byte wire format rather than
+  // sharing `encryptForRecipient`'s UTF-8-string format.
+  async function wrapAttachmentKeyForDevice(
+    d: ParticipantDevice,
+    fileKey: Uint8Array
+  ): Promise<{ ciphertext: string; nonce: string; ratchetHeaderJson?: string }> {
+    if (d.device_id === myDeviceId) {
+      return wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+    }
+    try {
+      const envelope = await encryptMessage(d.device_id, b64(fileKey));
+      return {
+        ciphertext: envelope.ciphertext,
+        nonce: envelope.nonce,
+        ratchetHeaderJson: JSON.stringify({ dh: envelope.dh, pn: envelope.pn, n: envelope.n, initial: envelope.initial }),
+      };
+    } catch (err) {
+      if (!(err instanceof RatchetNotSupportedError)) throw err;
+      return wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+    }
+  }
+
   // Encrypts `content` once per device in `devices` -- including this
   // device's own current device, with no special-casing (see
   // `DMChatArea.svelte`'s identical function for the full rationale: the
@@ -624,9 +686,11 @@
 
     // Hybrid encryption, same as the DM attachment flow: the file is
     // encrypted ONCE with a fresh random symmetric key, then that small
-    // key is wrapped once per recipient device. The wrapped key stays on
-    // the legacy scheme regardless of the text path -- see
-    // `DMChatArea.svelte`'s identical note for why.
+    // key is wrapped once per recipient device, through
+    // `wrapAttachmentKeyForDevice` -- which prefers the ratchet (forward
+    // secrecy + post-compromise security for the key wrap, not just the
+    // text) and falls back to the legacy static scheme exactly like text
+    // does -- see migration 0044.
     const fileBytes = new Uint8Array(await file.arrayBuffer());
     const { ciphertext: fileCiphertext, nonce: attachmentNonce, fileKey } = encryptFileForFanout(fileBytes);
     const encryptedBlob = new File([fileCiphertext.slice()], file.name, { type: 'application/octet-stream' });
@@ -635,8 +699,13 @@
     const encryptedFor = await Promise.all(
       devices.map(async d => {
         const textResult = await encryptForDevice(d, content);
-        const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
-        return { ...textResult, attachmentKeyCiphertext: wrapped.ciphertext, attachmentKeyNonce: wrapped.nonce };
+        const keyWrap = await wrapAttachmentKeyForDevice(d, fileKey);
+        return {
+          ...textResult,
+          attachmentKeyCiphertext: keyWrap.ciphertext,
+          attachmentKeyNonce: keyWrap.nonce,
+          attachmentKeyRatchetHeaderJson: keyWrap.ratchetHeaderJson,
+        };
       })
     );
 
@@ -733,6 +802,7 @@
       try {
         await deleteMessage(messageId);
         await deleteCachedPlaintext(messageId);
+        await deleteCachedPlaintext(`${messageId}:attachment-key`);
       } catch (e: any) {
         failures.push(e.message);
       }

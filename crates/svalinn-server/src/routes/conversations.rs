@@ -321,12 +321,14 @@ pub(crate) async fn fetch_recipients_for_messages(
         attachment_key_ciphertext: Option<String>,
         attachment_key_nonce: Option<String>,
         ratchet_header_json: Option<String>,
+        attachment_key_ratchet_header_json: Option<String>,
     }
 
     let rows: Vec<RecipientRow> = sqlx::query_as(
         r#"
         SELECT message_id, device_id, ciphertext, nonce, sender_public_key,
-               attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json
+               attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json,
+               attachment_key_ratchet_header_json
         FROM message_recipients
         WHERE message_id = ANY($1) AND ($2::uuid IS NULL OR device_id = $2)
         "#,
@@ -347,6 +349,7 @@ pub(crate) async fn fetch_recipients_for_messages(
             attachment_key_ciphertext: row.attachment_key_ciphertext,
             attachment_key_nonce: row.attachment_key_nonce,
             ratchet_header_json: row.ratchet_header_json,
+            attachment_key_ratchet_header_json: row.attachment_key_ratchet_header_json,
         });
     }
     Ok(map)
@@ -512,12 +515,14 @@ pub(crate) const MAX_FANOUT_CIPHERTEXT_B64_CHARS: usize = 24_000;
 /// base64 chars -- no headroom needed since this isn't an estimate.
 pub(crate) const MAX_FANOUT_NONCE_B64_CHARS: usize = 32;
 
-/// Longest per-recipient wrapped attachment key accepted. The wrapped
-/// value is a `crypto_box_easy` ciphertext of a fixed 32-byte
-/// `crypto_secretbox` key: 32 + 16 (Poly1305 MAC) = 48 bytes, base64 ->
-/// exactly 64 chars. Rounded up with headroom, same style as
-/// `MAX_FANOUT_CIPHERTEXT_B64_CHARS` above.
-pub(crate) const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 100;
+/// Longest per-recipient wrapped attachment key accepted. Covers both
+/// wrap schemes (see migration 0044): the legacy `crypto_box_easy`
+/// ciphertext of a fixed 32-byte `crypto_secretbox` key (32 + 16 Poly1305
+/// MAC = 48 bytes, base64 -> exactly 64 chars), and the newer ratchet-AEAD
+/// ciphertext of the key's 44-char base64 string (44 + 16 Poly1305 tag =
+/// 60 bytes, base64 -> exactly 80 chars). Rounded up with headroom over
+/// both, same style as `MAX_FANOUT_CIPHERTEXT_B64_CHARS` above.
+pub(crate) const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 120;
 
 /// Longest `ratchet_header_json` accepted per recipient entry -- the
 /// envelope's `dh`/`pn`/`n` fields plus, only on a session's first message,
@@ -817,6 +822,18 @@ async fn send_fanout_message(
                 )));
             }
         }
+        if let Some(header) = &r.attachment_key_ratchet_header_json {
+            if !has_attachment {
+                return Err(AppError::BadRequest(
+                    "attachment_key_ratchet_header_json must not be set without attachment_url".into(),
+                ));
+            }
+            if header.len() > MAX_RATCHET_HEADER_JSON_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_ratchet_header_json in encrypted_for can be at most {MAX_RATCHET_HEADER_JSON_CHARS} characters"
+                )));
+            }
+        }
     }
     let device_ids: Vec<Uuid> = recipients.iter().map(|r| r.device_id).collect();
     let mut seen = HashSet::new();
@@ -910,7 +927,7 @@ async fn send_fanout_message(
 
     for r in recipients {
         sqlx::query(
-            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json, attachment_key_ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(msg_id)
         .bind(r.device_id)
@@ -920,6 +937,7 @@ async fn send_fanout_message(
         .bind(&r.attachment_key_ciphertext)
         .bind(&r.attachment_key_nonce)
         .bind(&r.ratchet_header_json)
+        .bind(&r.attachment_key_ratchet_header_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2150,6 +2168,7 @@ mod tests {
                         attachment_key_ciphertext: Some("wrapped-key-a1".into()),
                         attachment_key_nonce: Some("wrap-nonce-a1".into()),
                         ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: None,
                     },
                     EncryptedRecipient {
                         device_id: b_device1,
@@ -2158,6 +2177,7 @@ mod tests {
                         attachment_key_ciphertext: Some("wrapped-key-b1".into()),
                         attachment_key_nonce: Some("wrap-nonce-b1".into()),
                         ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: None,
                     },
                 ]),
                 sender_device_id: Some(a_device1),
@@ -2183,6 +2203,157 @@ mod tests {
         assert_eq!(found.recipients.len(), 1);
         assert_eq!(found.recipients[0].attachment_key_ciphertext.as_deref(), Some("wrapped-key-b1"));
         assert_eq!(found.recipients[0].attachment_key_nonce.as_deref(), Some("wrap-nonce-b1"));
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// Migration 0044: an attachment key wrapped through the ratchet
+    /// (`attachment_key_ratchet_header_json` set) round-trips the exact
+    /// same way the legacy static wrap does in the test above -- the
+    /// server treats both as opaque bytes either way, it's purely a
+    /// client-side discriminator.
+    #[tokio::test]
+    async fn fanout_attachment_round_trips_ratchet_wrapped_key_and_header() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 70, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 71, "B's Laptop").await;
+
+        let ratchet_header = r#"{"dh":"dh-bytes","pn":0,"n":3}"#;
+        let sent = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: Some("/uploads/ratchet-wrapped.png".into()),
+                attachment_filename: Some("photo.png".into()),
+                attachment_size: Some(1234),
+                attachment_mime_type: Some("image/png".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient {
+                        device_id: a_device1,
+                        ciphertext: "ct-for-a1".into(),
+                        nonce: "nonce-a1".into(),
+                        attachment_key_ciphertext: Some("ratchet-wrapped-key-a1".into()),
+                        attachment_key_nonce: Some("ratchet-wrap-nonce-a1".into()),
+                        ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: Some(ratchet_header.into()),
+                    },
+                    EncryptedRecipient {
+                        device_id: b_device1,
+                        ciphertext: "ct-for-b1".into(),
+                        nonce: "nonce-b1".into(),
+                        attachment_key_ciphertext: Some("ratchet-wrapped-key-b1".into()),
+                        attachment_key_nonce: Some("ratchet-wrap-nonce-b1".into()),
+                        ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: Some(ratchet_header.into()),
+                    },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await
+        .expect("sending fan-out message with a ratchet-wrapped attachment key failed")
+        .0;
+
+        let b1_messages = get_conversation_messages(
+            State(db.clone()),
+            CurrentSession { user_id: user_b, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(b_device1) }),
+        )
+        .await
+        .expect("fetching as B's device 1 failed")
+        .0;
+        let found = b1_messages.iter().find(|m| m.id == sent.id).expect("message should appear");
+        assert_eq!(found.recipients[0].attachment_key_ciphertext.as_deref(), Some("ratchet-wrapped-key-b1"));
+        assert_eq!(found.recipients[0].attachment_key_nonce.as_deref(), Some("ratchet-wrap-nonce-b1"));
+        assert_eq!(found.recipients[0].attachment_key_ratchet_header_json.as_deref(), Some(ratchet_header));
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// `attachment_key_ratchet_header_json` set without `attachment_url`
+    /// is rejected, same as `attachment_key_ciphertext`/`_nonce` above --
+    /// it's meaningless metadata for a message with no attachment.
+    #[tokio::test]
+    async fn fanout_rejects_attachment_key_ratchet_header_without_attachment() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 72, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 73, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient {
+                        device_id: a_device1,
+                        ciphertext: "ct-for-a1".into(),
+                        nonce: "nonce-a1".into(),
+                        attachment_key_ciphertext: None,
+                        attachment_key_nonce: None,
+                        ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: Some(r#"{"dh":"x","pn":0,"n":0}"#.into()),
+                    },
+                    EncryptedRecipient {
+                        device_id: b_device1,
+                        ciphertext: "ct-for-b1".into(),
+                        nonce: "nonce-b1".into(),
+                        attachment_key_ciphertext: None,
+                        attachment_key_nonce: None,
+                        ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: None,
+                    },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
 
         cleanup_test_user(&db, user_a).await;
         cleanup_test_user(&db, user_b).await;
@@ -2340,6 +2511,7 @@ mod tests {
                         attachment_key_ciphertext: Some("wrapped-key-a1".into()),
                         attachment_key_nonce: Some("wrap-nonce-a1".into()),
                         ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: None,
                     },
                     // B's device carries no wrapped key at all.
                     EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
@@ -2410,6 +2582,7 @@ mod tests {
                         attachment_key_ciphertext: Some("wrapped-key-b1".into()),
                         attachment_key_nonce: Some("wrap-nonce-b1".into()),
                         ratchet_header_json: None,
+                        attachment_key_ratchet_header_json: None,
                     },
                 ]),
                 sender_device_id: Some(a_device1),
