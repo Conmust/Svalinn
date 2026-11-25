@@ -50,11 +50,17 @@ import {
 export { RatchetNotSupportedError };
 
 // --- Base64 helpers (same ORIGINAL variant/convention as crypto.ts) -------
+//
+// Exported alongside `hmac`/`hkdfExpand` below for reuse by `message-history.ts`,
+// which derives its own local encryption key the same deterministic,
+// device-identity-derived way `derivePickleKey` does here -- no reason to
+// duplicate these tiny, easy-to-get-subtly-wrong primitives in a second
+// file.
 
-function b64(bytes: Uint8Array): string {
+export function b64(bytes: Uint8Array): string {
   return sodium.to_base64(bytes, sodium.base64_variants.ORIGINAL);
 }
-function fromB64(str: string): Uint8Array {
+export function fromB64(str: string): Uint8Array {
   return sodium.from_base64(str, sodium.base64_variants.ORIGINAL);
 }
 
@@ -103,14 +109,15 @@ export class RatchetSendBeforeReceiveError extends Error {
 // keys, PRKs) always is, since they're either freshly generated 32-byte
 // values or the output of this same HKDF.
 
-function hmac(key: Uint8Array, data: Uint8Array): Uint8Array {
+export function hmac(key: Uint8Array, data: Uint8Array): Uint8Array {
   return sodium.crypto_auth_hmacsha256(data, key);
 }
 
 /** HKDF-Expand: stretches a pseudorandom key into `length` bytes of
- * output, bound to `info` so different purposes (root KDF vs. the pickle
- * backup key, say) never collide even if fed the same `prk`. */
-function hkdfExpand(prk: Uint8Array, info: string, length: number): Uint8Array {
+ * output, bound to `info` so different purposes (root KDF, the pickle
+ * backup key, `message-history.ts`'s own local cache key, say) never
+ * collide even if fed the same `prk`. */
+export function hkdfExpand(prk: Uint8Array, info: string, length: number): Uint8Array {
   const infoBytes = sodium.from_string(info);
   const out = new Uint8Array(length);
   let generated = 0;
