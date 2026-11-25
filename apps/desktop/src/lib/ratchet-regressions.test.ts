@@ -58,6 +58,14 @@ function resetFakeServer(): void {
 
 let backupSerial = 0;
 
+/** Set from a test, right before triggering the call under test, to make
+ * `putRatchetSession` below block until the test explicitly releases it --
+ * used to deterministically tell an AWAITED backup apart from a
+ * fire-and-forget one (see the "backs up eagerly" test), rather than
+ * relying on how many microtask hops each happens to take, which is not a
+ * reliable signal either way. */
+let putGate: Promise<void> | null = null;
+
 vi.mock('./devices', async () => {
   class RatchetNotSupportedError extends Error {
     constructor(message = "This device has not opted into the Double Ratchet yet.") {
@@ -151,6 +159,7 @@ vi.mock('./devices', async () => {
     pickleNonce: string,
     expectedUpdatedAt: string | null
   ) {
+    if (putGate) await putGate;
     const key = `${deviceId}:${peerDeviceId}`;
     const existing = fakeServer.sessions.get(key);
     if (expectedUpdatedAt !== null) {
@@ -730,6 +739,63 @@ describe('Ratchet regressions (reported by external review)', () => {
 
       const unconsumedAfter = [...dev!.oneTimePrekeys.values()].filter((c) => !c).length;
       expect(unconsumedAfter).toBeGreaterThan(unconsumedBefore);
+    });
+  });
+
+  describe('Fix (confidentiality case 15, step 1): consuming a skipped key backs up eagerly', () => {
+    it('decryptMessage does not resolve until the backup for a skipped-key consumption actually completes', async () => {
+      const alice = await createDeviceHarness();
+      const bob = await createDeviceHarness();
+
+      // Establish a confirmed session.
+      const hello = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'hi'));
+      await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, hello));
+      const reply = await on(bob, ({ ratchet }) => ratchet.encryptMessage(alice.deviceId, 'hi back'));
+      await on(alice, ({ ratchet }) => ratchet.decryptMessage(bob.deviceId, reply));
+
+      const envA = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'out of order first'));
+      const envB = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, 'out of order second'));
+
+      // Deliver B first: Bob skips (caches) a key for A's position while
+      // processing B via the normal in-order path, and lets that message's
+      // own (ordinary, fire-and-forget) backup settle before gating.
+      expect(await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envB))).toBe('out of order second');
+      activate(bob);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Block the next server-side backup write from completing until
+      // explicitly released below. If consuming a skipped key merely
+      // fires its backup and forgets it (the pre-fix behavior),
+      // `decryptMessage`'s own promise is NOT waiting on this gate at
+      // all, and resolves well before it's released -- a fixed number of
+      // microtask turns is not a reliable way to tell "awaited" from
+      // "fire-and-forget" apart (a fire-and-forget call can easily settle
+      // within a handful of microtask turns purely by chance), so this
+      // test uses an actual blocking gate instead of counting ticks.
+      let releaseGate: () => void = () => {};
+      putGate = new Promise((resolve) => {
+        releaseGate = resolve;
+      });
+
+      let settled = false;
+      const decryptPromise = on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envA)).then((plaintext) => {
+        settled = true;
+        return plaintext;
+      });
+
+      // Give it generous room (20 microtask turns, no real timer) to
+      // settle on its own if it were going to -- it must NOT, since the
+      // fix's `saveSessionEagerly` awaits exactly the gated call.
+      for (let i = 0; i < 20; i++) {
+        await Promise.resolve();
+      }
+      expect(settled).toBe(false);
+
+      releaseGate();
+      putGate = null;
+      expect(await decryptPromise).toBe('out of order first');
+      expect(settled).toBe(true);
     });
   });
 });
