@@ -68,6 +68,8 @@ jobs:
         run: pnpm --filter desktop check
       - name: Build frontend
         run: pnpm --filter desktop build
+      - name: Unit tests
+        run: pnpm --filter desktop test
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Tauri Linux build deps

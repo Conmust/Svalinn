@@ -241,6 +241,17 @@ export interface RatchetState {
    * backup race) is caught as a conflict rather than silently clobbered.
    * See `backupSession`. */
   backupUpdatedAt: string | null;
+  /** This device's own identity public key at the moment this session was
+   * created. A cached session is only ever valid for the identity it was
+   * derived under -- its AD and DH math are both bound to it -- so this is
+   * compared against the CURRENT identity on every load (see
+   * `loadOrRecoverSession`) to catch the case where this device's active
+   * identity keypair changes (e.g. `adoptRecoveredKeypair`) while a stale
+   * per-peer session, keyed only by peer device id, is left behind.
+   * Optional for backward compatibility with sessions persisted before
+   * this field existed -- a missing value is treated as "assume valid"
+   * rather than forcing every existing session to re-handshake. */
+  myIdentityPublicKey?: string;
 }
 
 /** The X3DH-style handshake fields a session's INITIATOR must send, once,
@@ -251,6 +262,17 @@ export interface InitialHandshakeFields {
   identityPublicKey: string;
   ephemeralPublicKey: string;
   usedOneTimePrekeyPublicKey: string | null;
+  /** Which of the responder's signed prekeys this handshake's dh1/dh3 were
+   * actually computed against -- needed because the responder's signed
+   * prekey can rotate (weekly) in the time between the initiator fetching
+   * a prekey bundle and this message actually being delivered (an offline
+   * recipient, a slow retry, ...). Without it, `establishSessionAsResponder`
+   * has no way to know whether to answer with its CURRENT signed prekey or
+   * a just-retired one it kept around for exactly this (see
+   * `ensureSignedPrekey`). Optional for backward compatibility with
+   * envelopes from before this field existed -- absent, the responder
+   * falls back to assuming its current key, exactly as before. */
+  usedSignedPrekeyPublicKey?: string;
 }
 
 /** What actually travels with a Double Ratchet-encrypted message. `dh`,
@@ -291,6 +313,7 @@ function initRatchetAsInitiator(
     adLow: b64(low),
     adHigh: b64(high),
     backupUpdatedAt: null,
+    myIdentityPublicKey: b64(myIdentityPublicKey),
   };
 }
 
@@ -316,6 +339,7 @@ function initRatchetAsResponder(
     adLow: b64(low),
     adHigh: b64(high),
     backupUpdatedAt: null,
+    myIdentityPublicKey: b64(myIdentityPublicKey),
   };
 }
 
@@ -452,6 +476,17 @@ function ratchetDecrypt(state: RatchetState, envelope: RatchetEnvelope): { state
       fromB64(envelope.nonce),
       messageKey
     );
+    if (working.pendingInitialHeader && working.chainKeyRecv !== null) {
+      // This is the initiator's side confirming its FIRST successful
+      // decrypt of anything from the peer -- the session is now
+      // bidirectionally established, so there's no more need to keep
+      // repeating the X3DH handshake fields on every subsequent send (see
+      // `encryptMessage`, which otherwise keeps attaching them to every
+      // message for as long as they're present, precisely so an
+      // unacknowledged retry or an overlapping concurrent first send isn't
+      // left without the bootstrap data a fresh responder needs).
+      working = { ...working, pendingInitialHeader: null };
+    }
     return { state: working, plaintext: sodium.to_string(plaintextBytes) };
   } catch {
     return null;
@@ -519,6 +554,7 @@ async function bootstrapSessionAsInitiator(peerDeviceId: string): Promise<Ratche
     identityPublicKey: myIdentityPublicKeyB64,
     ephemeralPublicKey: b64(ephemeral.publicKey),
     usedOneTimePrekeyPublicKey: bundle.oneTimePrekeyPublicKey,
+    usedSignedPrekeyPublicKey: bundle.signedPrekeyPublicKey,
   };
 
   return initRatchetAsInitiator(sharedKey, theirSignedPrekeyPublic, myIdentityPublicKey, theirIdentityPublic, pendingInitialHeader);
@@ -531,8 +567,27 @@ async function bootstrapSessionAsInitiator(peerDeviceId: string): Promise<Ratche
  * private keys -- see this file's header comment on why those private
  * keys have to be kept locally rather than only published. */
 async function establishSessionAsResponder(peerDeviceId: string, initial: InitialHandshakeFields): Promise<RatchetState> {
-  const signedPrekeyPublic = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
-  const signedPrekeyPrivate = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
+  const currentSignedPrekeyPublic = localStorage.getItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
+  const currentSignedPrekeyPrivate = localStorage.getItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
+  const previousSignedPrekeyPublic = localStorage.getItem(SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY);
+  const previousSignedPrekeyPrivate = localStorage.getItem(SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY);
+
+  // The sender's handshake may have been bootstrapped against a signed
+  // prekey we've since rotated out (fetched before rotation, delivered
+  // after -- an offline recipient or a slow retry). Answer with whichever
+  // local key it actually used, not blindly whatever is current. See
+  // `ensureSignedPrekey` for why one retired generation is kept around,
+  // and `InitialHandshakeFields.usedSignedPrekeyPublicKey`'s doc for the
+  // backward-compatibility fallback when that field is absent.
+  let signedPrekeyPublic: string | null;
+  let signedPrekeyPrivate: string | null;
+  if (initial.usedSignedPrekeyPublicKey && initial.usedSignedPrekeyPublicKey === previousSignedPrekeyPublic) {
+    signedPrekeyPublic = previousSignedPrekeyPublic;
+    signedPrekeyPrivate = previousSignedPrekeyPrivate;
+  } else {
+    signedPrekeyPublic = currentSignedPrekeyPublic;
+    signedPrekeyPrivate = currentSignedPrekeyPrivate;
+  }
   if (!signedPrekeyPublic || !signedPrekeyPrivate) {
     throw new DeviceSetupError('This device has no local signed prekey to bootstrap a ratchet session with.');
   }
@@ -583,6 +638,15 @@ const SIGNING_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signing_private_key';
 const SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_public_key';
 const SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_private_key';
 const SIGNED_PREKEY_CREATED_AT_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_created_at';
+/** One retired generation back, kept so `establishSessionAsResponder` can
+ * still answer a handshake bootstrapped against the key we just rotated
+ * out. Deliberately scoped to ONE generation, not a time-based retention
+ * window: a message delayed across more than one rotation (the default
+ * cadence is weekly) remains unanswerable, same as before this existed.
+ * Fully covering arbitrarily long delivery delays would need a longer,
+ * multi-generation retention policy -- out of scope here. */
+const SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_previous_public_key';
+const SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY = 'svalinn_ratchet_signed_prekey_previous_private_key';
 const ONE_TIME_PREKEYS_STORAGE_KEY = 'svalinn_ratchet_one_time_prekeys';
 
 const SIGNED_PREKEY_ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -609,14 +673,25 @@ function loadOneTimePrekeys(): StoredOneTimePrekey[] {
   }
 }
 
-function storeOneTimePrekeys(keys: StoredOneTimePrekey[]): void {
+/** Returns whether the write actually succeeded, for the one call site
+ * (`maintainOneTimePrekeys`) where that matters: it must not advertise new
+ * one-time prekeys to the server unless their private keys are actually
+ * saved locally first (see its own comment). Every other call site treats
+ * this as fire-and-forget, same as before -- see `storeOneTimePrekeys`. */
+function tryStoreOneTimePrekeys(keys: StoredOneTimePrekey[]): boolean {
   try {
     localStorage.setItem(ONE_TIME_PREKEYS_STORAGE_KEY, JSON.stringify(keys));
+    return true;
   } catch {
-    // Best-effort -- see crypto.ts's `checkStorageAvailable` precedent;
-    // a broken store here just means fewer one-time prekeys available
-    // locally, not a correctness problem (X3DH degrades gracefully).
+    return false;
   }
+}
+
+function storeOneTimePrekeys(keys: StoredOneTimePrekey[]): void {
+  // Best-effort -- see crypto.ts's `checkStorageAvailable` precedent; a
+  // broken store here just means fewer one-time prekeys available
+  // locally, not a correctness problem (X3DH degrades gracefully).
+  tryStoreOneTimePrekeys(keys);
 }
 
 function findAndConsumeLocalOneTimePrekey(publicKey: string): Uint8Array | null {
@@ -659,8 +734,26 @@ async function ensureSignedPrekey(deviceId: string, signingPrivateKey: Uint8Arra
   const publicKey = b64(kp.publicKey);
   const privateKey = b64(kp.privateKey);
   const signature = b64(sodium.crypto_sign_detached(kp.publicKey, signingPrivateKey));
-  await uploadPrekeys(deviceId, [{ keyType: 'signed', publicKey, signature }]);
+
+  // Persist locally BEFORE publishing to the server, not after. If the
+  // local write fails, we must not leave the server advertising a public
+  // key whose private half was never actually saved anywhere -- that key
+  // becomes permanently unusable (nothing retries it: the NEXT call's
+  // freshness check sees the unchanged, still-current OLD key and
+  // concludes there's nothing to do) while still being exactly the key
+  // future senders' X3DH handshakes bootstrap against. Failing closed here
+  // means a storage failure throws before anything is published, so a
+  // retry starts clean instead of orphaning a key.
   try {
+    if (existingPublic && existingPrivate) {
+      // An actual rotation, not first-ever creation: keep the outgoing key
+      // around for one generation (see the storage key's own doc comment)
+      // so a handshake already bootstrapped against it moments before this
+      // rotation can still be answered instead of silently failing the
+      // moment the server starts advertising a different one.
+      localStorage.setItem(SIGNED_PREKEY_PREVIOUS_PUBLIC_KEY_STORAGE_KEY, existingPublic);
+      localStorage.setItem(SIGNED_PREKEY_PREVIOUS_PRIVATE_KEY_STORAGE_KEY, existingPrivate);
+    }
     localStorage.setItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY, publicKey);
     localStorage.setItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY, privateKey);
     localStorage.setItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY, String(Date.now()));
@@ -669,6 +762,7 @@ async function ensureSignedPrekey(deviceId: string, signingPrivateKey: Uint8Arra
       "This device cannot store its ratchet signed prekey (local storage is unavailable, full, or disabled)."
     );
   }
+  await uploadPrekeys(deviceId, [{ keyType: 'signed', publicKey, signature }]);
 }
 
 async function maintainOneTimePrekeys(deviceId: string): Promise<void> {
@@ -683,11 +777,21 @@ async function maintainOneTimePrekeys(deviceId: string): Promise<void> {
     newKeys.push({ publicKey, privateKey: b64(kp.privateKey) });
     uploads.push({ keyType: 'one_time', publicKey });
   }
-  await uploadPrekeys(deviceId, uploads);
 
+  // Persist locally BEFORE publishing, not after: a batch the server
+  // advertises as available but whose private keys this device never
+  // actually saved is worse than useless. Any peer who consumes one of
+  // those "phantom" prekeys derives a shared secret this device can never
+  // reproduce (see `establishSessionAsResponder`'s fallback comment),
+  // permanently breaking that one handshake with no way to detect or
+  // retry it after the fact. Fail closed instead: if the local write
+  // fails, publish nothing this attempt -- the next low-water-mark check
+  // retries the whole batch from scratch.
   const merged = [...loadOneTimePrekeys(), ...newKeys];
   const bounded = merged.length > MAX_LOCAL_ONE_TIME_PREKEYS ? merged.slice(merged.length - MAX_LOCAL_ONE_TIME_PREKEYS) : merged;
-  storeOneTimePrekeys(bounded);
+  if (!tryStoreOneTimePrekeys(bounded)) return;
+
+  await uploadPrekeys(deviceId, uploads);
 }
 
 /** Sets this device up for the Double Ratchet, idempotently: generates (or
@@ -803,10 +907,43 @@ function sessionStorageKey(peerDeviceId: string): string {
   return `svalinn_ratchet_session_${peerDeviceId}`;
 }
 
+/** Structural sanity check for a value that's about to be trusted as a
+ * `RatchetState` -- whether freshly parsed from local storage or decrypted
+ * out of the server-side backup. A value that merely parses as JSON
+ * (`null`, `{}`, `[]`, `"text"`, or an object missing required fields) is
+ * NOT a usable session: feeding it straight into the ratchet math throws
+ * deep inside `ratchetDecrypt`/`ratchetEncrypt` instead of falling back to
+ * a session that IS usable (the local cache's healthy twin, or the
+ * server-side backup). Treating anything that fails this check as "no
+ * session cached" lets the existing recovery path in `loadOrRecoverSession`
+ * do its job instead. */
+function isValidRatchetState(value: unknown): value is RatchetState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.dhsPublic === 'string' &&
+    typeof v.dhsPrivate === 'string' &&
+    (v.dhrPublic === null || typeof v.dhrPublic === 'string') &&
+    typeof v.rootKey === 'string' &&
+    (v.chainKeySend === null || typeof v.chainKeySend === 'string') &&
+    (v.chainKeyRecv === null || typeof v.chainKeyRecv === 'string') &&
+    typeof v.sendCount === 'number' &&
+    typeof v.recvCount === 'number' &&
+    typeof v.previousChainLength === 'number' &&
+    typeof v.skippedKeys === 'object' &&
+    v.skippedKeys !== null &&
+    !Array.isArray(v.skippedKeys) &&
+    typeof v.adLow === 'string' &&
+    typeof v.adHigh === 'string'
+  );
+}
+
 function loadLocalSession(peerDeviceId: string): RatchetState | null {
   try {
     const raw = localStorage.getItem(sessionStorageKey(peerDeviceId));
-    return raw ? (JSON.parse(raw) as RatchetState) : null;
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isValidRatchetState(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -875,21 +1012,49 @@ function saveSession(myDeviceId: string, peerDeviceId: string, state: RatchetSta
   });
 }
 
+/** True if a loaded session was created under a DIFFERENT local identity
+ * than the one now active. Its AD and DH math were both derived from the
+ * OLD identity key (see `initRatchetAsInitiator`/`initRatchetAsResponder`)
+ * and can never produce a matching ciphertext under a new one -- most
+ * directly after `adoptRecoveredKeypair` switches this device to a
+ * different legitimate identity while a session cached only by peer
+ * device id is left behind. A session with no recorded identity at all
+ * (persisted before this field existed) is treated as valid rather than
+ * forcing every pre-existing session to re-handshake on upgrade. */
+function belongsToAnotherIdentity(state: RatchetState, myIdentityPublicKeyB64: string): boolean {
+  return Boolean(state.myIdentityPublicKey) && state.myIdentityPublicKey !== myIdentityPublicKeyB64;
+}
+
 /** Loads a session's local state, falling back to recovering it from the
  * server-side encrypted backup if nothing's cached locally (e.g. local
  * storage was cleared) -- see this file's header comment. Returns null if
  * there's truly no session yet either way. */
-async function loadOrRecoverSession(myDeviceId: string, peerDeviceId: string): Promise<RatchetState | null> {
+async function loadOrRecoverSession(
+  myDeviceId: string,
+  peerDeviceId: string,
+  myIdentityPublicKeyB64: string
+): Promise<RatchetState | null> {
   const local = loadLocalSession(peerDeviceId);
-  if (local) return local;
+  if (local) {
+    if (!belongsToAnotherIdentity(local, myIdentityPublicKeyB64)) return local;
+    // Stale: clear it rather than silently feeding it to the ratchet math
+    // on every future call for this peer, so the next check short-circuits
+    // on "nothing cached" instead of re-deriving this same answer.
+    try {
+      localStorage.removeItem(sessionStorageKey(peerDeviceId));
+    } catch {
+      /* best-effort, same as every other local write in this file */
+    }
+  }
 
   try {
     const backup = await fetchRatchetSession(myDeviceId, peerDeviceId);
     const { privateKey } = await ensureDeviceKeypair();
     const pickleKey = derivePickleKey(fromB64(privateKey));
     const plaintextBytes = sodium.crypto_secretbox_open_easy(fromB64(backup.pickleCiphertext), fromB64(backup.pickleNonce), pickleKey);
-    const state = JSON.parse(sodium.to_string(plaintextBytes)) as RatchetState;
-    state.backupUpdatedAt = backup.updatedAt;
+    const parsed: unknown = JSON.parse(sodium.to_string(plaintextBytes));
+    if (!isValidRatchetState(parsed) || belongsToAnotherIdentity(parsed, myIdentityPublicKeyB64)) return null;
+    const state: RatchetState = { ...parsed, backupUpdatedAt: backup.updatedAt };
     storeLocalSession(peerDeviceId, state);
     return state;
   } catch (err) {
@@ -901,26 +1066,58 @@ async function loadOrRecoverSession(myDeviceId: string, peerDeviceId: string): P
 
 // --- Public send/receive API ----------------------------------------------
 
+/** Serializes every load-mutate-persist cycle for one (my device, peer
+ * device) session pair. Without this, two overlapping calls -- a user
+ * firing off several messages in quick succession before the first one's
+ * state write lands, or two incoming messages from the same peer arriving
+ * close together -- can both load the SAME starting chain key before
+ * either has persisted its advance. That derives and transmits the SAME
+ * message key under two different ciphertexts (a real per-message-key
+ * invariant violation, not just a UI race), and can equally regress a
+ * receive counter that a second concurrent decrypt already moved forward.
+ * Plain (non-`async`) on purpose: the get-then-set below must happen with
+ * no `await` in between, or two overlapping calls could both see the
+ * queue as empty and run concurrently anyway. A failed call never poisons
+ * the queue for whoever's waiting behind it (`.catch(() => undefined)`
+ * below) -- it's still rejected for ITS OWN caller via the returned
+ * promise, just not propagated to anyone else's turn. */
+const sessionLocks = new Map<string, Promise<unknown>>();
+
+function withSessionLock<T>(myDeviceId: string, peerDeviceId: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${myDeviceId}:${peerDeviceId}`;
+  const prior = sessionLocks.get(key) ?? Promise.resolve();
+  const next = prior.then(fn, fn);
+  sessionLocks.set(key, next.catch(() => undefined));
+  return next;
+}
+
 /** Encrypts `plaintext` for `peerDeviceId`, establishing a brand-new
  * session via the X3DH-style handshake first if none exists yet. Throws
  * `RatchetNotSupportedError` if the peer device hasn't opted into the
  * Double Ratchet (no published signed prekey) -- callers should catch
  * that and fall back to `crypto.ts`'s stateless per-device encryption. */
 export async function encryptMessage(peerDeviceId: string, plaintext: string): Promise<RatchetEnvelope> {
-  const { deviceId: myDeviceId } = await ensureDeviceKeypair();
-  const existing = await loadOrRecoverSession(myDeviceId, peerDeviceId);
-  const state = existing ?? (await bootstrapSessionAsInitiator(peerDeviceId));
+  const { deviceId: myDeviceId, publicKey: myIdentityPublicKeyB64 } = await ensureDeviceKeypair();
+  return withSessionLock(myDeviceId, peerDeviceId, async () => {
+    const existing = await loadOrRecoverSession(myDeviceId, peerDeviceId, myIdentityPublicKeyB64);
+    const state = existing ?? (await bootstrapSessionAsInitiator(peerDeviceId));
 
-  const result = ratchetEncrypt(state, plaintext);
-  const envelope: RatchetEnvelope = { dh: result.dh, pn: result.pn, n: result.n, ciphertext: result.ciphertext, nonce: result.nonce };
+    const result = ratchetEncrypt(state, plaintext);
+    const envelope: RatchetEnvelope = { dh: result.dh, pn: result.pn, n: result.n, ciphertext: result.ciphertext, nonce: result.nonce };
 
-  let newState = result.state;
-  if (newState.pendingInitialHeader) {
-    envelope.initial = newState.pendingInitialHeader;
-    newState = { ...newState, pendingInitialHeader: null };
-  }
-  saveSession(myDeviceId, peerDeviceId, newState);
-  return envelope;
+    const newState = result.state;
+    if (newState.pendingInitialHeader) {
+      // Kept attached to EVERY message for as long as it's present (see
+      // `ratchetDecrypt`'s matching comment on when it's cleared) -- not
+      // just the first one -- so an unacknowledged retry, or the other
+      // side of an overlapping concurrent first send that arrives before
+      // this one, is never left without the bootstrap data a fresh
+      // responder needs to decrypt it at all.
+      envelope.initial = newState.pendingInitialHeader;
+    }
+    saveSession(myDeviceId, peerDeviceId, newState);
+    return envelope;
+  });
 }
 
 /** Decrypts a message from `peerDeviceId`, bootstrapping a session as the
@@ -931,7 +1128,16 @@ export async function encryptMessage(peerDeviceId: string, plaintext: string): P
  * show this one" rather than crashing the conversation. */
 export async function decryptMessage(peerDeviceId: string, envelope: RatchetEnvelope): Promise<string | null> {
   const { deviceId: myDeviceId, publicKey: myIdentityPublicKeyB64 } = await ensureDeviceKeypair();
-  let state = await loadOrRecoverSession(myDeviceId, peerDeviceId);
+  return withSessionLock(myDeviceId, peerDeviceId, () => decryptMessageLocked(myDeviceId, peerDeviceId, myIdentityPublicKeyB64, envelope));
+}
+
+async function decryptMessageLocked(
+  myDeviceId: string,
+  peerDeviceId: string,
+  myIdentityPublicKeyB64: string,
+  envelope: RatchetEnvelope
+): Promise<string | null> {
+  let state = await loadOrRecoverSession(myDeviceId, peerDeviceId, myIdentityPublicKeyB64);
 
   // Mutual X3DH initiation collision: both sides of a brand-new (device,
   // peer device) pair can simultaneously find no session and self-initiate
@@ -965,11 +1171,12 @@ export async function decryptMessage(peerDeviceId: string, envelope: RatchetEnve
   // null regardless of how many unanswered messages we've sent, and that's
   // exactly the state that means "this session has never been confirmed
   // by an actual reply" -- which is also implied by the peer's message
-  // still carrying `initial` fields at all (the sender clears those after
-  // its own first message, so a still-present `initial` means the SENDER
-  // hasn't heard back from us either). A session with any genuine
-  // received traffic (`chainKeyRecv` set) is never second-guessed here,
-  // whatever headers show up on top of it.
+  // still carrying `initial` fields at all (the sender keeps attaching
+  // those to EVERY message for as long as its own `chainKeyRecv` is still
+  // null -- see `encryptMessage`/`ratchetDecrypt` -- so a still-present
+  // `initial` means the SENDER hasn't heard back from us either). A
+  // session with any genuine received traffic (`chainKeyRecv` set) is
+  // never second-guessed here, whatever headers show up on top of it.
   const isRaceCandidate = !!state && !!envelope.initial && state.chainKeyRecv === null;
 
   if (isRaceCandidate && envelope.initial) {
