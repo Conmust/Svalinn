@@ -17,7 +17,7 @@ use crate::models::device::{EncryptedRecipient, MessageRecipientPayload};
 use crate::models::message::BroadcastMessage;
 use crate::routes::conversations::{
     fetch_recipients_for_messages, MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS, MAX_FANOUT_CIPHERTEXT_B64_CHARS,
-    MAX_FANOUT_NONCE_B64_CHARS,
+    MAX_FANOUT_NONCE_B64_CHARS, MAX_RATCHET_HEADER_JSON_CHARS,
 };
 
 /// One emoji's reactions on a message.
@@ -443,6 +443,13 @@ pub async fn create_message(
                 "attachment_key_ciphertext/attachment_key_nonce must not be set without attachment_url".into(),
             ));
         }
+        if let Some(header) = &r.ratchet_header_json {
+            if header.len() > MAX_RATCHET_HEADER_JSON_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "ratchet_header_json in encrypted_for can be at most {MAX_RATCHET_HEADER_JSON_CHARS} characters"
+                )));
+            }
+        }
     }
 
     let device_ids: Vec<Uuid> = payload.encrypted_for.iter().map(|r| r.device_id).collect();
@@ -530,7 +537,7 @@ pub async fn create_message(
 
     for r in &payload.encrypted_for {
         sqlx::query(
-            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(msg_id)
         .bind(r.device_id)
@@ -539,6 +546,7 @@ pub async fn create_message(
         .bind(&sender_public_key)
         .bind(&r.attachment_key_ciphertext)
         .bind(&r.attachment_key_nonce)
+        .bind(&r.ratchet_header_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -844,7 +852,7 @@ mod tests {
         register_device(
             State(db.clone()),
             CurrentUser(user_id),
-            Json(RegisterDeviceRequest { public_key: fake_public_key(byte), device_label: format!("device-{byte}") }),
+            Json(RegisterDeviceRequest { public_key: fake_public_key(byte), device_label: format!("device-{byte}"), signing_public_key: None }),
         )
         .await
         .expect("registering a test device should succeed")
@@ -859,6 +867,7 @@ mod tests {
             nonce: "nonce".into(),
             attachment_key_ciphertext: None,
             attachment_key_nonce: None,
+            ratchet_header_json: None,
         }
     }
 

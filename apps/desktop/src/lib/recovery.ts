@@ -33,6 +33,7 @@ import {
   CryptoLibraryError,
   type DeviceKeypair,
 } from './crypto';
+import { ensureRatchetReady } from './ratchet';
 import { withTimeout, TimeoutError } from './timeout';
 
 /** Same bound as `lib/crypto.ts`'s own `ready()` -- this module loads
@@ -402,6 +403,17 @@ const MAX_BACKUP_CHECK_ATTEMPTS = 3;
 function settleDeviceReady(keypair: DeviceKeypair): void {
   resolveReady?.(keypair);
   activeDeviceKeypair.set(keypair);
+
+  // Best-effort, fire-and-forget: sets this device up for the Double
+  // Ratchet (signing identity, signed prekey, one-time prekeys) alongside
+  // its existing stateless keypair above. Never blocks `deviceEncryptionReady()`
+  // on it -- a failure here (e.g. this one request to publish a prekey
+  // timing out) shouldn't stop a device that otherwise works fine from
+  // opening DMs; it just means every peer falls back to the legacy
+  // per-device path (`RatchetNotSupportedError` -- see `ratchet.ts`) until
+  // a later call succeeds. `ensureRatchetReady()` is idempotent and safe to
+  // call repeatedly, so there's no harm in just trying again next launch.
+  ensureRatchetReady().catch((e) => console.error('Failed to set this device up for the Double Ratchet:', e));
 }
 
 async function runDeviceEncryptionSetup(attempt = 1): Promise<void> {

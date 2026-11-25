@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -39,6 +39,13 @@ pub struct MessageRecipientPayload {
     /// Nonce for `attachment_key_ciphertext`. Always present together with
     /// it, never alone.
     pub attachment_key_nonce: Option<String>,
+    /// This entry's Double Ratchet envelope metadata (`ratchet.ts`'s
+    /// `RatchetEnvelope` minus `ciphertext`/`nonce`, which already have
+    /// their own columns), as an opaque JSON string the server never
+    /// parses -- only stores and hands back verbatim. `None` for a message
+    /// sent via the legacy stateless per-device path (`crypto.ts`), and for
+    /// every row that predates this feature. See migration 0040.
+    pub ratchet_header_json: Option<String>,
 }
 
 /// One entry of a fan-out send request: the server-assigned encrypting
@@ -57,6 +64,11 @@ pub struct EncryptedRecipient {
     pub attachment_key_ciphertext: Option<String>,
     #[serde(default)]
     pub attachment_key_nonce: Option<String>,
+    /// See `MessageRecipientPayload::ratchet_header_json` -- the same
+    /// opaque JSON blob, supplied by the client when this entry was
+    /// encrypted via `ratchet.ts` rather than `crypto.ts`.
+    #[serde(default)]
+    pub ratchet_header_json: Option<String>,
 }
 
 /// One of a conversation's two participants' devices, as seen by a client
@@ -71,4 +83,82 @@ pub struct ParticipantDevice {
     pub public_key: String,
     pub device_label: String,
     pub is_me: bool,
+}
+
+// --- Double Ratchet prekey bundles & session pickles (migration 0038) -----
+//
+// These support an X3DH-style bootstrap for a Double Ratchet session,
+// additive alongside the stateless per-device model above. A device never
+// uploads anything private here either -- only public prekeys and, for
+// session pickles, ciphertext the device itself encrypted before upload
+// (see migration 0038's comment on `ratchet_sessions.pickle_ciphertext`).
+
+/// One row of `device_prekeys`, as uploaded by a device. `signature` is
+/// required for `key_type = "signed"` (an Ed25519 signature over
+/// `public_key`'s bytes, by the device's identity signing key) and must be
+/// absent for `key_type = "one_time"` -- see `upload_prekeys`'s validation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrekeyUpload {
+    pub key_type: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// A device's active signed prekey plus (if any remained) one freshly
+/// consumed one-time prekey, returned to whoever is bootstrapping a new
+/// session with this device. `one_time_prekey_id` lets the caller do
+/// nothing further -- the prekey is marked consumed server-side, atomically,
+/// as part of producing this response (see `fetch_prekey_bundle`) -- it's
+/// returned only so a client can log/debug which one it used.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrekeyBundle {
+    pub device_id: Uuid,
+    pub identity_public_key: String,
+    /// This device's Ed25519 signing public key (migration 0039),
+    /// needed to verify `signed_prekey_signature` below. Always present --
+    /// `fetch_prekey_bundle` refuses to return a bundle for a device that
+    /// hasn't registered one, rather than returning an unverifiable bundle.
+    pub identity_signing_public_key: String,
+    pub signed_prekey_public_key: String,
+    pub signed_prekey_signature: String,
+    pub one_time_prekey_id: Option<Uuid>,
+    pub one_time_prekey_public_key: Option<String>,
+}
+
+/// A device's own view of its remaining one-time prekey count, so its
+/// client can tell when it's running low and should upload more -- see
+/// `ratchet.ts`'s replenishment check.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct PrekeyCounts {
+    pub unconsumed_one_time_prekeys: i64,
+    pub has_signed_prekey: bool,
+}
+
+/// One device's own encrypted backup of its session with one specific peer
+/// device (a `ratchet_sessions` row, keyed by the owning device's id and
+/// the peer device's id -- see migration 0038's doc comment on why this is
+/// directed, not a row shared between the two devices in a conversation).
+/// This struct carries the opaque, client-encrypted state plus enough to
+/// detect a concurrent write (`updated_at`, checked by the client before
+/// overwriting -- see `ratchet.ts`'s `saveSession`).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct RatchetSessionPickle {
+    pub pickle_ciphertext: String,
+    pub pickle_nonce: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for upserting a session pickle -- see `put_ratchet_session`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PutRatchetSessionRequest {
+    pub pickle_ciphertext: String,
+    pub pickle_nonce: String,
+    /// The `updated_at` this client last read for this session (`None` if
+    /// it believes no session exists yet). If another of the user's own
+    /// devices has written a newer pickle in the meantime, the write is
+    /// rejected with a conflict rather than silently clobbering it -- see
+    /// `put_ratchet_session`'s optimistic-concurrency check.
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
 }

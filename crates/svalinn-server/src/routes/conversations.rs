@@ -320,12 +320,13 @@ pub(crate) async fn fetch_recipients_for_messages(
         sender_public_key: String,
         attachment_key_ciphertext: Option<String>,
         attachment_key_nonce: Option<String>,
+        ratchet_header_json: Option<String>,
     }
 
     let rows: Vec<RecipientRow> = sqlx::query_as(
         r#"
         SELECT message_id, device_id, ciphertext, nonce, sender_public_key,
-               attachment_key_ciphertext, attachment_key_nonce
+               attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json
         FROM message_recipients
         WHERE message_id = ANY($1) AND ($2::uuid IS NULL OR device_id = $2)
         "#,
@@ -345,6 +346,7 @@ pub(crate) async fn fetch_recipients_for_messages(
             sender_public_key: row.sender_public_key,
             attachment_key_ciphertext: row.attachment_key_ciphertext,
             attachment_key_nonce: row.attachment_key_nonce,
+            ratchet_header_json: row.ratchet_header_json,
         });
     }
     Ok(map)
@@ -516,6 +518,14 @@ pub(crate) const MAX_FANOUT_NONCE_B64_CHARS: usize = 32;
 /// exactly 64 chars. Rounded up with headroom, same style as
 /// `MAX_FANOUT_CIPHERTEXT_B64_CHARS` above.
 pub(crate) const MAX_ATTACHMENT_KEY_CIPHERTEXT_B64_CHARS: usize = 100;
+
+/// Longest `ratchet_header_json` accepted per recipient entry -- the
+/// envelope's `dh`/`pn`/`n` fields plus, only on a session's first message,
+/// the X3DH `initial` block (two or three more base64 32-byte keys). A few
+/// hundred characters covers the worst case with real headroom; the server
+/// never parses this field, only stores and returns it, so the cap exists
+/// purely to bound storage/transfer, not to validate its shape.
+pub(crate) const MAX_RATCHET_HEADER_JSON_CHARS: usize = 2000;
 
 /// GET /api/v1/conversations/:id/participant-devices
 ///
@@ -800,6 +810,13 @@ async fn send_fanout_message(
                 "attachment_key_ciphertext/attachment_key_nonce must not be set without attachment_url".into(),
             ));
         }
+        if let Some(header) = &r.ratchet_header_json {
+            if header.len() > MAX_RATCHET_HEADER_JSON_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "ratchet_header_json in encrypted_for can be at most {MAX_RATCHET_HEADER_JSON_CHARS} characters"
+                )));
+            }
+        }
     }
     let device_ids: Vec<Uuid> = recipients.iter().map(|r| r.device_id).collect();
     let mut seen = HashSet::new();
@@ -893,7 +910,7 @@ async fn send_fanout_message(
 
     for r in recipients {
         sqlx::query(
-            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(msg_id)
         .bind(r.device_id)
@@ -902,6 +919,7 @@ async fn send_fanout_message(
         .bind(&sender_public_key)
         .bind(&r.attachment_key_ciphertext)
         .bind(&r.attachment_key_nonce)
+        .bind(&r.ratchet_header_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1580,6 +1598,7 @@ mod tests {
             Json(crate::routes::devices::RegisterDeviceRequest {
                 public_key: fake_public_key(byte),
                 device_label: label.into(),
+                signing_public_key: None,
             }),
         )
         .await
@@ -2130,6 +2149,7 @@ mod tests {
                         nonce: "nonce-a1".into(),
                         attachment_key_ciphertext: Some("wrapped-key-a1".into()),
                         attachment_key_nonce: Some("wrap-nonce-a1".into()),
+                        ratchet_header_json: None,
                     },
                     EncryptedRecipient {
                         device_id: b_device1,
@@ -2137,6 +2157,7 @@ mod tests {
                         nonce: "nonce-b1".into(),
                         attachment_key_ciphertext: Some("wrapped-key-b1".into()),
                         attachment_key_nonce: Some("wrap-nonce-b1".into()),
+                        ratchet_header_json: None,
                     },
                 ]),
                 sender_device_id: Some(a_device1),
@@ -2318,6 +2339,7 @@ mod tests {
                         nonce: "nonce-a1".into(),
                         attachment_key_ciphertext: Some("wrapped-key-a1".into()),
                         attachment_key_nonce: Some("wrap-nonce-a1".into()),
+                        ratchet_header_json: None,
                     },
                     // B's device carries no wrapped key at all.
                     EncryptedRecipient { device_id: b_device1, ciphertext: "ct-for-b1".into(), nonce: "nonce-b1".into(), ..Default::default() },
@@ -2387,6 +2409,7 @@ mod tests {
                         nonce: "nonce-b1".into(),
                         attachment_key_ciphertext: Some("wrapped-key-b1".into()),
                         attachment_key_nonce: Some("wrap-nonce-b1".into()),
+                        ratchet_header_json: None,
                     },
                 ]),
                 sender_device_id: Some(a_device1),

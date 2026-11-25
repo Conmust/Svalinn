@@ -117,6 +117,198 @@ export async function fetchParticipantDevices(conversationId: string): Promise<P
   return response.json();
 }
 
+// --- Double Ratchet prekey bundles & session sync (migration 0038/0039) ---
+//
+// Additive alongside everything above: `ratchet.ts` is the only caller of
+// these. None of this is used by the stateless per-device `crypto.ts` path.
+
+/** Sets (or replaces) this device's Ed25519 signing public key -- see
+ * migration 0039. Called once by `ratchet.ts`'s identity setup, the first
+ * time it runs on a device that was already registered (the common case:
+ * `ensureDeviceKeypair` in `crypto.ts` usually ran long before ratchet
+ * support existed on this device). */
+export async function setSigningKey(deviceId: string, signingPublicKeyBase64: string): Promise<void> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/devices/${deviceId}/signing-key`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ signing_public_key: signingPublicKeyBase64 }),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to set this device\'s signing key');
+  }
+}
+
+/** One prekey to upload: either `{ keyType: "signed", publicKey, signature
+ * }` (replaces this device's previous active signed prekey) or `{ keyType:
+ * "one_time", publicKey }` (always additive). */
+export interface PrekeyUpload {
+  keyType: 'signed' | 'one_time';
+  publicKey: string;
+  signature?: string;
+}
+
+/** Uploads one or more prekeys for this device. */
+export async function uploadPrekeys(deviceId: string, prekeys: PrekeyUpload[]): Promise<void> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/devices/${deviceId}/prekeys`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({
+      prekeys: prekeys.map((p) => ({ key_type: p.keyType, public_key: p.publicKey, signature: p.signature })),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to upload prekeys');
+  }
+}
+
+/** This device's own remaining one-time-prekey count, for the
+ * replenishment check in `ratchet.ts`. */
+export interface PrekeyCounts {
+  unconsumedOneTimePrekeys: number;
+  hasSignedPrekey: boolean;
+}
+
+export async function fetchPrekeyCounts(deviceId: string): Promise<PrekeyCounts> {
+  const response = await apiFetch(`${apiBase()}/api/v1/users/me/devices/${deviceId}/prekeys/count`, {
+    headers: getAuthHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to fetch this device\'s prekey counts');
+  }
+  const body = await response.json();
+  return { unconsumedOneTimePrekeys: body.unconsumed_one_time_prekeys, hasSignedPrekey: body.has_signed_prekey };
+}
+
+/** A device's identity + one-time-use bundle, as needed to bootstrap a
+ * brand-new ratchet session with it (the X3DH-style handshake). See
+ * `ratchet.ts`'s `bootstrapSessionAsInitiator`. */
+export interface PrekeyBundle {
+  deviceId: string;
+  identityPublicKey: string;
+  identitySigningPublicKey: string;
+  signedPrekeyPublicKey: string;
+  signedPrekeySignature: string;
+  oneTimePrekeyId: string | null;
+  oneTimePrekeyPublicKey: string | null;
+}
+
+/** Thrown when a device hasn't published a signed prekey (or a signing
+ * key) yet -- i.e. it hasn't opted into the Double Ratchet. Distinct from a
+ * network failure so `ratchet.ts` can fall back to the legacy per-device
+ * `crypto.ts` path instead of treating this as "DM sending is broken." */
+export class RatchetNotSupportedError extends Error {
+  constructor(message = 'This device has not opted into the Double Ratchet yet.') {
+    super(message);
+    this.name = 'RatchetNotSupportedError';
+  }
+}
+
+export async function fetchPrekeyBundle(deviceId: string): Promise<PrekeyBundle> {
+  const response = await withTimeout(
+    apiFetch(`${apiBase()}/api/v1/devices/${deviceId}/prekey-bundle`, {
+      headers: getAuthHeaders(),
+    }),
+    DEVICE_NETWORK_TIMEOUT_MS,
+    'Timed out fetching a prekey bundle.'
+  );
+  if (response.status === 404) {
+    throw new RatchetNotSupportedError();
+  }
+  if (!response.ok) {
+    throw new Error('Failed to fetch a prekey bundle');
+  }
+  const body = await response.json();
+  return {
+    deviceId: body.device_id,
+    identityPublicKey: body.identity_public_key,
+    identitySigningPublicKey: body.identity_signing_public_key,
+    signedPrekeyPublicKey: body.signed_prekey_public_key,
+    signedPrekeySignature: body.signed_prekey_signature,
+    oneTimePrekeyId: body.one_time_prekey_id,
+    oneTimePrekeyPublicKey: body.one_time_prekey_public_key,
+  };
+}
+
+/** This device's own encrypted backup of its session with one peer
+ * device -- opaque, client-encrypted state plus `updatedAt` for
+ * optimistic-concurrency writes. NOT shared with the peer device: see
+ * migration 0038's doc comment on why this is a directed, per-owning-
+ * device backup rather than a row shared between the two devices in a
+ * conversation. See `ratchet.ts`'s `loadSession`/`saveSession`. */
+export interface RatchetSessionPickle {
+  pickleCiphertext: string;
+  pickleNonce: string;
+  updatedAt: string;
+}
+
+/** Thrown by `fetchRatchetSession` when this device has no backup saved
+ * yet for this peer -- distinct from a network failure, so `ratchet.ts`
+ * knows to bootstrap a session via `fetchPrekeyBundle` instead of
+ * retrying (or, if it already has local session state, that it simply
+ * hasn't backed it up yet). */
+export class NoRatchetSessionError extends Error {
+  constructor(message = 'No ratchet session backup exists yet for this device pair.') {
+    super(message);
+    this.name = 'NoRatchetSessionError';
+  }
+}
+
+/** Fetches THIS device's own backup of its session with `peerDeviceId`.
+ * `myDeviceId` must be one of the current user's own devices. */
+export async function fetchRatchetSession(myDeviceId: string, peerDeviceId: string): Promise<RatchetSessionPickle> {
+  const response = await apiFetch(`${apiBase()}/api/v1/ratchet-sessions/${myDeviceId}/${peerDeviceId}`, {
+    headers: getAuthHeaders(),
+  });
+  if (response.status === 404) {
+    throw new NoRatchetSessionError();
+  }
+  if (!response.ok) {
+    throw new Error('Failed to fetch ratchet session');
+  }
+  const body = await response.json();
+  return { pickleCiphertext: body.pickle_ciphertext, pickleNonce: body.pickle_nonce, updatedAt: body.updated_at };
+}
+
+/** Thrown by `putRatchetSession` when this backup's server-side state has
+ * moved on since the caller last read it (a concurrent write from this
+ * same device, e.g. two tabs). The caller must re-fetch and reconcile --
+ * see `ratchet.rs`'s `put_ratchet_session` doc comment on why this can't
+ * be resolved for the caller automatically. */
+export class RatchetSessionConflictError extends Error {
+  constructor(message = 'This ratchet session backup was updated elsewhere; re-fetch before writing again.') {
+    super(message);
+    this.name = 'RatchetSessionConflictError';
+  }
+}
+
+/** Saves THIS device's own backup of its session with `peerDeviceId`.
+ * `myDeviceId` must be one of the current user's own devices. */
+export async function putRatchetSession(
+  myDeviceId: string,
+  peerDeviceId: string,
+  pickleCiphertext: string,
+  pickleNonce: string,
+  expectedUpdatedAt: string | null
+): Promise<RatchetSessionPickle> {
+  const response = await apiFetch(`${apiBase()}/api/v1/ratchet-sessions/${myDeviceId}/${peerDeviceId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({
+      pickle_ciphertext: pickleCiphertext,
+      pickle_nonce: pickleNonce,
+      expected_updated_at: expectedUpdatedAt,
+    }),
+  });
+  if (response.status === 403) {
+    throw new RatchetSessionConflictError();
+  }
+  if (!response.ok) {
+    throw new Error('Failed to save ratchet session');
+  }
+  const body = await response.json();
+  return { pickleCiphertext: body.pickle_ciphertext, pickleNonce: body.pickle_nonce, updatedAt: body.updated_at };
+}
+
 /** Lists every registered device of every CURRENT member of a channel's
  * server -- what a client needs before composing an encrypted channel
  * send: encrypt once per device in this list (the sending device

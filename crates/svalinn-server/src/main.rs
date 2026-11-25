@@ -161,6 +161,26 @@ async fn main() {
             patch(routes::devices::rename_device).delete(routes::devices::delete_device),
         )
         .route(
+            "/api/v1/users/me/devices/:device_id/signing-key",
+            axum::routing::put(routes::devices::set_signing_key),
+        )
+        .route(
+            "/api/v1/users/me/devices/:device_id/prekeys",
+            post(routes::devices::upload_prekeys),
+        )
+        .route(
+            "/api/v1/users/me/devices/:device_id/prekeys/count",
+            get(routes::devices::get_prekey_counts),
+        )
+        .route(
+            "/api/v1/devices/:device_id/prekey-bundle",
+            get(routes::ratchet::fetch_prekey_bundle),
+        )
+        .route(
+            "/api/v1/ratchet-sessions/:device_a_id/:device_b_id",
+            get(routes::ratchet::get_ratchet_session).put(routes::ratchet::put_ratchet_session),
+        )
+        .route(
             "/api/v1/users/me/key-backup",
             get(routes::users::get_key_backup)
                 .put(routes::users::put_key_backup)
