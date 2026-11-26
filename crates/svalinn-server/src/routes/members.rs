@@ -302,16 +302,25 @@ pub async fn ban_member(
         return Err(AppError::BadRequest("Reason must be at most 500 characters".into()));
     }
 
+    // Captured once, up front, and used for BOTH inserts below (`server_bans`
+    // and `banned_emails`), so they always agree with each other -- see
+    // `unban_member`'s comment for why that matters: `server_bans.email_hash`
+    // is what lets an unban later find and clear the exact same
+    // `banned_emails` row this ban is about to create, even if the user's
+    // own `users.email_hash` has since changed to something else.
+    let email_hash_at_ban_time = email_hash_of(&db, payload.user_id).await?;
+
     sqlx::query(
         r#"
-        INSERT INTO server_bans (server_id, user_id, banned_by, reason) VALUES ($1, $2, $3, $4)
-        ON CONFLICT (server_id, user_id) DO UPDATE SET banned_by = $3, reason = $4, created_at = NOW()
+        INSERT INTO server_bans (server_id, user_id, banned_by, reason, email_hash) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (server_id, user_id) DO UPDATE SET banned_by = $3, reason = $4, email_hash = $5, created_at = NOW()
         "#,
     )
     .bind(server_id)
     .bind(payload.user_id)
     .bind(actor)
     .bind(reason)
+    .bind(&email_hash_at_ban_time)
     .execute(&db.pool)
     .await
     .map_err(|e| match e {
@@ -325,7 +334,7 @@ pub async fn ban_member(
     // with no verified email yet (email_hash still NULL) has nothing to
     // record here, which is fine -- `accept_invite` already requires
     // verification before anyone can join at all.
-    if let Some(email_hash) = email_hash_of(&db, payload.user_id).await? {
+    if let Some(email_hash) = &email_hash_at_ban_time {
         sqlx::query(
             r#"
             INSERT INTO banned_emails (email_hash, server_id, reason) VALUES ($1, $2, $3)
@@ -402,16 +411,24 @@ pub async fn unban_member(
     Path((server_id, target)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
     require_moderator(&db, server_id, actor).await?;
-    let removed = sqlx::query("DELETE FROM server_bans WHERE server_id = $1 AND user_id = $2")
-        .bind(server_id)
-        .bind(target)
-        .execute(&db.pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .rows_affected();
-    if removed == 0 {
+    // `RETURNING email_hash` so the `banned_emails` cleanup below uses the
+    // hash that was actually recorded WHEN THIS BAN WAS CREATED (see
+    // `ban_member`), not whatever the user's `users.email_hash` happens to
+    // be right now. Those two can diverge -- a per-server ban doesn't stop
+    // someone from changing their account email in the meantime -- and
+    // re-deriving it from the current record here used to leave the
+    // original hash permanently stuck in `banned_emails`, with no way for a
+    // moderator to ever clear it again, even after explicitly unbanning.
+    let removed_email_hash: Option<Option<String>> =
+        sqlx::query_scalar("DELETE FROM server_bans WHERE server_id = $1 AND user_id = $2 RETURNING email_hash")
+            .bind(server_id)
+            .bind(target)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some(email_hash) = removed_email_hash else {
         return Err(AppError::NotFound("That user isn't banned from this server".into()));
-    }
+    };
 
     // ban_member also records the account's email hash in banned_emails, so
     // a new account under the same email can't evade the ban (see
@@ -419,7 +436,7 @@ pub async fn unban_member(
     // account we just unbanned still can't get back in through an invite
     // -- `banned_emails` would be blocking the very account `server_bans`
     // no longer does.
-    if let Some(email_hash) = email_hash_of(&db, target).await? {
+    if let Some(email_hash) = email_hash {
         sqlx::query("DELETE FROM banned_emails WHERE server_id = $1 AND email_hash = $2")
             .bind(server_id)
             .bind(&email_hash)
@@ -843,6 +860,74 @@ mod tests {
         .await
         .expect("querying banned_emails failed");
         assert!(recorded, "banning a member with a verified email should record its blind-index hash");
+
+        cleanup(&db, server_id, &[owner, evader]).await;
+    }
+
+    #[tokio::test]
+    async fn unban_clears_the_banned_emails_row_even_after_the_target_changed_their_email() {
+        // Regression test for a bug found in a fresh adversarial audit:
+        // `unban_member` used to re-derive the email hash to clear from the
+        // target's CURRENT `users.email_hash`, instead of the hash that was
+        // actually recorded in `banned_emails` when the ban was created. If
+        // the user changed their email in between (a per-server ban doesn't
+        // lock the account itself), those two hashes diverge, and the old
+        // hash was left stuck in `banned_emails` forever -- an explicit,
+        // successful unban that silently didn't fully take effect.
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let old_email = format!("old_{}@example.invalid", Uuid::new_v4());
+        let evader = create_test_user_with_verified_email(&db, &old_email).await;
+        join_server(&db, server_id, evader, "member").await;
+
+        ban_member(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(BanRequest { user_id: evader, reason: Some("evasion test".into()) }),
+        )
+        .await
+        .expect("owner should be able to ban a plain member");
+
+        let old_email_hash = crate::email_privacy::blind_index(&old_email);
+        let recorded_under_old_hash: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM banned_emails WHERE server_id = $1 AND email_hash = $2)",
+        )
+        .bind(server_id)
+        .bind(&old_email_hash)
+        .fetch_one(&db.pool)
+        .await
+        .expect("querying banned_emails failed");
+        assert!(recorded_under_old_hash, "the ban should have recorded the OLD email's hash");
+
+        // Simulate the banned account changing its email in between -- the
+        // same thing `routes::users::update_email` does to `users.email_hash`,
+        // without needing that whole flow here.
+        let new_email_hash = crate::email_privacy::blind_index(&format!("new_{}@example.invalid", Uuid::new_v4()));
+        sqlx::query("UPDATE users SET email_hash = $1 WHERE id = $2")
+            .bind(&new_email_hash)
+            .bind(evader)
+            .execute(&db.pool)
+            .await
+            .expect("simulating an email change failed");
+
+        unban_member(State(db.clone()), CurrentUser(owner), Path((server_id, evader)))
+            .await
+            .expect("owner should be able to unban");
+
+        let still_recorded_under_old_hash: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM banned_emails WHERE server_id = $1 AND email_hash = $2)",
+        )
+        .bind(server_id)
+        .bind(&old_email_hash)
+        .fetch_one(&db.pool)
+        .await
+        .expect("querying banned_emails failed");
+        assert!(
+            !still_recorded_under_old_hash,
+            "unbanning must clear the OLD email's hash, not whatever hash the account has NOW"
+        );
 
         cleanup(&db, server_id, &[owner, evader]).await;
     }
