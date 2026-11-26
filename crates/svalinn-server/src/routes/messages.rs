@@ -398,9 +398,9 @@ pub struct SendChannelMessageRequest {
     /// `attachment_url` is set; must be absent otherwise.
     pub attachment_nonce: Option<String>,
     /// One ciphertext per recipient device -- must cover EXACTLY every
-    /// currently-registered device of every current member of this
-    /// channel's server, including the sender's own sending device. See
-    /// the completeness check below.
+    /// currently-registered device of every current member who can
+    /// currently see this channel (`VIEW_CHANNEL`), including the sender's
+    /// own sending device. See the completeness check below.
     pub encrypted_for: Vec<EncryptedRecipient>,
     /// The id of THIS device (the one that did the encrypting), so the
     /// server can resolve and record its public key on every
@@ -412,16 +412,31 @@ pub struct SendChannelMessageRequest {
 /// POST /api/v1/channels/:channel_id/messages
 ///
 /// Validates that `encrypted_for` covers every currently-registered device
-/// of every current member of this channel's server exactly -- no more, no
-/// less -- then inserts the `messages` row and every `message_recipients`
-/// row in one transaction: either all of it lands, or none of it does.
-/// Mirrors `conversations::send_fanout_message`, scoped to `server_members`
-/// instead of a fixed two-person `conversation_participants`.
+/// of every current member who can currently see this specific channel
+/// (i.e. holds `VIEW_CHANNEL` on it, same set `channels::members_who_can_view`
+/// computes for live broadcasts) exactly -- no more, no less -- then
+/// inserts the `messages` row and every `message_recipients` row in one
+/// transaction: either all of it lands, or none of it does. Mirrors
+/// `conversations::send_fanout_message`, scoped to this channel's current
+/// viewers instead of a fixed two-person `conversation_participants`.
 ///
-/// A member who joins this server after a message is sent never gets a
-/// row here for it -- there is no re-share/history-backfill ceremony, by
-/// design. A member who leaves (or is removed) simply isn't in the
-/// completeness check for any message sent after they're gone.
+/// Scoping to channel viewers rather than the whole server (the previous
+/// behavior) is what actually makes a private channel private against
+/// OTHER MEMBERS, not just against outsiders: content keys themselves are
+/// per-message and per-device (a `message_recipients` row, produced fresh
+/// by the sender's ratchet/crypto_box for exactly this send), never a
+/// standing shared secret, so a member who doesn't currently hold
+/// `VIEW_CHANNEL` simply never receives a row for any message sent while
+/// they lack it -- there's no key left lying around to revoke. A member
+/// who regains (or newly gains) `VIEW_CHANNEL` is, symmetrically, in the
+/// `encrypted_for` requirement for every message sent from that point on,
+/// same as joining the server fresh already worked for channel history:
+/// there is no re-share/history-backfill ceremony, by design. (The one
+/// thing this can't do anything about, nor can any similar scheme: a
+/// member who legitimately held `VIEW_CHANNEL` when a message was sent
+/// already received that message's key then and keeps it after being
+/// denied `VIEW_CHANNEL` later -- forward secrecy for messages already
+/// shared with you isn't a thing any encryption scheme provides.)
 pub async fn create_message(
     State(db): State<Database>,
     CurrentSession { user_id, session_id }: CurrentSession,
@@ -431,6 +446,20 @@ pub async fn create_message(
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
     crate::permissions::require_channel_permission(&db, channel_id, user_id, crate::permissions::Permission::SEND_MESSAGES).await?;
+
+    // Computed here, before the transaction below, same timing as the
+    // `require_channel_permission` check just above (and the exact same
+    // staleness tolerance that check already has): a member's access
+    // changing in the instant between this read and the transaction's
+    // commit is an existing acceptable race, not a new one introduced
+    // here. Includes the sender themselves unconditionally -- a role could
+    // in principle grant SEND_MESSAGES without VIEW_CHANNEL on a channel
+    // (the two are independent bits), and the sender's own device must
+    // always be in the completeness requirement regardless.
+    let mut viewer_ids = crate::routes::channels::members_who_can_view(&db, server_id, channel_id).await?;
+    if !viewer_ids.contains(&user_id) {
+        viewer_ids.push(user_id);
+    }
 
     if payload.encrypted_for.is_empty() {
         return Err(AppError::BadRequest(
@@ -518,16 +547,7 @@ pub async fn create_message(
     }
 
     let mut tx = db.pool.begin().await.map_err(|e| AppError::Database(e.to_string()))?;
-
-    // Read inside the transaction (not via `db.pool` beforehand) so this
-    // is genuinely the same consistent snapshot the completeness check
-    // below claims to use, rather than a membership list that could have
-    // gone stale by the time the transaction actually started.
-    let member_ids: Vec<Uuid> = sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
-        .bind(server_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    let member_ids = viewer_ids;
 
     let sender_public_key: Option<String> =
         sqlx::query_scalar("SELECT public_key FROM device_keys WHERE id = $1 AND user_id = $2")
@@ -539,9 +559,9 @@ pub async fn create_message(
     let sender_public_key = sender_public_key
         .ok_or_else(|| AppError::BadRequest("sender_device_id must be one of your own registered devices".into()))?;
 
-    // Every recipient device must belong to device_keys owned by a CURRENT
-    // member of this server -- otherwise reject the whole send rather than
-    // partially deliver it.
+    // Every recipient device must belong to device_keys owned by a member
+    // who can currently VIEW this channel -- otherwise reject the whole
+    // send rather than partially deliver it.
     let valid_device_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM device_keys WHERE id = ANY($1) AND user_id = ANY($2)")
             .bind(&device_ids)
@@ -556,11 +576,13 @@ pub async fn create_message(
     }
 
     // `encrypted_for` must cover every currently-registered device of
-    // every current server member, INCLUDING the sender's own sending
-    // device -- read inside the same transaction as the rest of this
-    // function's checks so it sees a consistent device/membership list; a
-    // device or membership change racing this transaction is an existing
-    // acceptable race, not a new one.
+    // every current VIEWER of this channel (`member_ids` here is really
+    // "this channel's current viewer ids", computed above), INCLUDING the
+    // sender's own sending device. The device lookup itself still runs
+    // inside the transaction so it's a consistent snapshot with the rest
+    // of this function's checks; only the viewer-id computation (a
+    // permission resolution, not a plain row read) happened just before
+    // it -- see the comment above `members_who_can_view` being called.
     let registered_device_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM device_keys WHERE user_id = ANY($1)")
         .bind(&member_ids)
         .fetch_all(&mut *tx)
@@ -570,7 +592,7 @@ pub async fn create_message(
     if required_device_ids != seen {
         let missing: Vec<Uuid> = required_device_ids.difference(&seen).copied().collect();
         return Err(AppError::BadRequest(format!(
-            "encrypted_for must contain exactly every currently-registered device of every current server member (including the sender's own sending device); missing: {missing:?}"
+            "encrypted_for must contain exactly every currently-registered device of every member who can currently view this channel (including the sender's own sending device); missing: {missing:?}"
         )));
     }
 
@@ -1306,7 +1328,10 @@ mod tests {
 
         let owner_device = register_test_device(&db, owner, 40).await;
         let viewer_device = register_test_device(&db, viewer, 41).await;
-        let blocked_device = register_test_device(&db, blocked, 42).await;
+        // Registered, but deliberately never passed to `encrypted_for`
+        // below -- proving `blocked` is excluded even though their device
+        // is real and registered, not merely absent from this test.
+        let _blocked_device = register_test_device(&db, blocked, 42).await;
 
         let mut rx = db.message_tx.subscribe();
 
@@ -1320,15 +1345,12 @@ mod tests {
                 attachment_size: None,
                 attachment_mime_type: None,
                 attachment_nonce: None,
-                // Completeness still requires every current member's
-                // device, `blocked`'s included -- see `create_message`'s own
-                // doc comment on why VIEW_CHANNEL doesn't shrink this list.
-                // What must change is who the broadcast of it reaches.
-                encrypted_for: vec![
-                    fake_recipient(owner_device),
-                    fake_recipient(viewer_device),
-                    fake_recipient(blocked_device),
-                ],
+                // `blocked`'s device is deliberately NOT included: the
+                // completeness check is scoped to current channel viewers
+                // (see `create_message`'s doc comment), and `blocked` isn't
+                // one. This also doubles as this test's own proof that the
+                // send succeeds without their device present at all.
+                encrypted_for: vec![fake_recipient(owner_device), fake_recipient(viewer_device)],
                 sender_device_id: owner_device,
             }),
         )
@@ -1344,6 +1366,104 @@ mod tests {
         assert!(
             !recipients.contains(&blocked),
             "a member denied VIEW_CHANNEL must not receive the message's ciphertext live over the socket"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
+    }
+
+    /// The deeper architectural fix beneath `new_message_broadcast_excludes_...`
+    /// above: the broadcast-scoping fix alone only stopped a denied member
+    /// from receiving their *live* copy over the socket -- it didn't change
+    /// that `encrypted_for` still had to cover their device at send time,
+    /// meaning the server still held, and the client still had to produce,
+    /// a decryptable `message_recipients` row for them. That meant a
+    /// member's cryptographic access to a "private" channel never actually
+    /// shrank when their `VIEW_CHANNEL` was revoked -- only the server's
+    /// willingness to hand them the ciphertext through the API did. This
+    /// proves the completeness requirement itself is now scoped to current
+    /// channel viewers: a denied member's device is neither required NOR
+    /// accepted in `encrypted_for`, and no row for them is ever created.
+    #[tokio::test]
+    async fn create_message_excludes_a_member_denied_view_channel_from_encrypted_for() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+        deny_view_channel(&db, channel, blocked).await;
+
+        let owner_device = register_test_device(&db, owner, 60).await;
+        let viewer_device = register_test_device(&db, viewer, 61).await;
+        let blocked_device = register_test_device(&db, blocked, 62).await;
+
+        // A client that still builds `encrypted_for` as if `blocked` were a
+        // required recipient (the old, pre-fix behavior) must now be
+        // rejected outright -- the completeness check is EXACT, so an
+        // extra, no-longer-required device is just as much a mismatch as a
+        // missing one.
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![
+                    fake_recipient(owner_device),
+                    fake_recipient(viewer_device),
+                    fake_recipient(blocked_device),
+                ],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "encrypted_for including a device_id of a member denied VIEW_CHANNEL must be rejected, got {result:?}"
+        );
+
+        // The correctly-scoped send (what a fixed client actually produces,
+        // e.g. from `channels::get_channel_member_devices`) succeeds, and
+        // leaves no `message_recipients` row for `blocked` at all.
+        let message_id = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device), fake_recipient(viewer_device)],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await
+        .expect("a correctly-scoped send must succeed")
+        .0
+        .id;
+
+        let recipient_devices: Vec<Uuid> = sqlx::query_scalar("SELECT device_id FROM message_recipients WHERE message_id = $1")
+            .bind(message_id)
+            .fetch_all(&db.pool)
+            .await
+            .expect("failed to query message_recipients");
+        assert!(recipient_devices.contains(&owner_device));
+        assert!(recipient_devices.contains(&viewer_device));
+        assert!(
+            !recipient_devices.contains(&blocked_device),
+            "a member denied VIEW_CHANNEL must never get a message_recipients row -- there's no key to hold"
         );
 
         cleanup_test_server(&db, server).await;
@@ -1418,7 +1538,14 @@ mod tests {
         let owner_device = register_test_device(&db, owner, 50).await;
         let moderator_device = register_test_device(&db, moderator, 51).await;
 
-        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[moderator_device]).await;
+        // `moderator_device` isn't passed to `encrypted_for` here: now that
+        // `encrypted_for` is scoped to current channel viewers, a moderator
+        // denied VIEW_CHANNEL isn't a required recipient of this message at
+        // all -- which is exactly the point. The mutation check under test
+        // (message_context's VIEW_CHANNEL requirement) doesn't depend on
+        // whether they have a `message_recipients` row.
+        let _ = moderator_device;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
 
         let result = delete_message(State(db.clone()), CurrentUser(moderator), Path(message_id)).await;
         assert!(
@@ -1460,7 +1587,11 @@ mod tests {
         let owner_device = register_test_device(&db, owner, 52).await;
         let blocked_device = register_test_device(&db, blocked, 53).await;
 
-        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[blocked_device]).await;
+        // Same reasoning as the delete-message test above: `blocked_device`
+        // isn't a required `encrypted_for` recipient once the completeness
+        // check is scoped to current channel viewers.
+        let _ = blocked_device;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
 
         let result = add_reaction(
             State(db.clone()),
