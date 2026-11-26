@@ -794,11 +794,20 @@
   // open) -- the server rejects the whole send with a 400 naming the bad
   // `device_id` in that case (see `send_fanout_message`'s validation).
   function isStaleDeviceListError(e: unknown): boolean {
+    if (!(e instanceof SendDirectMessageError) || e.status !== 400 || !e.serverMessage) return false;
+    // Two distinct validation failures both mean the same thing here --
+    // `participantDevices` is stale -- and the server's wording differs
+    // between them (see `conversations.rs`'s two checks): a device that's
+    // been removed/revoked produces "...a device_id that doesn't
+    // belong...", while a NEW device that was added since the list was
+    // last loaded (the more common race -- the other participant just
+    // added a device) produces "...must contain exactly every
+    // currently-registered device...; missing: [...]", which never
+    // contains the literal substring "device_id" at all. Both need to
+    // trigger the same reload-and-retry below.
     return (
-      e instanceof SendDirectMessageError &&
-      e.status === 400 &&
-      !!e.serverMessage &&
-      e.serverMessage.includes('device_id')
+      e.serverMessage.includes('device_id') ||
+      e.serverMessage.includes('must contain exactly every currently-registered device')
     );
   }
 
