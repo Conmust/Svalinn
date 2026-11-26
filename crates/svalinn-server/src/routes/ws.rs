@@ -198,17 +198,35 @@ async fn handle_socket_connection(
     // (a crash, a closed laptop lid) never gets to call the `leave`
     // endpoint itself, so without this the roster -- and everyone else's
     // WebRTC mesh with them -- would be stuck thinking they're still there.
+    announce_voice_departures(&db, user_id).await;
+
+    println!("🔌 User {} disconnected from WebSocket", user_id);
+}
+
+/// Tells every member who can still view each of `user_id`'s voice channels
+/// that they left, after an ungraceful disconnect (the client never got to
+/// call `leave_voice_channel` itself) drops them from the in-memory roster.
+///
+/// Uses the same `broadcast_to_channel_viewers` helper as
+/// `routes/voice.rs`'s own `leave_voice_channel` -- this is the other place
+/// `voice_participant_left` gets sent from, and it needs the identical
+/// scoping for the identical reason: a member denied VIEW_CHANNEL on a
+/// private voice channel must not learn, live over the socket, that someone
+/// was just in it, whether they left by calling the endpoint or by their
+/// connection simply dropping.
+async fn announce_voice_departures(db: &Database, user_id: Uuid) {
     for channel_id in db.voice.leave_all(user_id).await {
-        if let Ok(server_id) = crate::access::channel_server_id(&db, channel_id).await {
-            let _ = db.message_tx.send(BroadcastMessage::to_server(
+        if let Ok(server_id) = crate::access::channel_server_id(db, channel_id).await {
+            crate::routes::voice::broadcast_to_channel_viewers(
+                db,
                 "voice_participant_left",
                 serde_json::json!({ "channel_id": channel_id, "user_id": user_id }),
                 server_id,
-            ));
+                channel_id,
+            )
+            .await;
         }
     }
-
-    println!("🔌 User {} disconnected from WebSocket", user_id);
 }
 
 /// Dispatches an allow-listed client event to the right relay, based on
@@ -301,4 +319,119 @@ fn close_message(denied: &AccessDenied) -> Message {
         reason.pop();
     }
     Message::Close(Some(CloseFrame { code: denied.close_code(), reason: reason.into() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    async fn create_test_server(db: &Database, owner_id: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(server_id)
+            .bind(owner_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert owner membership");
+        server_id
+    }
+
+    async fn add_server_member(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+    }
+
+    async fn create_test_voice_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'voice') RETURNING id")
+            .bind(server_id)
+            .bind(format!("voice-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test voice channel")
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    /// The disconnect-cleanup counterpart of
+    /// `routes::voice::tests::voice_broadcasts_exclude_a_member_denied_view_channel`:
+    /// an ungraceful disconnect (socket just drops, `leave_voice_channel` is
+    /// never called) must scope its `voice_participant_left` announcement
+    /// the same way the explicit endpoint does.
+    #[tokio::test]
+    async fn announce_voice_departures_excludes_a_member_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_voice_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel)
+            .bind(blocked)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+
+        // Put the owner in the roster directly, bypassing the join endpoint
+        // -- `announce_voice_departures` is exercised as if their socket had
+        // just dropped mid-call.
+        db.voice.join(channel, owner, "owner".to_string()).await;
+
+        let mut rx = db.message_tx.subscribe();
+        announce_voice_departures(&db, owner).await;
+
+        let left = rx.try_recv().expect("a voice_participant_left event should have been broadcast");
+        assert_eq!(left.event_type, "voice_participant_left");
+        let recipients = left.to_users.expect("voice_participant_left must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&viewer), "a member with VIEW_CHANNEL must still see the departure");
+        assert!(
+            !recipients.contains(&blocked),
+            "a member denied VIEW_CHANNEL must not see who left a private voice channel, even on an ungraceful disconnect"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
+    }
 }

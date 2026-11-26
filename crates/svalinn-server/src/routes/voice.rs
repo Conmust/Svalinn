@@ -36,7 +36,7 @@ use crate::voice::VoiceParticipant;
 /// so the blast radius is smaller than the message case this mirrors -- but
 /// it's still exactly the kind of "private channel" leak this app is
 /// supposed to prevent, and it's the same bypass of the same permission.
-async fn broadcast_to_channel_viewers(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid, channel_id: Uuid) {
+pub(crate) async fn broadcast_to_channel_viewers(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid, channel_id: Uuid) {
     let recipients = match crate::routes::channels::members_who_can_view(db, server_id, channel_id).await {
         Ok(recipients) => recipients,
         Err(e) => {
