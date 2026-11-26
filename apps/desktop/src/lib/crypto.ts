@@ -12,10 +12,14 @@
 import sodium from 'libsodium-wrappers-sumo';
 import { registerDevice } from './devices';
 import { withTimeout, TimeoutError } from './timeout';
+import { getCurrentUser } from './auth';
 
 const PUBLIC_KEY_STORAGE_KEY = 'svalinn_e2ee_public_key';
 const PRIVATE_KEY_STORAGE_KEY = 'svalinn_e2ee_private_key';
 const DEVICE_ID_STORAGE_KEY = 'svalinn_e2ee_device_id';
+/** Which account this localStorage identity was generated for -- see
+ * `ownerMatchesCurrentUser`'s doc comment for why this exists. */
+const OWNER_USER_ID_STORAGE_KEY = 'svalinn_e2ee_owner_user_id';
 
 export interface DeviceKeypair {
   publicKey: string;
@@ -112,12 +116,55 @@ function checkStorageAvailable(): void {
   }
 }
 
+/** True unless this localStorage identity was recorded as belonging to a
+ * DIFFERENT, currently-logged-in account than the one asking.
+ *
+ * The per-device model (this file's header comment) was written assuming
+ * one account per browser/install forever -- "a different device
+ * (different browser profile, different install, cleared localStorage,
+ * ...) always gets its own independent keypair". That assumption silently
+ * breaks the moment a SECOND account logs in on the same shared
+ * browser/install without the first one's local storage ever being
+ * cleared: `logout()` (see `api.ts`'s `clearSession`) only clears the
+ * session tokens, not this identity, so the next account to log in here
+ * would otherwise inherit the PREVIOUS account's device keypair wholesale
+ * -- including its private key -- via `readStoredKeypair` below, with no
+ * indication anything was wrong. Worse, since `ratchet.ts`'s own signing
+ * identity and `message-history.ts`'s cache both derive from or are keyed
+ * independently of this keypair, the same leak would extend to a
+ * Double-Ratchet signing/prekey identity and locally-cached decrypted
+ * message plaintext too (see `recovery.ts`'s `forgetLocalDeviceIdentity`
+ * orchestration, which this function's own export,
+ * `storedDeviceOwnerUserId`, feeds into).
+ *
+ * A key stored before this field existed (pre-existing installs) has no
+ * recorded owner -- treated as "assume valid" rather than forcing every
+ * existing single-account install to silently re-register its device on
+ * next launch, same backward-compatibility stance `ratchet.ts` takes for
+ * its own `myIdentityPublicKey` field. Likewise, if there's no
+ * currently-logged-in account to compare against (shouldn't happen in
+ * practice -- every caller here runs only once logged in), this doesn't
+ * invalidate anything either; there's nothing to compare. */
+function ownerMatchesCurrentUser(): boolean {
+  let ownerUserId: string | null;
+  try {
+    ownerUserId = localStorage.getItem(OWNER_USER_ID_STORAGE_KEY);
+  } catch {
+    return true;
+  }
+  if (!ownerUserId) return true;
+  const currentUserId = getCurrentUser()?.id ?? null;
+  if (!currentUserId) return true;
+  return ownerUserId === currentUserId;
+}
+
 function readStoredKeypair(): DeviceKeypair | null {
   try {
     const publicKey = localStorage.getItem(PUBLIC_KEY_STORAGE_KEY);
     const privateKey = localStorage.getItem(PRIVATE_KEY_STORAGE_KEY);
     const deviceId = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
     if (!publicKey || !privateKey || !deviceId) return null;
+    if (!ownerMatchesCurrentUser()) return null;
     return { publicKey, privateKey, deviceId };
   } catch {
     // Treated as "nothing stored yet" here -- `ensureDeviceKeypair` always
@@ -125,6 +172,61 @@ function readStoredKeypair(): DeviceKeypair | null {
     // key, so a genuinely broken store still surfaces as `DeviceSetupError`
     // rather than silently regenerating a key every call.
     return null;
+  }
+}
+
+/** Which account's device this browser's local E2EE identity was last
+ * generated or recovered for, if recorded -- null if there's no local
+ * keypair yet, or it predates `OWNER_USER_ID_STORAGE_KEY`. Exported so
+ * `recovery.ts` can detect, in ONE place, whether the account now logging
+ * in differs from whoever this device identity actually belongs to --
+ * see `ownerMatchesCurrentUser`'s doc comment. */
+export function storedDeviceOwnerUserId(): string | null {
+  try {
+    return localStorage.getItem(OWNER_USER_ID_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/** Records which account this browser's local E2EE identity belongs to.
+ * Called every time a keypair is persisted (freshly generated or
+ * recovered from a backup) so a later login from a DIFFERENT account on
+ * this same browser can be detected -- see `ownerMatchesCurrentUser`. A
+ * failure here is best-effort, same as every other local write in this
+ * module: at worst it just means this particular keypair is grandfathered
+ * in (treated as ownerless, see `ownerMatchesCurrentUser`) rather than
+ * tagged, not that anything breaks outright. */
+function recordDeviceOwner(): void {
+  const currentUserId = getCurrentUser()?.id;
+  if (!currentUserId) return;
+  try {
+    localStorage.setItem(OWNER_USER_ID_STORAGE_KEY, currentUserId);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Wipes this browser's local E2EE identity (keypair + device id + owner
+ * marker) outright, and resets the in-memory promise so the very next
+ * `ensureDeviceKeypair()` call generates and registers a genuinely new
+ * device rather than replaying a cached promise for an account that just
+ * logged out. Called by `recovery.ts` specifically when it detects (via
+ * `storedDeviceOwnerUserId`) that a different account has just logged in
+ * on this browser than whoever this identity belongs to -- see
+ * `ownerMatchesCurrentUser`'s doc comment for the full scenario this
+ * guards against. Not the same thing as merely losing storage access,
+ * which `readStoredKeypair`'s own error handling already treats as
+ * "nothing stored" without actively deleting anything. */
+export function forgetLocalDeviceIdentity(): void {
+  keypairPromise = null;
+  try {
+    localStorage.removeItem(PUBLIC_KEY_STORAGE_KEY);
+    localStorage.removeItem(PRIVATE_KEY_STORAGE_KEY);
+    localStorage.removeItem(DEVICE_ID_STORAGE_KEY);
+    localStorage.removeItem(OWNER_USER_ID_STORAGE_KEY);
+  } catch {
+    /* best-effort, same as every other local write in this module */
   }
 }
 
@@ -352,6 +454,7 @@ export function ensureDeviceKeypair(): Promise<DeviceKeypair> {
             'This device cannot store an encryption key (local storage is unavailable, full, or disabled).'
           );
         }
+        recordDeviceOwner();
 
         return { publicKey, privateKey, deviceId };
       } finally {
@@ -386,6 +489,7 @@ export function adoptRecoveredKeypair(keypair: DeviceKeypair): void {
   localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, keypair.publicKey);
   localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, keypair.privateKey);
   localStorage.setItem(DEVICE_ID_STORAGE_KEY, keypair.deviceId);
+  recordDeviceOwner();
   keypairPromise = Promise.resolve(keypair);
 }
 
