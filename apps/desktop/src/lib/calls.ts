@@ -279,11 +279,34 @@ function mediaErrorMessage(e: unknown): string {
 // media devices before that).
 let pendingOffer: RTCSessionDescriptionInit | null = null;
 
+function currentCallState(): CallState {
+  let current: CallState = initialState;
+  callState.subscribe((s) => (current = s))();
+  return current;
+}
+
+/** Whether `fromUser` is the specific peer the CURRENT call session is
+ * with. The server's own relay check (`relay_dm_signal` in `routes/ws.rs`)
+ * only verifies that sender and recipient share SOME DM conversation --
+ * deliberately coarse, since it has no notion of "who's in a call with
+ * whom" to check against. That means, without this check, any of a user's
+ * DM contacts (not just the one they're actually calling) could forge a
+ * `call-hangup`/`call-reject`/`call-busy`/`call-cancel` to kill an
+ * unrelated ongoing call, or race a forged `webrtc-answer`/`ice-candidate`
+ * against the real peer's to hijack the WebRTC negotiation before it
+ * completes. `from_user` itself IS trustworthy -- the server stamps it
+ * server-side from the authenticated sender, never trusting a
+ * client-supplied value -- so comparing it to `callState.peerId` here is
+ * sufficient to scope every signaling event to the actual call it claims
+ * to belong to. */
+function isFromCurrentPeer(fromUser: string): boolean {
+  return currentCallState().peerId === fromUser;
+}
+
 /** Wires up the WS listeners. Call once, e.g. from App.svelte on mount. */
 export function initCallSignaling() {
   wsClient.on('call-invite', (data: { from_user: string; with_video: boolean; from_username?: string }) => {
-    let current: CallState = initialState;
-    callState.subscribe((s) => (current = s))();
+    const current = currentCallState();
     // Already on a call: let the caller know we're busy instead of silently dropping it.
     if (current.status !== 'idle' && current.status !== 'ended') {
       sendSignal('call-busy', data.from_user);
@@ -300,11 +323,12 @@ export function initCallSignaling() {
   });
 
   wsClient.on('webrtc-offer', (data: { from_user: string; sdp: RTCSessionDescriptionInit }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
     pendingOffer = data.sdp;
   });
 
   wsClient.on('webrtc-answer', async (data: { from_user: string; sdp: RTCSessionDescriptionInit }) => {
-    if (!pc) return;
+    if (!pc || !isFromCurrentPeer(data.from_user)) return;
     await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
     for (const candidate of pendingCandidates) {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -313,6 +337,7 @@ export function initCallSignaling() {
   });
 
   wsClient.on('ice-candidate', async (data: { from_user: string; candidate: RTCIceCandidateInit }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
     if (pc && pc.remoteDescription) {
       await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
     } else {
@@ -320,12 +345,25 @@ export function initCallSignaling() {
     }
   });
 
-  wsClient.on('call-accept', () => {
+  wsClient.on('call-accept', (data: { from_user: string }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
     callState.update((s) => ({ ...s, status: 'connecting' }));
   });
 
-  wsClient.on('call-reject', (data: { reason?: string }) => endCall(data?.reason || 'Call declined'));
-  wsClient.on('call-busy', () => endCall('User is busy'));
-  wsClient.on('call-cancel', () => endCall('Call cancelled'));
-  wsClient.on('call-hangup', () => endCall(null));
+  wsClient.on('call-reject', (data: { from_user: string; reason?: string }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
+    endCall(data?.reason || 'Call declined');
+  });
+  wsClient.on('call-busy', (data: { from_user: string }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
+    endCall('User is busy');
+  });
+  wsClient.on('call-cancel', (data: { from_user: string }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
+    endCall('Call cancelled');
+  });
+  wsClient.on('call-hangup', (data: { from_user: string }) => {
+    if (!isFromCurrentPeer(data.from_user)) return;
+    endCall(null);
+  });
 }
