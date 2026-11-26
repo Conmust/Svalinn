@@ -25,6 +25,28 @@ use crate::models::message::BroadcastMessage;
 use crate::permissions::{require_channel_permission, resolve_channel, Permission};
 use crate::voice::VoiceParticipant;
 
+/// Sends a voice-roster event only to members who can currently view the
+/// channel it's about -- exactly like `routes/messages.rs`'s `broadcast`
+/// helper, and for the identical reason. `get_server_voice_rosters` already
+/// filters a private voice channel's roster out of the REST response for
+/// anyone denied `VIEW_CHANNEL`; without this, a member in that situation
+/// would still see it live the moment someone joined, left, or muted,
+/// straight over the WebSocket, with nothing more than an open connection.
+/// A roster entry carries a username and a mute flag rather than ciphertext,
+/// so the blast radius is smaller than the message case this mirrors -- but
+/// it's still exactly the kind of "private channel" leak this app is
+/// supposed to prevent, and it's the same bypass of the same permission.
+async fn broadcast_to_channel_viewers(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid, channel_id: Uuid) {
+    let recipients = match crate::routes::channels::members_who_can_view(db, server_id, channel_id).await {
+        Ok(recipients) => recipients,
+        Err(e) => {
+            eprintln!("Failed to compute channel viewers for a {event_type} broadcast: {e}");
+            return;
+        }
+    };
+    let _ = db.message_tx.send(BroadcastMessage::to_users(event_type, payload, recipients));
+}
+
 /// A channel must actually be a voice channel to be joined -- joining a
 /// text channel's "voice session" wouldn't mean anything, and would let a
 /// client ring every member of the server under an event type nothing else
@@ -67,11 +89,14 @@ pub async fn join_voice_channel(
 
     let existing = db.voice.join(channel_id, user_id, username.clone()).await;
 
-    let _ = db.message_tx.send(BroadcastMessage::to_server(
+    broadcast_to_channel_viewers(
+        &db,
         "voice_participant_joined",
         serde_json::json!({ "channel_id": channel_id, "user_id": user_id, "username": username, "muted": false }),
         server_id,
-    ));
+        channel_id,
+    )
+    .await;
 
     Ok(Json(existing))
 }
@@ -88,11 +113,14 @@ pub async fn leave_voice_channel(
     let was_present = db.voice.leave(channel_id, user_id).await;
     if was_present {
         if let Ok(server_id) = channel_server_id(&db, channel_id).await {
-            let _ = db.message_tx.send(BroadcastMessage::to_server(
+            broadcast_to_channel_viewers(
+                &db,
                 "voice_participant_left",
                 serde_json::json!({ "channel_id": channel_id, "user_id": user_id }),
                 server_id,
-            ));
+                channel_id,
+            )
+            .await;
         }
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -113,11 +141,14 @@ pub async fn set_voice_state(
     let updated = db.voice.set_muted(channel_id, user_id, payload.muted).await;
     if updated {
         if let Ok(server_id) = channel_server_id(&db, channel_id).await {
-            let _ = db.message_tx.send(BroadcastMessage::to_server(
+            broadcast_to_channel_viewers(
+                &db,
                 "voice_state_updated",
                 serde_json::json!({ "channel_id": channel_id, "user_id": user_id, "muted": payload.muted }),
                 server_id,
-            ));
+                channel_id,
+            )
+            .await;
         }
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -154,4 +185,136 @@ pub async fn get_server_voice_rosters(
     }
 
     Ok(Json(db.voice.rosters(&visible_ids).await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    async fn create_test_server(db: &Database, owner_id: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(server_id)
+            .bind(owner_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert owner membership");
+        server_id
+    }
+
+    async fn add_server_member(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+    }
+
+    async fn create_test_voice_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'voice') RETURNING id")
+            .bind(server_id)
+            .bind(format!("voice-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test voice channel")
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    /// Mirrors `routes::messages`'s
+    /// `new_message_broadcast_excludes_a_member_denied_view_channel`: a
+    /// member denied `VIEW_CHANNEL` on a voice channel must not receive the
+    /// live `voice_participant_joined`/`left`/`voice_state_updated` events
+    /// for it, even though they're still a server member and the roster
+    /// lives in one process-wide, non-permission-aware registry.
+    #[tokio::test]
+    async fn voice_broadcasts_exclude_a_member_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_voice_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel)
+            .bind(blocked)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+
+        let mut rx = db.message_tx.subscribe();
+
+        // owner joins
+        let _ = join_voice_channel(State(db.clone()), CurrentUser(owner), Path(channel))
+            .await
+            .expect("owner should be able to join the voice channel");
+        let joined = rx.try_recv().expect("a voice_participant_joined event should have been broadcast");
+        assert_eq!(joined.event_type, "voice_participant_joined");
+        let recipients = joined.to_users.expect("voice_participant_joined must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&owner));
+        assert!(recipients.contains(&viewer), "a member with VIEW_CHANNEL must still see who joins live");
+        assert!(!recipients.contains(&blocked), "a member denied VIEW_CHANNEL must not see who joins a private voice channel");
+
+        // owner mutes
+        let _ = set_voice_state(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetVoiceStateRequest { muted: true }))
+            .await
+            .expect("muting should succeed");
+        let muted = rx.try_recv().expect("a voice_state_updated event should have been broadcast");
+        assert_eq!(muted.event_type, "voice_state_updated");
+        let recipients = muted.to_users.expect("voice_state_updated must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&viewer));
+        assert!(!recipients.contains(&blocked), "a member denied VIEW_CHANNEL must not see mute state in a private voice channel");
+
+        // owner leaves
+        let _ = leave_voice_channel(State(db.clone()), CurrentUser(owner), Path(channel))
+            .await
+            .expect("leaving should succeed");
+        let left = rx.try_recv().expect("a voice_participant_left event should have been broadcast");
+        assert_eq!(left.event_type, "voice_participant_left");
+        let recipients = left.to_users.expect("voice_participant_left must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&viewer));
+        assert!(!recipients.contains(&blocked), "a member denied VIEW_CHANNEL must not see who leaves a private voice channel");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
+    }
 }
