@@ -25,11 +25,14 @@
 import sodium from 'libsodium-wrappers-sumo';
 import { writable, type Writable } from 'svelte/store';
 import { apiFetch, apiBase, getAuthHeaders } from './api';
+import { getCurrentUser } from './auth';
 import { fetchMyDevices, registerDevice } from './devices';
 import {
   adoptRecoveredKeypair,
   ensureDeviceKeypair,
   hasLocalKeypair,
+  storedDeviceOwnerUserId,
+  forgetLocalDeviceIdentity,
   CryptoLibraryError,
   type DeviceKeypair,
 } from './crypto';
@@ -37,9 +40,39 @@ import {
   ensureRatchetReady,
   exportRatchetIdentityForBackup,
   importRecoveredRatchetIdentity,
+  forgetLocalRatchetIdentity,
   type RatchetIdentityBackup,
 } from './ratchet';
+import { clearMessageHistoryCache } from './message-history';
 import { withTimeout, TimeoutError } from './timeout';
+
+/** Detects a DIFFERENT account logging in on this same browser/install than
+ * whoever its local E2EE identity currently belongs to, and if so, wipes
+ * every piece of that stale identity before anything else runs. Without
+ * this, a shared computer where one account logs out and a different one
+ * logs in (without ever clearing browser storage) would otherwise silently
+ * hand the new account's session the PREVIOUS account's device keypair,
+ * Double Ratchet signing/prekey identity, and locally-cached decrypted
+ * message plaintext -- see `crypto.ts`'s `ownerMatchesCurrentUser` for the
+ * full scenario this guards against; that function's own check only makes
+ * `crypto.ts` treat its OWN keypair as absent, which stops the new account
+ * from actively using the old one, but leaves the stale secret material
+ * sitting in storage and leaves `ratchet.ts`'s entirely-separate identity
+ * (by design independent of `crypto.ts`'s keypair -- see that file's own
+ * header comment) untouched. This function is what actually erases all of
+ * it, once, as early as possible in `runDeviceEncryptionSetup()`. A no-op
+ * (and safe to call unconditionally) whenever there's no recorded owner yet
+ * (a pre-existing or brand-new install) or it already matches. */
+function forgetStaleIdentityFromPreviousAccount(): void {
+  const owner = storedDeviceOwnerUserId();
+  const currentUserId = getCurrentUser()?.id ?? null;
+  if (!owner || !currentUserId || owner === currentUserId) return;
+  forgetLocalDeviceIdentity();
+  forgetLocalRatchetIdentity();
+  clearMessageHistoryCache().catch((e) =>
+    console.warn('Failed to clear the previous account\'s local message cache on this shared device:', e)
+  );
+}
 
 /** Same bound as `lib/crypto.ts`'s own `ready()` -- this module loads
  * `sodium` independently (it needs `crypto_pwhash`/`crypto_secretbox`,
@@ -451,6 +484,15 @@ function settleDeviceReady(keypair: DeviceKeypair): void {
 }
 
 async function runDeviceEncryptionSetup(attempt = 1): Promise<void> {
+  // Step 0: if this browser's local E2EE identity belongs to a DIFFERENT
+  // account than the one now logged in (a shared computer, logout then a
+  // different login, with browser storage never cleared in between), wipe
+  // it before anything below gets a chance to read or build on it. Cheap
+  // and idempotent -- a no-op on every call after the first actually wipes
+  // something, since the owner marker it checks is itself removed by the
+  // wipe. See `forgetStaleIdentityFromPreviousAccount`'s own doc comment.
+  forgetStaleIdentityFromPreviousAccount();
+
   // Step 1: does this device need to ask the user to choose? This is the
   // ONLY part that's retried -- it's the part that can fail AMBIGUOUSLY
   // (a timeout or network error never tells us whether a backup exists).

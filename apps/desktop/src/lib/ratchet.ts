@@ -1023,8 +1023,49 @@ export function importRecoveredRatchetIdentity(material: RatchetIdentityBackup):
 
 // --- Session persistence (local cache + best-effort encrypted backup) -----
 
+const SESSION_STORAGE_KEY_PREFIX = 'svalinn_ratchet_session_';
+
 function sessionStorageKey(peerDeviceId: string): string {
-  return `svalinn_ratchet_session_${peerDeviceId}`;
+  return `${SESSION_STORAGE_KEY_PREFIX}${peerDeviceId}`;
+}
+
+/** Wipes EVERY piece of this browser's local Double Ratchet state: the
+ * signing identity, the current and retired signed prekeys, the one-time
+ * prekey stash, and every cached per-peer session (there's no registry of
+ * which peer device ids exist locally, so this scans for the
+ * `SESSION_STORAGE_KEY_PREFIX` prefix rather than tracking them).
+ *
+ * Called by `recovery.ts` alongside `crypto.ts`'s own
+ * `forgetLocalDeviceIdentity` when it detects that a DIFFERENT account has
+ * just logged in on this browser than whoever it was last used for -- see
+ * `crypto.ts`'s `ownerMatchesCurrentUser` for the full scenario. This
+ * module's signing identity is deliberately independent of `crypto.ts`'s
+ * own keypair (see this file's "Identity & prekey lifecycle" section
+ * header comment: generated once per BROWSER, never regenerated just
+ * because the core identity keypair changes) -- which is exactly why
+ * clearing `crypto.ts`'s identity alone would NOT be enough to stop a
+ * second account from inheriting this module's signing/prekey material
+ * too. Safe to call even if `ensureRatchetReady()` was never run on this
+ * browser (every removal is a no-op against a key that was never set). */
+export function forgetLocalRatchetIdentity(): void {
+  try {
+    localStorage.removeItem(SIGNING_PUBLIC_KEY_STORAGE_KEY);
+    localStorage.removeItem(SIGNING_PRIVATE_KEY_STORAGE_KEY);
+    localStorage.removeItem(SIGNED_PREKEY_PUBLIC_KEY_STORAGE_KEY);
+    localStorage.removeItem(SIGNED_PREKEY_PRIVATE_KEY_STORAGE_KEY);
+    localStorage.removeItem(SIGNED_PREKEY_CREATED_AT_STORAGE_KEY);
+    localStorage.removeItem(SIGNED_PREKEY_RETIRED_STORAGE_KEY);
+    localStorage.removeItem(ONE_TIME_PREKEYS_STORAGE_KEY);
+    const sessionKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(SESSION_STORAGE_KEY_PREFIX)) sessionKeys.push(key);
+    }
+    for (const key of sessionKeys) localStorage.removeItem(key);
+  } catch {
+    /* best-effort, same as every other local write in this module */
+  }
+  sessionLocks.clear();
 }
 
 /** Structural sanity check for a value that's about to be trusted as a

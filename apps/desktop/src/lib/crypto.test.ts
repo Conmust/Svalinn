@@ -164,3 +164,73 @@ describe('ensureDeviceKeypair cross-tab setup leadership (confidentiality follow
     expect(registeredDevices).toHaveLength(1);
   });
 });
+
+// Regression tests for the cross-account device-identity leak: a shared
+// computer where one account logs out and a DIFFERENT one logs in, without
+// browser storage ever being cleared in between, would otherwise silently
+// hand the new account's session the previous account's device keypair --
+// see `ownerMatchesCurrentUser`'s doc comment in `crypto.ts` for the full
+// scenario, and `recovery.ts`'s `forgetStaleIdentityFromPreviousAccount`
+// for the orchestration that also extends this to `ratchet.ts`'s identity
+// and `message-history.ts`'s cache.
+describe('ensureDeviceKeypair does not leak across accounts on a shared browser', () => {
+  beforeEach(() => {
+    registerDeviceGate = null;
+    registeredDevices = [];
+    nextDeviceId = 1;
+  });
+
+  it('a second account logging in on the same storage gets its own fresh keypair, not the first account\'s', async () => {
+    const storage = new FakeLocalStorage();
+    storage.setItem('user', JSON.stringify({ id: 'user-a', username: 'alice', email: 'a@example.com' }));
+
+    const alicesTab = await freshTab(storage);
+    const alicesKeypair = await alicesTab.ensureDeviceKeypair();
+    expect(registeredDevices).toHaveLength(1);
+    expect(alicesTab.storedDeviceOwnerUserId()).toBe('user-a');
+
+    // Alice logs out (clearSession only touches token/refresh_token/user,
+    // never the e2ee keys -- this test doesn't even need to simulate that
+    // precisely, since the point is storage is untouched either way) and
+    // Bob logs in on the same install.
+    storage.setItem('user', JSON.stringify({ id: 'user-b', username: 'bob', email: 'b@example.com' }));
+    const bobsTab = await freshTab(storage);
+
+    // Without the owner check, this would just return Alice's keypair.
+    const bobsKeypair = await bobsTab.ensureDeviceKeypair();
+
+    expect(bobsKeypair).not.toEqual(alicesKeypair);
+    expect(bobsKeypair.deviceId).toBe('device-2');
+    expect(registeredDevices).toHaveLength(2);
+    expect(bobsTab.storedDeviceOwnerUserId()).toBe('user-b');
+  });
+
+  it('forgetLocalDeviceIdentity wipes the keypair, device id, and owner marker outright', async () => {
+    const storage = new FakeLocalStorage();
+    storage.setItem('user', JSON.stringify({ id: 'user-a' }));
+    const tab = await freshTab(storage);
+    await tab.ensureDeviceKeypair();
+
+    expect(tab.hasLocalKeypair()).toBe(true);
+    tab.forgetLocalDeviceIdentity();
+    expect(tab.hasLocalKeypair()).toBe(false);
+    expect(tab.storedDeviceOwnerUserId()).toBeNull();
+  });
+
+  it('a pre-existing keypair with no recorded owner is grandfathered in (no forced re-registration)', async () => {
+    const storage = new FakeLocalStorage();
+    // Simulates an install from before the owner marker existed.
+    storage.setItem('user', JSON.stringify({ id: 'user-a' }));
+    const firstTab = await freshTab(storage);
+    const original = await firstTab.ensureDeviceKeypair();
+    // Strip the owner marker back out, as a pre-upgrade install would have.
+    storage.removeItem('svalinn_e2ee_owner_user_id');
+
+    storage.setItem('user', JSON.stringify({ id: 'user-b' }));
+    const secondTab = await freshTab(storage);
+    const stillTheSame = await secondTab.ensureDeviceKeypair();
+
+    expect(stillTheSame).toEqual(original);
+    expect(registeredDevices).toHaveLength(1);
+  });
+});
