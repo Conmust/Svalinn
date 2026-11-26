@@ -348,4 +348,48 @@ describe('Ratchet smoke tests (fast, broad happy-path sanity)', () => {
     activate(alice);
     await expect(alice.ratchet.encryptMessage(bareDeviceId, 'hi')).rejects.toThrow();
   });
+
+  // Migration 0044 / the DM & channel components' `wrapAttachmentKeyForDevice`:
+  // an attachment's symmetric file key is now wrapped through the ratchet
+  // (when the recipient device supports it) by base64-encoding the raw key
+  // bytes and passing that string through `encryptMessage`/`decryptMessage`
+  // exactly as if it were ordinary message text -- `ratchet.ts` itself has
+  // no dedicated "key wrap" API, deliberately, since it doesn't need one.
+  // These two tests pin that approach at the `ratchet.ts` level, since
+  // there's no component-level test harness in this codebase to exercise
+  // `wrapAttachmentKeyForDevice`/`ensureAttachmentDecrypted` directly.
+  it('a base64-encoded symmetric key round-trips through the ratchet exactly like message text', async () => {
+    const alice = await createDeviceHarness();
+    const bob = await createDeviceHarness();
+
+    // A real `crypto_secretbox` key is 32 random bytes -- base64-encode it
+    // the same way `wrapAttachmentKeyForDevice` does (`ratchet.ts`'s own
+    // `b64` helper), deliberately including bytes across the whole 0-255
+    // range so the encoded string exercises every base64 output character,
+    // not just a convenient subset.
+    const fileKey = new Uint8Array(32).map((_, i) => (i * 37 + 11) % 256);
+    const fileKeyB64 = alice.ratchet.b64(fileKey);
+
+    const envelope = await on(alice, ({ ratchet }) => ratchet.encryptMessage(bob.deviceId, fileKeyB64));
+    const decryptedB64 = await on(bob, ({ ratchet }) => ratchet.decryptMessage(alice.deviceId, envelope));
+    expect(decryptedB64).toBe(fileKeyB64);
+
+    const roundTrippedKey = bob.ratchet.fromB64(decryptedB64 as string);
+    expect(Array.from(roundTrippedKey)).toEqual(Array.from(fileKey));
+  });
+
+  it('wrapping an attachment key for a device with no published prekeys still reports RatchetNotSupportedError, the same as text', async () => {
+    const alice = await createDeviceHarness();
+    vi.resetModules();
+    const bareStorage = new FakeLocalStorage();
+    (globalThis as unknown as { localStorage: FakeLocalStorage }).localStorage = bareStorage;
+    const bareCrypto = await import('./crypto');
+    const { deviceId: bareDeviceId } = await bareCrypto.ensureDeviceKeypair();
+
+    const fileKey = new Uint8Array(32).fill(7);
+    activate(alice);
+    await expect(alice.ratchet.encryptMessage(bareDeviceId, alice.ratchet.b64(fileKey))).rejects.toBeInstanceOf(
+      alice.ratchet.RatchetNotSupportedError
+    );
+  });
 });

@@ -18,7 +18,7 @@
     CryptoLibraryError,
     DeviceSetupError,
   } from '../lib/crypto';
-  import { encryptMessage, decryptMessage, RatchetNotSupportedError, type RatchetEnvelope } from '../lib/ratchet';
+  import { encryptMessage, decryptMessage, RatchetNotSupportedError, b64, fromB64, type RatchetEnvelope } from '../lib/ratchet';
   import { getCachedPlaintext, cachePlaintext } from '../lib/message-history';
   import { activeDeviceKeypair, deviceEncryptionReady } from '../lib/recovery';
   import { fetchParticipantDevices, type ParticipantDevice } from '../lib/devices';
@@ -267,14 +267,40 @@
     }
   }
 
+  /** Resolves a `MessageRecipientEntry.sender_public_key` back to the
+   * sending device's id -- `ratchet.ts`'s `decryptMessage` is keyed by
+   * device id, not public key, since a session is per (device, peer
+   * device), not per public key. Shared by both the message-text and
+   * attachment-key ratchet-decrypt paths below, since both need exactly
+   * this same lookup-with-one-retry. */
+  async function resolveSenderDeviceId(senderPublicKey: string): Promise<string | undefined> {
+    let senderDeviceId = participantDevices.find(d => d.public_key === senderPublicKey)?.device_id;
+    if (!senderDeviceId) {
+      // `participantDevices` is a point-in-time snapshot (fetched once on
+      // mount/conversation-select -- see `loadParticipantDevices`), with
+      // no live push when the OTHER participant registers a device mid-
+      // session: there's no "device added" WebSocket event, unlike every
+      // other piece of conversation state here. The SEND path already
+      // self-heals from this exact staleness (a 400 naming the unknown
+      // device_id triggers a `loadParticipantDevices()` retry -- see
+      // `isStaleDeviceListError` below); the RECEIVE path had no
+      // equivalent, so a message legitimately encrypted for a just-added
+      // sender device looked permanently undecryptable even though
+      // nothing is actually wrong -- a fresh fetch would have resolved
+      // it. One retry, not a loop: if the device still isn't known after
+      // refetching, it really doesn't exist (removed, or a bogus
+      // sender_public_key), and this message stays undecryptable.
+      await loadParticipantDevices();
+      senderDeviceId = participantDevices.find(d => d.public_key === senderPublicKey)?.device_id;
+    }
+    return senderDeviceId;
+  }
+
   /** Decrypts one ratchet-encrypted message's text and stores the result in
    * `ratchetDecryptState`, triggering `toDisplayMessage` to re-render it on
    * the next reactive pass (see the `messages` derivation below, which
    * reads `ratchetDecryptState` directly so Svelte tracks it as a
-   * dependency). Needs `participantDevices` to map the entry's
-   * `sender_public_key` back to a device id -- `ratchet.ts`'s
-   * `decryptMessage` is keyed by device id, not public key, since a
-   * session is per (device, peer device), not per public key. */
+   * dependency). */
   async function ensureRatchetMessageDecrypted(message: ConversationMessage, mine: MessageRecipientEntry): Promise<void> {
     ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'loading' } };
     try {
@@ -293,25 +319,7 @@
         return;
       }
 
-      let senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
-      if (!senderDeviceId) {
-        // `participantDevices` is a point-in-time snapshot (fetched once on
-        // mount/conversation-select -- see `loadParticipantDevices`), with
-        // no live push when the OTHER participant registers a device mid-
-        // session: there's no "device added" WebSocket event, unlike every
-        // other piece of conversation state here. The SEND path already
-        // self-heals from this exact staleness (a 400 naming the unknown
-        // device_id triggers a `loadParticipantDevices()` retry -- see
-        // `isStaleDeviceListError` below); the RECEIVE path had no
-        // equivalent, so a message legitimately encrypted for a just-added
-        // sender device looked permanently undecryptable even though
-        // nothing is actually wrong -- a fresh fetch would have resolved
-        // it. One retry, not a loop: if the device still isn't known after
-        // refetching, it really doesn't exist (removed, or a bogus
-        // sender_public_key), and this message stays undecryptable.
-        await loadParticipantDevices();
-        senderDeviceId = participantDevices.find(d => d.public_key === mine.sender_public_key)?.device_id;
-      }
+      const senderDeviceId = await resolveSenderDeviceId(mine.sender_public_key);
       if (!senderDeviceId) {
         ratchetDecryptState = { ...ratchetDecryptState, [message.id]: { status: 'done', text: null } };
         return;
@@ -410,7 +418,43 @@
         fail(SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER);
         return;
       }
-      const fileKey = unwrapFileKey(mine.attachment_key_ciphertext, mine.attachment_key_nonce, mine.sender_public_key, myPrivateKey);
+
+      // The ratchet's message keys are single-use and deleted the instant
+      // they're consumed (forward secrecy -- see `ratchet.ts`'s header
+      // comment), so a SECOND attempt to ratchet-decrypt this same
+      // attachment key would fail outright, the exact same reason
+      // `ensureRatchetMessageDecrypted` checks the local history cache
+      // first. Reuses that same cache, under a key namespaced so it never
+      // collides with this message's own text-plaintext cache entry.
+      const attachmentKeyCacheId = `${message.id}:attachment-key`;
+      let fileKey: Uint8Array | null = null;
+      const cachedKeyB64 = await getCachedPlaintext(attachmentKeyCacheId);
+      if (cachedKeyB64 !== null) {
+        fileKey = fromB64(cachedKeyB64);
+      } else if (mine.attachment_key_ratchet_header_json) {
+        const senderDeviceId = await resolveSenderDeviceId(mine.sender_public_key);
+        if (senderDeviceId) {
+          const header = JSON.parse(mine.attachment_key_ratchet_header_json);
+          const envelope: RatchetEnvelope = {
+            dh: header.dh,
+            pn: header.pn,
+            n: header.n,
+            ciphertext: mine.attachment_key_ciphertext,
+            nonce: mine.attachment_key_nonce,
+            initial: header.initial,
+          };
+          const keyB64 = await decryptMessage(senderDeviceId, envelope);
+          if (keyB64 !== null) {
+            await cachePlaintext(attachmentKeyCacheId, keyB64);
+            fileKey = fromB64(keyB64);
+          }
+        }
+      } else {
+        // Legacy static wrap (migration 0032, pre-0044): the raw key
+        // bytes, wrapped directly with `crypto_box_easy`, not through the
+        // ratchet at all.
+        fileKey = unwrapFileKey(mine.attachment_key_ciphertext, mine.attachment_key_nonce, mine.sender_public_key, myPrivateKey);
+      }
       if (!fileKey) {
         fail(DECRYPT_FAILED_PLACEHOLDER);
         return;
@@ -635,6 +679,39 @@
     }
   }
 
+  // Wraps an attachment's symmetric file key for one recipient device,
+  // preferring the Double Ratchet exactly like `encryptForDevice` does for
+  // text, and falling back to the legacy static `wrapFileKey` scheme
+  // (`crypto.ts`, raw-bytes `crypto_box_easy`) the same way too -- see
+  // migration 0044. This is deliberately a SEPARATE function from
+  // `encryptForDevice`, not a shared payload-agnostic helper: its static
+  // fallback must keep using `wrapFileKey`'s raw-byte wire format, not
+  // `encryptForRecipient`'s UTF-8-string format `encryptForDevice` falls
+  // back to for text -- those are different byte layouts on the wire, and
+  // `attachment_key_ratchet_header_json` being absent is the ONLY signal
+  // `unwrapFileKey` (below) has for "this is the legacy raw-byte format";
+  // sharing one fallback path between the two would silently break that
+  // discriminator for every non-ratchet-supporting recipient.
+  async function wrapAttachmentKeyForDevice(
+    d: ParticipantDevice,
+    fileKey: Uint8Array
+  ): Promise<{ ciphertext: string; nonce: string; ratchetHeaderJson?: string }> {
+    if (d.device_id === myDeviceId) {
+      return wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+    }
+    try {
+      const envelope = await encryptMessage(d.device_id, b64(fileKey));
+      return {
+        ciphertext: envelope.ciphertext,
+        nonce: envelope.nonce,
+        ratchetHeaderJson: JSON.stringify({ dh: envelope.dh, pn: envelope.pn, n: envelope.n, initial: envelope.initial }),
+      };
+    } catch (err) {
+      if (!(err instanceof RatchetNotSupportedError)) throw err;
+      return wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
+    }
+  }
+
   // Encrypts `content` and sends it to EVERY device in `devices` --
   // including this device's own current device. There's no
   // special-casing of "my own device" here:
@@ -679,18 +756,24 @@
     const encryptedBlob = new File([fileCiphertext.slice()], file.name, { type: 'application/octet-stream' });
     const uploaded = await uploadFile(encryptedBlob);
 
-    // The attachment's wrapped file key stays on the legacy per-device
-    // X25519 scheme regardless of whether the message TEXT goes through
-    // the ratchet -- it's a one-shot key wrap for a blob that's already
-    // uploaded and shared across every recipient, not an evolving message
-    // stream, so there's no forward-secrecy benefit to ratcheting it, and
-    // keeping it independent avoids coupling the attachment path to
-    // whether a session happens to exist yet.
+    // The attachment's symmetric file key is wrapped once per recipient
+    // device via `wrapAttachmentKeyForDevice`, which prefers the ratchet
+    // (forward secrecy + post-compromise security for the key wrap, not
+    // just the text) and falls back to the legacy static scheme exactly
+    // like text does -- see migration 0044 and that function's doc
+    // comment. The underlying FILE blob itself is still only ever
+    // encrypted once, shared across every recipient -- only the small key
+    // is duplicated per device, same hybrid-encryption shape as before.
     const encryptedFor = await Promise.all(
       devices.map(async d => {
         const textResult = await encryptForDevice(d, content);
-        const wrapped = wrapFileKey(fileKey, d.public_key, myPrivateKey as string);
-        return { ...textResult, attachmentKeyCiphertext: wrapped.ciphertext, attachmentKeyNonce: wrapped.nonce };
+        const keyWrap = await wrapAttachmentKeyForDevice(d, fileKey);
+        return {
+          ...textResult,
+          attachmentKeyCiphertext: keyWrap.ciphertext,
+          attachmentKeyNonce: keyWrap.nonce,
+          attachmentKeyRatchetHeaderJson: keyWrap.ratchetHeaderJson,
+        };
       })
     );
 
@@ -711,11 +794,20 @@
   // open) -- the server rejects the whole send with a 400 naming the bad
   // `device_id` in that case (see `send_fanout_message`'s validation).
   function isStaleDeviceListError(e: unknown): boolean {
+    if (!(e instanceof SendDirectMessageError) || e.status !== 400 || !e.serverMessage) return false;
+    // Two distinct validation failures both mean the same thing here --
+    // `participantDevices` is stale -- and the server's wording differs
+    // between them (see `conversations.rs`'s two checks): a device that's
+    // been removed/revoked produces "...a device_id that doesn't
+    // belong...", while a NEW device that was added since the list was
+    // last loaded (the more common race -- the other participant just
+    // added a device) produces "...must contain exactly every
+    // currently-registered device...; missing: [...]", which never
+    // contains the literal substring "device_id" at all. Both need to
+    // trigger the same reload-and-retry below.
     return (
-      e instanceof SendDirectMessageError &&
-      e.status === 400 &&
-      !!e.serverMessage &&
-      e.serverMessage.includes('device_id')
+      e.serverMessage.includes('device_id') ||
+      e.serverMessage.includes('must contain exactly every currently-registered device')
     );
   }
 

@@ -450,6 +450,18 @@ pub async fn create_message(
                 )));
             }
         }
+        if let Some(header) = &r.attachment_key_ratchet_header_json {
+            if !has_attachment {
+                return Err(AppError::BadRequest(
+                    "attachment_key_ratchet_header_json must not be set without attachment_url".into(),
+                ));
+            }
+            if header.len() > MAX_RATCHET_HEADER_JSON_CHARS {
+                return Err(AppError::BadRequest(format!(
+                    "attachment_key_ratchet_header_json in encrypted_for can be at most {MAX_RATCHET_HEADER_JSON_CHARS} characters"
+                )));
+            }
+        }
     }
 
     let device_ids: Vec<Uuid> = payload.encrypted_for.iter().map(|r| r.device_id).collect();
@@ -537,7 +549,7 @@ pub async fn create_message(
 
     for r in &payload.encrypted_for {
         sqlx::query(
-            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO message_recipients (message_id, device_id, ciphertext, nonce, sender_public_key, attachment_key_ciphertext, attachment_key_nonce, ratchet_header_json, attachment_key_ratchet_header_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(msg_id)
         .bind(r.device_id)
@@ -547,6 +559,7 @@ pub async fn create_message(
         .bind(&r.attachment_key_ciphertext)
         .bind(&r.attachment_key_nonce)
         .bind(&r.ratchet_header_json)
+        .bind(&r.attachment_key_ratchet_header_json)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -868,6 +881,7 @@ mod tests {
             attachment_key_ciphertext: None,
             attachment_key_nonce: None,
             ratchet_header_json: None,
+            attachment_key_ratchet_header_json: None,
         }
     }
 
@@ -914,6 +928,106 @@ mod tests {
         .0;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].recipients.len(), 1, "the history endpoint should return this device's own ciphertext");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Migration 0044: a channel attachment's symmetric file key can be
+    /// wrapped through the ratchet (`attachment_key_ratchet_header_json`
+    /// set) instead of the legacy static scheme -- the server stores and
+    /// returns it as opaque bytes either way, same as the DM path tested
+    /// in `conversations.rs`.
+    #[tokio::test]
+    async fn fanout_attachment_round_trips_ratchet_wrapped_key_and_header() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 10).await;
+
+        let ratchet_header = r#"{"dh":"dh-bytes","pn":0,"n":1}"#;
+        let created = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: Some("/uploads/photo.png".into()),
+                attachment_filename: Some("photo.png".into()),
+                attachment_size: Some(1234),
+                attachment_mime_type: Some("image/png".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                encrypted_for: vec![EncryptedRecipient {
+                    device_id: device,
+                    ciphertext: "ciphertext".into(),
+                    nonce: "nonce".into(),
+                    attachment_key_ciphertext: Some("ratchet-wrapped-key".into()),
+                    attachment_key_nonce: Some("ratchet-wrap-nonce".into()),
+                    ratchet_header_json: None,
+                    attachment_key_ratchet_header_json: Some(ratchet_header.into()),
+                }],
+                sender_device_id: device,
+            }),
+        )
+        .await
+        .expect("a fan-out send with a ratchet-wrapped attachment key should succeed")
+        .0;
+
+        assert_eq!(created.recipients[0].attachment_key_ciphertext.as_deref(), Some("ratchet-wrapped-key"));
+        assert_eq!(created.recipients[0].attachment_key_ratchet_header_json.as_deref(), Some(ratchet_header));
+
+        let history = get_channel_messages(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(HistoryQuery { before: None, limit: None, device_id: Some(device) }),
+        )
+        .await
+        .expect("fetching channel history should succeed")
+        .0;
+        let found = history.iter().find(|m| m.id == created.id).expect("message should appear");
+        assert_eq!(found.recipients[0].attachment_key_ratchet_header_json.as_deref(), Some(ratchet_header));
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// `attachment_key_ratchet_header_json` set without `attachment_url`
+    /// is rejected for channel messages too -- same validation as the DM
+    /// path (`conversations.rs`'s identical test).
+    #[tokio::test]
+    async fn fanout_rejects_attachment_key_ratchet_header_without_attachment() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 11).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![EncryptedRecipient {
+                    device_id: device,
+                    ciphertext: "ciphertext".into(),
+                    nonce: "nonce".into(),
+                    attachment_key_ciphertext: None,
+                    attachment_key_nonce: None,
+                    ratchet_header_json: None,
+                    attachment_key_ratchet_header_json: Some(r#"{"dh":"x","pn":0,"n":0}"#.into()),
+                }],
+                sender_device_id: device,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;

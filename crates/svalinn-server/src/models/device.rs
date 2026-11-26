@@ -46,6 +46,15 @@ pub struct MessageRecipientPayload {
     /// sent via the legacy stateless per-device path (`crypto.ts`), and for
     /// every row that predates this feature. See migration 0040.
     pub ratchet_header_json: Option<String>,
+    /// Same idea as `ratchet_header_json` above, but for the ATTACHMENT
+    /// key instead of the message text: when present, `attachment_key_ciphertext`/
+    /// `attachment_key_nonce` hold the ratchet's own `ciphertext`/`nonce`
+    /// (the file key, base64-encoded, passed through `ratchet.ts`'s
+    /// `encryptMessage` as if it were ordinary message text) rather than
+    /// the legacy static `crypto_box_easy` wrap. `None` means those two
+    /// columns hold the legacy static wrap instead, or there's no
+    /// attachment at all. See migration 0044.
+    pub attachment_key_ratchet_header_json: Option<String>,
 }
 
 /// One entry of a fan-out send request: the server-assigned encrypting
@@ -69,6 +78,13 @@ pub struct EncryptedRecipient {
     /// encrypted via `ratchet.ts` rather than `crypto.ts`.
     #[serde(default)]
     pub ratchet_header_json: Option<String>,
+    /// See `MessageRecipientPayload::attachment_key_ratchet_header_json` --
+    /// the same opaque JSON blob, but for the wrapped attachment key
+    /// instead of the message ciphertext. Supplied by the client only when
+    /// `attachment_key_ciphertext`/`attachment_key_nonce` above are the
+    /// ratchet's own envelope fields rather than the legacy static wrap.
+    #[serde(default)]
+    pub attachment_key_ratchet_header_json: Option<String>,
 }
 
 /// One of a conversation's two participants' devices, as seen by a client

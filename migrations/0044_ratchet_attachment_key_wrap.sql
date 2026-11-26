@@ -1,0 +1,31 @@
+-- Extends `message_recipients`' attachment key wrap (0032) to optionally
+-- carry a Double Ratchet envelope instead of the legacy static per-device
+-- wrap (`crypto.ts`'s `wrapFileKey`, X25519 `crypto_box_easy`).
+--
+-- Until now, an attachment's symmetric file key was ALWAYS wrapped with
+-- the static scheme, unconditionally, even in a conversation whose
+-- message TEXT was fully protected by the ratchet (`ratchet.ts`). That's a
+-- real asymmetry: forward secrecy and post-compromise security were the
+-- whole point of the ratchet migration (0038-0040), but a device's
+-- long-term identity key being compromised at any point still
+-- retroactively decrypts every attachment ever sent, even one sent
+-- alongside perfectly forward-secret text in the same conversation.
+--
+-- This column mirrors 0040's `ratchet_header_json` exactly, but for the
+-- attachment key instead of the message text: when present, the EXISTING
+-- `attachment_key_ciphertext`/`attachment_key_nonce` columns (0032) are
+-- repurposed to hold the ratchet's own `ciphertext`/`nonce` -- the file key
+-- (base64-encoded) is simply the "plaintext" passed through
+-- `ratchet.ts`'s `encryptMessage`/`decryptMessage`, exactly like message
+-- text is, rather than a bespoke ratchet-aware wrap/unwrap pair. `NULL`
+-- means the legacy static wrap is in those same two columns instead --
+-- the same discriminator pattern `ratchet_header_json` already
+-- established for message ciphertext.
+--
+-- Additive and nullable: every row from before this migration, and every
+-- entry whose recipient device hasn't published ratchet prekeys yet (see
+-- `RatchetNotSupportedError`'s fallback in `encryptPayloadForDevice`), has
+-- NULL here and keeps using the static wrap exactly as before -- this is
+-- a strict widening of what the existing two columns can hold, not a
+-- breaking change to any already-stored row.
+ALTER TABLE message_recipients ADD COLUMN IF NOT EXISTS attachment_key_ratchet_header_json TEXT;
