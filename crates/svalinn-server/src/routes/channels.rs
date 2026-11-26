@@ -244,18 +244,25 @@ pub async fn delete_channel(
 
 /// GET /api/v1/channels/:channel_id/member-devices
 ///
-/// Every registered device of every CURRENT member of this channel's
-/// server -- what a client needs before composing an encrypted channel
-/// send (see `messages::create_message`'s `encrypted_for` completeness
-/// check, which this list must match exactly). Mirrors
-/// `conversations::get_participant_devices`, but scoped to server
-/// membership (`server_members`) rather than a fixed two-person
-/// conversation: this recipient set can be large and changes continuously
-/// as members join or leave, unlike a DM's fixed pair.
+/// Every registered device of every CURRENT member who can currently
+/// VIEW this channel -- what a client needs before composing an encrypted
+/// channel send (see `messages::create_message`'s `encrypted_for`
+/// completeness check, which this list must match exactly: scoped the
+/// same way, to `members_who_can_view`, not to raw server membership).
+/// Mirrors `conversations::get_participant_devices`, but scoped to this
+/// channel's current viewers rather than a fixed two-person conversation:
+/// this recipient set can be large and changes continuously as members
+/// join, leave, or gain/lose `VIEW_CHANNEL` on this specific channel,
+/// unlike a DM's fixed pair.
 ///
-/// A member who joins later simply has no row here for a message sent
-/// before they joined -- there is no backfill/re-share mechanism, by
-/// design (see the server-level E2EE PR description).
+/// A member who gains (or re-gains) `VIEW_CHANNEL` later simply has no
+/// row for a message sent before they could see this channel -- there is
+/// no backfill/re-share mechanism, by design (see the server-level E2EE
+/// PR description). Scoping this to channel viewers, not just server
+/// members, is what keeps a private channel's content keys from ever
+/// reaching a member's device in the first place if they can't see that
+/// channel -- see `create_message`'s doc comment for why that matters
+/// more than just gating the API read path.
 pub async fn get_channel_member_devices(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
@@ -263,18 +270,21 @@ pub async fn get_channel_member_devices(
 ) -> Result<Json<Vec<ParticipantDevice>>, AppError> {
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
+    let mut viewer_ids = members_who_can_view(&db, server_id, channel_id).await?;
+    if !viewer_ids.contains(&user_id) {
+        viewer_ids.push(user_id);
+    }
 
     let devices: Vec<ParticipantDevice> = sqlx::query_as(
         r#"
         SELECT dk.id AS device_id, dk.user_id, dk.public_key, dk.device_label, (dk.user_id = $1) AS is_me
         FROM device_keys dk
-        JOIN server_members sm ON sm.user_id = dk.user_id
-        WHERE sm.server_id = $2
+        WHERE dk.user_id = ANY($2)
         ORDER BY dk.created_at ASC
         "#,
     )
     .bind(user_id)
-    .bind(server_id)
+    .bind(&viewer_ids)
     .fetch_all(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
