@@ -25,6 +25,7 @@ use crate::extractors::auth::CurrentUser;
 use crate::models::device::{
     ConsumedSkippedKey, PrekeyBundle, PutRatchetSessionRequest, RatchetSessionPickle, ReportConsumedSkippedKeyRequest,
 };
+use crate::rate_limit::PREKEY_BUNDLE_FETCH_PER_TARGET_DEVICE;
 
 /// GET /api/v1/devices/:device_id/prekey-bundle
 ///
@@ -44,9 +45,19 @@ use crate::models::device::{
 /// two concurrent bootstraps can never be handed the same one-time prekey.
 pub async fn fetch_prekey_bundle(
     State(db): State<Database>,
-    CurrentUser(_user_id): CurrentUser,
+    CurrentUser(user_id): CurrentUser,
     Path(device_id): Path<Uuid>,
 ) -> Result<Json<PrekeyBundle>, AppError> {
+    // See `PREKEY_BUNDLE_FETCH_PER_TARGET_DEVICE`'s doc comment: this
+    // endpoint is open to any authenticated caller by design, but a
+    // successful fetch consumes a one-time prekey, so unlimited repeat
+    // fetches against the SAME target device would let any account drain
+    // that device's whole stash. Scoped per (caller, target device), so
+    // bootstrapping sessions with many different devices at once (joining
+    // a large channel) is never affected.
+    db.limits
+        .hit(&PREKEY_BUNDLE_FETCH_PER_TARGET_DEVICE, &format!("{user_id}:{device_id}"))?;
+
     let device_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device_keys WHERE id = $1)")
         .bind(device_id)
         .fetch_one(&db.pool)
@@ -409,6 +420,66 @@ mod tests {
 
         cleanup_test_user(&db, alice).await;
         cleanup_test_user(&db, bob).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_prekey_bundle_is_rate_limited_per_target_device() {
+        // Any authenticated caller may fetch any device's bundle (by
+        // design), but each fetch that finds a one-time prekey consumes
+        // it, so unlimited repeat fetches against the SAME target device
+        // would let an attacker drain its whole stash. This proves the
+        // limiter actually kicks in, and that it's scoped tightly enough
+        // (per caller+target device) to leave a DIFFERENT target
+        // completely unaffected.
+        let db = test_db().await;
+        let alice = create_test_user(&db).await;
+        let bob = create_test_user(&db).await;
+        let carol = create_test_user(&db).await;
+        let bob_device = register_test_device(&db, bob, 30, "Bob's Laptop").await;
+        let carol_device = register_test_device(&db, carol, 31, "Carol's Laptop").await;
+
+        let _ = upload_prekeys(
+            State(db.clone()),
+            CurrentUser(bob),
+            Path(bob_device),
+            Json(UploadPrekeysRequest {
+                prekeys: vec![PrekeyUpload { key_type: "signed".into(), public_key: fake_public_key(32), signature: Some(fake_public_key(33)) }],
+            }),
+        )
+        .await
+        .expect("uploading prekeys should succeed");
+
+        // Exhaust the per-(caller, target device) limit against Bob's device.
+        for i in 0..PREKEY_BUNDLE_FETCH_PER_TARGET_DEVICE.limit {
+            let _ = fetch_prekey_bundle(State(db.clone()), CurrentUser(alice), Path(bob_device))
+                .await
+                .unwrap_or_else(|e| panic!("fetch {i} should still be under the limit, got {e:?}"));
+        }
+        let blocked = fetch_prekey_bundle(State(db.clone()), CurrentUser(alice), Path(bob_device)).await;
+        assert!(
+            matches!(blocked, Err(AppError::TooManyRequests { .. })),
+            "the fetch just past the limit should be rate-limited, got {blocked:?}"
+        );
+
+        // The same caller fetching a DIFFERENT target device is a different
+        // subject key and must be completely unaffected.
+        let _ = upload_prekeys(
+            State(db.clone()),
+            CurrentUser(carol),
+            Path(carol_device),
+            Json(UploadPrekeysRequest {
+                prekeys: vec![PrekeyUpload { key_type: "signed".into(), public_key: fake_public_key(34), signature: Some(fake_public_key(35)) }],
+            }),
+        )
+        .await
+        .expect("uploading prekeys should succeed");
+        let _ = fetch_prekey_bundle(State(db.clone()), CurrentUser(alice), Path(carol_device))
+            .await
+            .expect("a different target device must not be affected by Bob's device being rate-limited");
+
+        cleanup_test_user(&db, alice).await;
+        cleanup_test_user(&db, bob).await;
+        cleanup_test_user(&db, carol).await;
     }
 
     #[tokio::test]

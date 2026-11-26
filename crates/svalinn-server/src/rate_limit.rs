@@ -50,6 +50,29 @@ pub const INVITES_PER_USER: Rule = Rule { name: "invite-user", limit: 20, window
 /// Wrong current passwords when changing email or password, per user.
 pub const REAUTH_FAILURES_PER_USER: Rule = Rule { name: "reauth-user", limit: 5, window: Duration::from_secs(15 * 60) };
 
+/// Prekey-bundle fetches from one caller against one SPECIFIC target
+/// device (`routes::ratchet::fetch_prekey_bundle`). That endpoint is
+/// deliberately open to any authenticated caller for any device id (a
+/// prekey is as public as an identity key, by design -- see its own doc
+/// comment), but each fetch that finds one still atomically consumes and
+/// marks it `consumed_at`, same as a legitimate handshake would. Without
+/// this, any authenticated account could repeatedly hit one victim
+/// device's bundle endpoint to drain its entire one-time-prekey stash
+/// (bounded at `MAX_LOCAL_ONE_TIME_PREKEYS` = 200 client-side) well before
+/// it naturally replenishes, degrading every future handshake with that
+/// device onto X3DH's weaker 3-DH-only fallback (reduced forward-secrecy
+/// margin for that one session, the same tradeoff an exhausted legitimate
+/// stash already accepts) -- not a confidentiality break on its own, but
+/// an availability/forward-secrecy-margin attack with no legitimate reason
+/// to need unlimited repeat fetches against the SAME device. Scoped to
+/// (caller, target device), not the caller alone, so it does not get in
+/// the way of the one genuinely bulk-legitimate case -- joining a large
+/// channel and bootstrapping a session with each of many DIFFERENT
+/// member devices at once, which this rule never touches since each is a
+/// different subject key.
+pub const PREKEY_BUNDLE_FETCH_PER_TARGET_DEVICE: Rule =
+    Rule { name: "prekey-bundle-target", limit: 30, window: Duration::from_secs(10 * 60) };
+
 /// Drop idle keys once the table holds this many.
 const PRUNE_AT: usize = 10_000;
 
