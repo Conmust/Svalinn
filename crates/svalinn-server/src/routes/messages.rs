@@ -132,7 +132,8 @@ async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Resu
 
 /// Author, server, channel, lock state and the current user's role for a
 /// channel message. Fails with NotFound if the message doesn't exist,
-/// Forbidden if the user isn't in the message's server.
+/// Forbidden if the user isn't in the message's server or can't view the
+/// message's specific channel.
 struct MessageContext {
     author_id: Uuid,
     server_id: Uuid,
@@ -142,6 +143,23 @@ struct MessageContext {
     role: String,
 }
 
+/// Every caller of this (edit/delete/lock/pin/hide a message, add/remove a
+/// reaction) targets one already-existing message by id rather than acting
+/// within a channel a client navigated to, so none of them had anywhere
+/// else to enforce `VIEW_CHANNEL` -- `get_channel_messages` and
+/// `create_message` check it themselves because they take a `channel_id`
+/// path param, but every route built on `message_context` used to stop at
+/// `require_member` (server membership) and never checked the *channel's*
+/// permission overwrites at all. That let a member denied `VIEW_CHANNEL`
+/// on a private channel via a role/member overwrite still mutate its
+/// messages -- delete them, edit them, lock/pin them, or react to them --
+/// as long as they had (or could otherwise obtain) a message id from
+/// before the overwrite was added, even though they can no longer `GET`
+/// the channel's history or see any of this live over the socket (the
+/// broadcast is already scoped to `VIEW_CHANNEL`-holders). Checked here,
+/// once, so every caller gets it: a site owner or server owner still
+/// bypasses it the same way `resolve_channel` always lets them bypass
+/// everything.
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
     let row: Option<(Uuid, Uuid, Uuid, bool, bool)> = sqlx::query_as(
         r#"
@@ -158,6 +176,7 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     let (author_id, server_id, channel_id, is_locked, is_encrypted) =
         row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
     let role = require_member(db, server_id, user_id).await?;
+    crate::permissions::require_channel_permission(db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
 
     Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, role })
 }
@@ -821,6 +840,7 @@ pub async fn edit_message(
 mod tests {
     use super::*;
     use crate::routes::devices::{register_device, RegisterDeviceRequest};
+    use crate::routes::reactions::{add_reaction, AddReactionRequest};
 
     async fn test_db() -> Database {
         dotenvy::dotenv().ok();
@@ -1329,6 +1349,133 @@ mod tests {
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
+    }
+
+    async fn add_server_moderator(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'moderator')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert moderator");
+    }
+
+    async fn deny_view_channel(db: &Database, channel_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel_id)
+            .bind(user_id)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+    }
+
+    async fn send_test_message(db: &Database, server: Uuid, channel: Uuid, sender: Uuid, sender_device: Uuid, other_devices: &[Uuid]) -> Uuid {
+        let _ = server;
+        let mut encrypted_for = vec![fake_recipient(sender_device)];
+        encrypted_for.extend(other_devices.iter().map(|d| fake_recipient(*d)));
+        create_message(
+            State(db.clone()),
+            CurrentSession { user_id: sender, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for,
+                sender_device_id: sender_device,
+            }),
+        )
+        .await
+        .expect("the send itself should succeed")
+        .0
+        .id
+    }
+
+    /// Before this fix, `message_context` (and therefore every route built
+    /// on it -- edit/delete/lock/pin/hide a message, add/remove a
+    /// reaction) checked only server membership, never the message's own
+    /// channel's `VIEW_CHANNEL` permission. A legacy "moderator" is
+    /// normally allowed to delete any message in the server via
+    /// `is_moderator`, but that must not reach into a channel they've been
+    /// specifically denied access to by a member overwrite -- the same
+    /// kind of carve-out `resolve_channel` is built to support everywhere
+    /// else.
+    #[tokio::test]
+    async fn delete_message_is_rejected_for_a_moderator_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let moderator = create_test_user(&db).await;
+        add_server_moderator(&db, server, moderator).await;
+        deny_view_channel(&db, channel, moderator).await;
+
+        let owner_device = register_test_device(&db, owner, 50).await;
+        let moderator_device = register_test_device(&db, moderator, 51).await;
+
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[moderator_device]).await;
+
+        let result = delete_message(State(db.clone()), CurrentUser(moderator), Path(message_id)).await;
+        assert!(
+            matches!(result, Err(AppError::Forbidden(_))),
+            "a moderator denied VIEW_CHANNEL on this channel must not be able to delete its messages, got {result:?}"
+        );
+
+        // Sanity check: the same moderator, NOT denied access, can still
+        // delete -- this isn't just broken for everyone.
+        sqlx::query("DELETE FROM channel_member_overwrites WHERE channel_id = $1 AND user_id = $2")
+            .bind(channel)
+            .bind(moderator)
+            .execute(&db.pool)
+            .await
+            .expect("removing the overwrite should succeed");
+        let result = delete_message(State(db.clone()), CurrentUser(moderator), Path(message_id)).await;
+        assert!(result.is_ok(), "a moderator WITH VIEW_CHANNEL should still be able to delete messages: {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, moderator).await;
+    }
+
+    /// Same gap, cheaper to trigger: an ordinary member (no special role at
+    /// all) denied `VIEW_CHANNEL` could still add or remove reactions on a
+    /// message in that channel, as long as they had a message id from
+    /// before the overwrite was added.
+    #[tokio::test]
+    async fn add_reaction_is_rejected_for_a_member_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+        deny_view_channel(&db, channel, blocked).await;
+
+        let owner_device = register_test_device(&db, owner, 52).await;
+        let blocked_device = register_test_device(&db, blocked, 53).await;
+
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[blocked_device]).await;
+
+        let result = add_reaction(
+            State(db.clone()),
+            CurrentUser(blocked),
+            Path(message_id),
+            Json(AddReactionRequest { emoji: "👍".to_string() }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::Forbidden(_))),
+            "a member denied VIEW_CHANNEL must not be able to react to messages in that channel, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, blocked).await;
     }
 }
