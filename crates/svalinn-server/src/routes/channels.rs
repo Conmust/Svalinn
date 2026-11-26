@@ -107,7 +107,7 @@ fn clean_name(name: &str) -> Result<&str, AppError> {
 /// Computed up front (before any mutation) so a channel_deleted broadcast
 /// still has someone to check permissions against: by delivery time the
 /// channel row, and its overwrites, no longer exist.
-async fn members_who_can_view(db: &Database, server_id: Uuid, channel_id: Uuid) -> Result<Vec<Uuid>, AppError> {
+pub(crate) async fn members_who_can_view(db: &Database, server_id: Uuid, channel_id: Uuid) -> Result<Vec<Uuid>, AppError> {
     let member_ids: Vec<Uuid> =
         sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
             .bind(server_id)

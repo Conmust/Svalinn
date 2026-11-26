@@ -130,21 +130,22 @@ async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Resu
     Ok(message)
 }
 
-/// Author, server, lock state and the current user's role for a channel message.
-/// Fails with NotFound if the message doesn't exist, Forbidden if the user isn't
-/// in the message's server.
+/// Author, server, channel, lock state and the current user's role for a
+/// channel message. Fails with NotFound if the message doesn't exist,
+/// Forbidden if the user isn't in the message's server.
 struct MessageContext {
     author_id: Uuid,
     server_id: Uuid,
+    channel_id: Uuid,
     is_locked: bool,
     is_encrypted: bool,
     role: String,
 }
 
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, bool, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, Uuid, Uuid, bool, bool)> = sqlx::query_as(
         r#"
-        SELECT m.user_id, c.server_id, COALESCE(m.is_locked, false), m.is_encrypted
+        SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted
         FROM messages m JOIN channels c ON m.channel_id = c.id
         WHERE m.id = $1 AND c.server_id IS NOT NULL
         "#,
@@ -154,11 +155,11 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (author_id, server_id, is_locked, is_encrypted) =
+    let (author_id, server_id, channel_id, is_locked, is_encrypted) =
         row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
     let role = require_member(db, server_id, user_id).await?;
 
-    Ok(MessageContext { author_id, server_id, is_locked, is_encrypted, role })
+    Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, role })
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -169,9 +170,34 @@ fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
     }
 }
 
-fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid) {
-    // Ignore the error: it only means nobody is connected.
-    let _ = db.message_tx.send(BroadcastMessage::to_server(event_type, payload, server_id));
+/// Broadcasts a channel-message event to exactly the members who currently
+/// hold `VIEW_CHANNEL` on `channel_id` -- NEVER to the whole server
+/// unconditionally. This matters a great deal more here than it first looks:
+/// for `new_message`, `payload` carries every recipient device's actual
+/// fan-out ciphertext (see `fetch_message`'s doc comment) -- a member denied
+/// `VIEW_CHANNEL` on a "private" channel (via a role/member overwrite)
+/// already can't `GET` its history (`get_channel_messages` checks the same
+/// permission), but a plain server-wide broadcast would have handed them
+/// their own already-decryptable wrapped ciphertext live over the
+/// WebSocket anyway, with their own device's private key being all that's
+/// needed to read it -- completely bypassing the "private channel" they're
+/// supposed to be excluded from, the moment a message is sent while
+/// they're connected. `channels::create_channel`/`rename_channel`/
+/// `delete_channel` already scope their own broadcasts this same way; this
+/// closes the same gap for messages, edits, deletes, locks, pins and
+/// reactions. On a lookup failure, broadcasts to nobody rather than falling
+/// back to everyone -- a missed live update is recoverable (the next
+/// history fetch catches up); an over-broadcast isn't.
+async fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, server_id: Uuid, channel_id: Uuid) {
+    let recipients = match crate::routes::channels::members_who_can_view(db, server_id, channel_id).await {
+        Ok(recipients) => recipients,
+        Err(e) => {
+            eprintln!("Failed to compute channel viewers for a {event_type} broadcast: {e}");
+            return;
+        }
+    };
+    // Ignore the send error: it only means nobody is connected.
+    let _ = db.message_tx.send(BroadcastMessage::to_users(event_type, payload, recipients));
 }
 
 /// Longest message content accepted.
@@ -571,9 +597,11 @@ pub async fn create_message(
 
     // Broadcast every recipient's ciphertext; each connected client filters
     // down to its own device (and signs the stored attachment path for
-    // itself) client-side.
+    // itself) client-side. Scoped to members who can currently view this
+    // channel -- see `broadcast`'s own doc comment for why that matters far
+    // more here than for an ordinary event.
     let broadcast_payload = serde_json::to_value(&message).map_err(|e| AppError::Internal(e.to_string()))?;
-    broadcast(&db, "new_message", broadcast_payload, server_id);
+    broadcast(&db, "new_message", broadcast_payload, server_id, channel_id).await;
 
     sign_opt(&mut message.attachment_url, user_id, session_id);
     sign_opt(&mut message.avatar_url, user_id, session_id);
@@ -609,7 +637,7 @@ pub async fn delete_message(
         let _ = tokio::fs::remove_file(url.trim_start_matches('/')).await; // already gone is fine
     }
 
-    broadcast(&db, "message_deleted", serde_json::json!({ "message_id": message_id }), ctx.server_id);
+    broadcast(&db, "message_deleted", serde_json::json!({ "message_id": message_id }), ctx.server_id, ctx.channel_id).await;
 
     Ok(Json(()))
 }
@@ -646,7 +674,7 @@ async fn set_locked(db: Database, user_id: Uuid, message_id: Uuid, locked: bool)
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let payload = serde_json::json!({ "id": message_id, "is_locked": locked });
-    broadcast(&db, "message_updated", payload.clone(), ctx.server_id);
+    broadcast(&db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
     Ok(Json(payload))
 }
 
@@ -680,7 +708,7 @@ async fn set_pinned(db: Database, user_id: Uuid, message_id: Uuid, pinned: bool)
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let payload = serde_json::json!({ "id": message_id, "is_pinned": pinned });
-    broadcast(&db, "message_updated", payload.clone(), ctx.server_id);
+    broadcast(&db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
     Ok(Json(payload))
 }
 
@@ -725,7 +753,7 @@ pub async fn unhide_message(
 pub(crate) async fn broadcast_reactions(db: &Database, message_id: Uuid, user_id: Uuid, server_id: Uuid) -> Result<serde_json::Value, AppError> {
     let message = fetch_message(db, message_id, user_id).await?;
     let payload = serde_json::json!({ "id": message_id, "reactions": message.reactions });
-    broadcast(db, "message_updated", payload.clone(), server_id);
+    broadcast(db, "message_updated", payload.clone(), server_id, message.channel_id).await;
     Ok(payload)
 }
 
@@ -785,7 +813,7 @@ pub async fn edit_message(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let update = serde_json::json!({ "id": message_id, "content": payload.content, "is_edited": true });
-    broadcast(&db, "message_updated", update.clone(), ctx.server_id);
+    broadcast(&db, "message_updated", update.clone(), ctx.server_id, ctx.channel_id).await;
     Ok(Json(update))
 }
 
@@ -1217,5 +1245,90 @@ mod tests {
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
+    }
+
+    /// Regression test for a bug found in a fresh adversarial audit: the
+    /// `new_message` WebSocket broadcast used to go to every member of the
+    /// server unconditionally (`BroadcastMessage::to_server`), carrying each
+    /// recipient device's actual fan-out ciphertext (see `fetch_message`).
+    /// A member explicitly denied `VIEW_CHANNEL` on a channel via a
+    /// member-level overwrite -- a "private" channel -- already couldn't
+    /// `GET` its history, but would still receive their own
+    /// already-decryptable wrapped ciphertext live over the socket the
+    /// moment anyone sent a message there, completely bypassing the
+    /// channel's privacy with nothing more than an open connection and
+    /// their own device key. This asserts the broadcast is scoped to
+    /// current viewers only, the same way `channels::create_channel`'s own
+    /// broadcast already is.
+    #[tokio::test]
+    async fn new_message_broadcast_excludes_a_member_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+
+        // Deny VIEW_CHANNEL to `blocked` specifically on this channel --
+        // a member-level overwrite applies regardless of whether this
+        // server has any role rows at all (this test fixture has none; see
+        // `permissions::resolve_channel`).
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel)
+            .bind(blocked)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+
+        let owner_device = register_test_device(&db, owner, 40).await;
+        let viewer_device = register_test_device(&db, viewer, 41).await;
+        let blocked_device = register_test_device(&db, blocked, 42).await;
+
+        let mut rx = db.message_tx.subscribe();
+
+        let _ = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                // Completeness still requires every current member's
+                // device, `blocked`'s included -- see `create_message`'s own
+                // doc comment on why VIEW_CHANNEL doesn't shrink this list.
+                // What must change is who the broadcast of it reaches.
+                encrypted_for: vec![
+                    fake_recipient(owner_device),
+                    fake_recipient(viewer_device),
+                    fake_recipient(blocked_device),
+                ],
+                sender_device_id: owner_device,
+            }),
+        )
+        .await
+        .expect("the send itself should still succeed")
+        .0;
+
+        let broadcast = rx.try_recv().expect("a new_message event should have been broadcast");
+        assert_eq!(broadcast.event_type, "new_message");
+        let recipients = broadcast.to_users.expect("new_message must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&owner), "the sender can see their own channel");
+        assert!(recipients.contains(&viewer), "a member with VIEW_CHANNEL must still receive the live update");
+        assert!(
+            !recipients.contains(&blocked),
+            "a member denied VIEW_CHANNEL must not receive the message's ciphertext live over the socket"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
     }
 }
