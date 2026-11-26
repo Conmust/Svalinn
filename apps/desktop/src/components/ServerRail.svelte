@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { wsClient } from '../lib/websocket';
-  import { getAuthHeaders, apiFetch, fileUrl, apiBase } from '../lib/api';
+  import { getAuthHeaders, apiFetch, fileUrl, apiBase, endSession } from '../lib/api';
   import { autofocus } from '../lib/actions';
 
   const dispatch = createEventDispatcher();
@@ -101,9 +101,11 @@
         dispatch('serverSelected', servers[0].id);
       }
     } else if (response.status === 401) {
-      // Token is invalid, force logout
-      localStorage.clear();
-      location.reload();
+      // Token is invalid, force logout. Only the session (token/refresh_token/
+      // user) -- not a blanket localStorage.clear(), which would also wipe
+      // this device's E2EE identity (keypair, ratchet signing key, sessions)
+      // and force it to re-establish encryption with every peer.
+      endSession('Session expired');
     }
   } catch (e) {
     console.error('Failed to load servers:', e);
