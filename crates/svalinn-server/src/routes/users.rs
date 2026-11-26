@@ -101,6 +101,11 @@ pub async fn update_avatar(
     // A path not of ours (an external URL) or a freshly-uploaded one that
     // isn't referenced anywhere yet is unaffected.
     if let Some(path) = &avatar_url {
+        if !crate::files::is_safe_external_url(path) {
+            return Err(AppError::BadRequest(
+                "avatar_url must be one of your own uploaded files or an http(s) URL".into(),
+            ));
+        }
         if crate::files::is_stored_path(path)
             && crate::files::is_file_used_elsewhere(&db, path).await.map_err(|e| AppError::Database(e.to_string()))?
         {
@@ -1264,6 +1269,27 @@ mod tests {
         .await
         .expect("an external avatar URL should be accepted, same as servers' icon_url");
         assert_eq!(result.0.avatar_url, Some("https://example.invalid/pic.png".to_string()), "an external URL is returned as-is, not signed");
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn update_avatar_rejects_a_javascript_url() {
+        // Avatars are rendered client-side straight into `fileUrl(...)`
+        // and then an `<img>`/link with no scheme check of its own -- a
+        // `javascript:` avatar_url would be a stored-XSS payload against
+        // every logged-in user who ever loads this profile (see
+        // `files::is_safe_external_url`'s doc comment).
+        let db = test_db().await;
+        let user = create_test_user(&db).await;
+
+        let result = update_avatar(
+            State(db.clone()),
+            CurrentSession { user_id: user, session_id: Uuid::new_v4() },
+            Json(UpdateAvatarRequest { avatar_url: Some("javascript:alert(document.cookie)".into()) }),
+        )
+        .await;
+        assert!(result.is_err(), "a javascript: avatar_url must be rejected");
 
         cleanup_test_user(&db, user).await;
     }

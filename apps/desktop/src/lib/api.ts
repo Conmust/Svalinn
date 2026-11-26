@@ -47,19 +47,40 @@ export function setServerUrl(input: string): string {
   return normalized;
 }
 
+/** Schemes `fileUrl` treats as already-absolute and safe to render directly
+ * into an `href`/`src`/`<source>`: `http(s):` for a signed server link or a
+ * genuine external URL (the server accepts and stores those for an avatar,
+ * server icon, or attachment -- see `files::is_safe_external_url` there),
+ * and `blob:` for a locally-decrypted attachment's object URL (see
+ * `ChatArea.svelte`/`DMChatArea.svelte`'s `ensureAttachmentDecrypted`, which
+ * substitutes one of these in place of `attachment_url` for an encrypted
+ * message -- always created locally via `URL.createObjectURL()`, never a
+ * value the server hands back). Deliberately an allow-list, not "has any
+ * scheme at all": this is rendered straight into a clickable link with no
+ * further check (see every `fileUrl(...)` call site), so treating, say, a
+ * `javascript:` URL the same as an `http:` one would let it run in this
+ * app's own origin -- with access to everything in `localStorage`, private
+ * keys included -- the moment someone clicked the resulting "attachment"
+ * link. The server already rejects a value like that outright before it's
+ * ever stored, but this is the one place every such value is about to be
+ * rendered, so it gets its own check too rather than trusting every past
+ * and future caller to have validated what it received.
+ */
+const SAFE_ABSOLUTE_FILE_URL_SCHEMES = /^(https?|blob):/i;
+
 /**
  * Full URL for a file link from the server. Uploaded files come as signed,
- * session-bound paths ("/api/v1/files/..."); external links are kept as
- * they are. Also passed a locally-decrypted attachment's `blob:` object
- * URL (see `ChatArea.svelte`/`DMChatArea.svelte`'s `ensureAttachmentDecrypted`,
- * which substitutes it in place of `attachment_url` for an encrypted
- * message) -- any URL that already has its own scheme (not just
- * http/https) is left alone rather than getting `apiBase()` glued onto
- * the front of it.
+ * session-bound paths ("/api/v1/files/..."); a safe external link (see
+ * `SAFE_ABSOLUTE_FILE_URL_SCHEMES`) is kept as it is. Anything else --
+ * including a relative `/uploads/...` path, but also anything that isn't
+ * recognized as a safe absolute URL at all -- gets `apiBase()` glued onto
+ * the front of it, which for a bare relative path produces the intended
+ * server-relative link, and for anything else just produces a harmless,
+ * non-executing string rather than rendering it as-is.
  */
 export function fileUrl(path: string | null | undefined): string {
   if (!path) return '';
-  return /^[a-z][a-z0-9+.-]*:/i.test(path) ? path : `${apiBase()}${path}`;
+  return SAFE_ABSOLUTE_FILE_URL_SCHEMES.test(path) ? path : `${apiBase()}${path}`;
 }
 
 /** Refresh this long before the access token expires. */

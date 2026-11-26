@@ -183,13 +183,22 @@ pub async fn update_server(
         }
     }
 
+    let icon_url = payload.icon_url.as_deref().map(stored_path);
+    if let Some(icon) = &icon_url {
+        if !crate::files::is_safe_external_url(icon) {
+            return Err(AppError::BadRequest(
+                "icon_url must be one of your own uploaded files or an http(s) URL".into(),
+            ));
+        }
+    }
+
     // Use COALESCE to update only the provided fields, keeping existing values for None
     sqlx::query(
         "UPDATE servers SET name = COALESCE($1, name), description = COALESCE($2, description), icon_url = COALESCE($3, icon_url) WHERE id = $4",
     )
     .bind(payload.name.as_deref().map(str::trim))
     .bind(&payload.description)
-    .bind(payload.icon_url.as_deref().map(stored_path))
+    .bind(&icon_url)
     .bind(server_id)
     .execute(&db.pool)
     .await
@@ -330,6 +339,74 @@ mod tests {
 
     async fn cleanup_test_server(db: &Database, server_id: Uuid) {
         let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    async fn create_test_server_with_admin(db: &Database, admin: Uuid) -> Uuid {
+        let server_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO servers (id, name, owner_id) VALUES ($1, 'Test Server', $2)")
+            .bind(server_id)
+            .bind(admin)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'admin')")
+            .bind(server_id)
+            .bind(admin)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test server membership");
+        server_id
+    }
+
+    #[tokio::test]
+    async fn update_server_rejects_a_javascript_icon_url() {
+        // A server icon is rendered client-side straight into `fileUrl(...)`
+        // with no scheme check of its own -- a `javascript:` icon_url would
+        // be a stored-XSS payload against every member who ever loads this
+        // server (see `files::is_safe_external_url`'s doc comment).
+        let db = test_db().await;
+        let admin = create_test_user(&db).await;
+        let server_id = create_test_server_with_admin(&db, admin).await;
+
+        let result = update_server(
+            State(db.clone()),
+            CurrentSession { user_id: admin, session_id: Uuid::new_v4() },
+            Path(server_id),
+            Json(UpdateServerRequest {
+                name: None,
+                description: None,
+                icon_url: Some("javascript:alert(document.cookie)".into()),
+            }),
+        )
+        .await;
+        assert!(result.is_err(), "a javascript: icon_url must be rejected");
+
+        cleanup_test_server(&db, server_id).await;
+        cleanup_test_user(&db, admin).await;
+    }
+
+    #[tokio::test]
+    async fn update_server_accepts_an_https_icon_url() {
+        let db = test_db().await;
+        let admin = create_test_user(&db).await;
+        let server_id = create_test_server_with_admin(&db, admin).await;
+
+        let result = update_server(
+            State(db.clone()),
+            CurrentSession { user_id: admin, session_id: Uuid::new_v4() },
+            Path(server_id),
+            Json(UpdateServerRequest {
+                name: None,
+                description: None,
+                icon_url: Some("https://example.invalid/icon.png".into()),
+            }),
+        )
+        .await
+        .expect("an https icon_url should be accepted");
+        assert_eq!(result.0.icon_url, Some("https://example.invalid/icon.png".to_string()));
+
+        cleanup_test_server(&db, server_id).await;
+        cleanup_test_user(&db, admin).await;
     }
 
     #[tokio::test]
