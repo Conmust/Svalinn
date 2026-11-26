@@ -724,6 +724,17 @@ async fn send_legacy_message(
             "attachment_nonce requires encrypted_for (per-device fan-out send)".into(),
         ));
     }
+    // See `files::is_safe_external_url`'s doc comment: without this, any
+    // string at all would be stored and handed straight back to every
+    // viewer of this conversation as a file link, rendered directly into an
+    // `href`/`src` client-side with no scheme check of its own.
+    if let Some(url) = &payload.attachment_url {
+        if !crate::files::is_safe_external_url(url) {
+            return Err(AppError::BadRequest(
+                "attachment_url must be one of your own uploaded files or an http(s) URL".into(),
+            ));
+        }
+    }
 
     sqlx::query_scalar(
         r#"
@@ -776,6 +787,17 @@ async fn send_fanout_message(
     }
     if !has_attachment && payload.attachment_nonce.is_some() {
         return Err(AppError::BadRequest("attachment_nonce must not be set without attachment_url".into()));
+    }
+    // See `files::is_safe_external_url`'s doc comment: without this, any
+    // string at all would be stored and handed straight back to every
+    // viewer of this conversation as a file link, rendered directly into an
+    // `href`/`src` client-side with no scheme check of its own.
+    if let Some(url) = &payload.attachment_url {
+        if !crate::files::is_safe_external_url(url) {
+            return Err(AppError::BadRequest(
+                "attachment_url must be one of your own uploaded files or an http(s) URL".into(),
+            ));
+        }
     }
 
     for r in recipients {
@@ -2649,6 +2671,53 @@ mod tests {
         cleanup_test_conversation(&db, conversation_id).await;
     }
 
+    /// A DM attachment is rendered client-side straight into `fileUrl(...)`
+    /// and then an `<a href>`/`<img src>` with no scheme check of its own --
+    /// a `javascript:` attachment_url would be a stored-XSS payload against
+    /// whichever participant ever views the message and clicks the
+    /// resulting link (see `files::is_safe_external_url`'s doc comment).
+    #[tokio::test]
+    async fn legacy_send_rejects_a_javascript_attachment_url() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: Some("hi".into()),
+                attachment_url: Some("javascript:alert(document.cookie)".into()),
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: None,
+                sender_device_id: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "a javascript: attachment_url must be rejected");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
     /// If `encrypted_for` omits one of the OTHER participant's registered
     /// devices, the whole send is rejected -- a buggy/malicious client must
     /// not be able to "send" a message that silently never reaches the
@@ -2713,6 +2782,70 @@ mod tests {
         cleanup_test_user(&db, user_a).await;
         cleanup_test_user(&db, user_b).await;
         let _ = b_device2;
+        cleanup_test_conversation(&db, conversation_id).await;
+    }
+
+    /// Same as `legacy_send_rejects_a_javascript_attachment_url`, for the
+    /// per-device fan-out send path.
+    #[tokio::test]
+    async fn fanout_rejects_a_javascript_attachment_url() {
+        let db = test_db().await;
+        let user_a = create_test_user(&db).await;
+        let user_b = create_test_user(&db).await;
+
+        let conversation_id = create_or_get_conversation(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Json(CreateConversationRequest { participant_id: user_b }),
+        )
+        .await
+        .expect("setup: creating conversation failed")
+        .0
+        .id;
+
+        let a_device1 = register_device(&db, user_a, 53, "A's Laptop").await;
+        let b_device1 = register_device(&db, user_b, 54, "B's Laptop").await;
+
+        let result = send_conversation_message(
+            State(db.clone()),
+            CurrentSession { user_id: user_a, session_id: Uuid::new_v4() },
+            Path(conversation_id),
+            Json(SendDirectMessageRequest {
+                content: None,
+                attachment_url: Some("javascript:alert(document.cookie)".into()),
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: Some("file-nonce".into()),
+                is_encrypted: false,
+                nonce: None,
+                encrypted_for: Some(vec![
+                    EncryptedRecipient {
+                        device_id: a_device1,
+                        ciphertext: "ct-for-a1".into(),
+                        nonce: "nonce-a1".into(),
+                        attachment_key_ciphertext: Some("key".into()),
+                        attachment_key_nonce: Some("key-nonce".into()),
+                        ..Default::default()
+                    },
+                    EncryptedRecipient {
+                        device_id: b_device1,
+                        ciphertext: "ct-for-b1".into(),
+                        nonce: "nonce-b1".into(),
+                        attachment_key_ciphertext: Some("key".into()),
+                        attachment_key_nonce: Some("key-nonce".into()),
+                        ..Default::default()
+                    },
+                ]),
+                sender_device_id: Some(a_device1),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "a javascript: attachment_url must be rejected");
+
+        cleanup_test_user(&db, user_a).await;
+        cleanup_test_user(&db, user_b).await;
         cleanup_test_conversation(&db, conversation_id).await;
     }
 

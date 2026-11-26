@@ -139,6 +139,36 @@ pub fn is_stored_path(url: &str) -> bool {
     url.starts_with(STORED_PREFIX) && valid_name(&url[STORED_PREFIX.len()..])
 }
 
+/// Whether `url` (already run through `stored_path`) is safe to store and
+/// later hand back to every future viewer as a file link: one of our own
+/// `/uploads/...` paths, or an external `http`/`https` URL.
+///
+/// Every caller that accepts one of these fields from a client -- an
+/// attachment, an avatar, a server icon -- is choosing between "this is a
+/// path to one of our own uploaded files" and "the caller means this
+/// literally, as an external URL" (see `stored_path`'s doc comment: a value
+/// not recognized as one of our own paths is "kept as it is"). Without this
+/// check that second case accepts literally anything, including a
+/// `javascript:`/`data:`/`vbscript:` URL: it would be stored unchanged
+/// (`sign_path`/`stored_path` both explicitly pass through anything that
+/// isn't an `/uploads/...` path), round-tripped back to every viewer who
+/// loads that avatar, server icon, or message, and rendered directly into
+/// an `href`/`src` by the desktop client (`fileUrl` in `lib/api.ts`) with no
+/// scheme check of its own on the client side. A `javascript:...` "file
+/// link" surviving to that point would execute in the origin of every
+/// person who ever views it and clicks the resulting link or image --
+/// arbitrary script execution with access to this app's own localStorage,
+/// private keys included. Restricting external values to `http`/`https`
+/// closes that off at the one place every one of these fields is accepted,
+/// rather than trusting every future renderer to re-check it.
+pub fn is_safe_external_url(url: &str) -> bool {
+    if is_stored_path(url) {
+        return true;
+    }
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && !url.chars().any(|c| c.is_control())
+}
+
 /// Whether `stored` (a `/uploads/...` path, as normalized by `stored_path`)
 /// is already in use as a channel/DM attachment, a custom emoji, or a
 /// server icon. Used to stop `routes::users::update_avatar` from pointing a
@@ -312,6 +342,48 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
+
+    #[test]
+    fn is_safe_external_url_accepts_our_own_stored_paths_and_http_s_urls() {
+        assert!(is_safe_external_url("/uploads/abc123.png"));
+        assert!(is_safe_external_url("https://example.com/pic.png"));
+        assert!(is_safe_external_url("http://example.com/pic.png"));
+        assert!(is_safe_external_url("HTTPS://EXAMPLE.COM/PIC.PNG"), "scheme check must be case-insensitive");
+    }
+
+    /// The whole point of this function: a value that isn't one of our own
+    /// `/uploads/...` paths and isn't `http(s)` is destined to be stored and
+    /// later rendered directly into an `href`/`src` by the desktop client
+    /// (`fileUrl` in `lib/api.ts`) with no scheme check of its own -- so a
+    /// `javascript:`/`data:`/`vbscript:` value here is a stored-XSS payload
+    /// waiting to run in every future viewer's session the moment they click
+    /// the resulting "attachment" link, with access to that browser's
+    /// localStorage (private keys included).
+    #[test]
+    fn is_safe_external_url_rejects_dangerous_schemes() {
+        assert!(!is_safe_external_url("javascript:alert(document.cookie)"));
+        assert!(!is_safe_external_url("JaVaScRiPt:alert(1)"), "scheme check must be case-insensitive both ways");
+        assert!(!is_safe_external_url("data:text/html,<script>alert(1)</script>"));
+        assert!(!is_safe_external_url("vbscript:msgbox(1)"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("blob:https://example.com/some-uuid"));
+        assert!(!is_safe_external_url("not a url at all"));
+        assert!(!is_safe_external_url(""));
+    }
+
+    #[test]
+    fn is_safe_external_url_rejects_a_value_not_already_normalized_as_an_uploads_path() {
+        // `is_safe_external_url` is meant to run AFTER `stored_path` has had
+        // a chance to normalize a signed link back to a bare `/uploads/...`
+        // path -- a raw, not-yet-normalized signed link on its own doesn't
+        // start with `/uploads/`, so it correctly falls through to the
+        // http(s) check and fails it, same as any other non-`/uploads/...`,
+        // non-`http(s)` string would.
+        let not_yet_normalized = "/api/v1/files/abc.png?u=x&s=y&e=1&sig=z";
+        assert!(!is_stored_path(not_yet_normalized));
+        assert!(!is_safe_external_url(not_yet_normalized));
+        assert!(is_safe_external_url(&stored_path(not_yet_normalized)));
+    }
 
     async fn test_db() -> Database {
         dotenvy::dotenv().ok();

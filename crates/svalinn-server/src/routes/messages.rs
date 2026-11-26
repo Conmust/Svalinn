@@ -479,6 +479,17 @@ pub async fn create_message(
     if !has_attachment && payload.attachment_nonce.is_some() {
         return Err(AppError::BadRequest("attachment_nonce must not be set without attachment_url".into()));
     }
+    // See `files::is_safe_external_url`'s doc comment: without this, any
+    // string at all would be stored and handed straight back to every
+    // viewer of this channel as a file link, rendered directly into an
+    // `href`/`src` client-side with no scheme check of its own.
+    if let Some(url) = &payload.attachment_url {
+        if !crate::files::is_safe_external_url(url) {
+            return Err(AppError::BadRequest(
+                "attachment_url must be one of your own uploaded files or an http(s) URL".into(),
+            ));
+        }
+    }
 
     for r in &payload.encrypted_for {
         if r.ciphertext.trim().is_empty() || r.nonce.trim().is_empty() {
@@ -1098,6 +1109,50 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(AppError::BadRequest(_))));
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// A channel attachment is rendered client-side straight into
+    /// `fileUrl(...)` and then an `<a href>`/`<img src>` with no scheme
+    /// check of its own -- a `javascript:` attachment_url would be a
+    /// stored-XSS payload against every member of the channel who ever
+    /// views the message and clicks the resulting link (see
+    /// `files::is_safe_external_url`'s doc comment).
+    #[tokio::test]
+    async fn fanout_rejects_a_javascript_attachment_url() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 12).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: Some("javascript:alert(document.cookie)".into()),
+                attachment_filename: Some("photo.png".into()),
+                attachment_size: Some(1234),
+                attachment_mime_type: Some("image/png".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                encrypted_for: vec![EncryptedRecipient {
+                    device_id: device,
+                    ciphertext: "ciphertext".into(),
+                    nonce: "nonce".into(),
+                    attachment_key_ciphertext: Some("key".into()),
+                    attachment_key_nonce: Some("key-nonce".into()),
+                    ratchet_header_json: None,
+                    attachment_key_ratchet_header_json: None,
+                }],
+                sender_device_id: device,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "a javascript: attachment_url must be rejected");
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
