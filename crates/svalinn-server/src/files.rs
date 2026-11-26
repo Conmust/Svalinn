@@ -9,11 +9,12 @@
 //!
 //! The link is tied to the viewer's login session. Each time it's fetched the
 //! server checks the signature and expiry, that the account isn't banned and
-//! the session is still active, and that the viewer is a member of the server
-//! the file belongs to (channel attachments, emojis, server icons) or a
-//! participant of the DM conversation it belongs to (DM attachments). A ban,
-//! logout, leaving a server, or no longer being a DM participant therefore
-//! stops access to saved links immediately.
+//! the session is still active, and that the viewer still holds VIEW_CHANNEL
+//! on the channel a channel attachment belongs to, is a member of the server
+//! an emoji or server icon belongs to, or is a participant of the DM
+//! conversation a DM attachment belongs to. A ban, logout, leaving a server,
+//! losing VIEW_CHANNEL on a private channel, or no longer being a DM
+//! participant therefore stops access to saved links immediately.
 
 use axum::{
     body::Body,
@@ -211,43 +212,69 @@ pub async fn serve_file(
         return denied(StatusCode::FORBIDDEN);
     }
 
-    // 3. Viewer is a member of the server the file belongs to (channel
-    // attachments, custom emojis, server icons) OR a participant of the DM
-    // conversation it belongs to (DM attachments -- added alongside
-    // encrypted DM attachments; applies to legacy plaintext DM attachments
-    // too, which had no access check covering them at all before this) OR
-    // the file is someone's profile picture, which (like a username) is
-    // visible to any logged-in user regardless of shared servers/DMs --
-    // the "+ New Message" picker already lists every user site-wide by
-    // username, so gating avatars the way attachments are gated would just
-    // mean some of those listed people show a broken image instead of
-    // actually hiding anything.
-    let allowed: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM server_members sm
-            WHERE sm.user_id = $2 AND sm.server_id IN (
-                SELECT c.server_id FROM messages m JOIN channels c ON c.id = m.channel_id
-                WHERE m.attachment_url = $1
-                UNION
-                SELECT server_id FROM custom_emojis WHERE url = $1
-                UNION
-                SELECT id FROM servers WHERE icon_url = $1
-            )
-        ) OR EXISTS(
-            SELECT 1 FROM conversation_participants cp
-            JOIN messages m ON m.conversation_id = cp.conversation_id
-            WHERE cp.user_id = $2 AND m.attachment_url = $1
-        ) OR EXISTS(
-            SELECT 1 FROM users WHERE avatar_url = $1
-        )
-        "#,
+    // 3. Viewer is a member of the server the file belongs to (custom
+    // emojis, server icons) OR holds VIEW_CHANNEL on the specific channel a
+    // channel attachment belongs to OR a participant of the DM conversation
+    // it belongs to (DM attachments -- added alongside encrypted DM
+    // attachments; applies to legacy plaintext DM attachments too, which
+    // had no access check covering them at all before this) OR the file is
+    // someone's profile picture, which (like a username) is visible to any
+    // logged-in user regardless of shared servers/DMs -- the "+ New
+    // Message" picker already lists every user site-wide by username, so
+    // gating avatars the way attachments are gated would just mean some of
+    // those listed people show a broken image instead of actually hiding
+    // anything.
+    let stored = format!("{STORED_PREFIX}{name}");
+
+    // A channel attachment needs its own branch, checked separately from
+    // the membership-only EXISTS query below: server membership alone used
+    // to be enough, so a member denied VIEW_CHANNEL on a private channel
+    // via a role/member overwrite could still keep downloading its
+    // attachments (through a saved signed link, which stays valid for up
+    // to SIGNED_LINK_TTL_SECONDS) even after losing access to everything
+    // else about that channel -- the same gap `routes::messages`'s
+    // `message_context` had for edit/delete/lock/pin/react before it
+    // started checking VIEW_CHANNEL too. Emojis and server icons aren't
+    // channel-scoped, so server membership is still the right (and only
+    // meaningful) check for those.
+    let channel_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT c.id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE m.attachment_url = $1",
     )
-    .bind(format!("{STORED_PREFIX}{name}"))
-    .bind(q.u)
-    .fetch_one(&db.pool)
+    .bind(&stored)
+    .fetch_optional(&db.pool)
     .await
-    .unwrap_or(false);
+    .unwrap_or(None);
+
+    let allowed = if let Some(channel_id) = channel_id {
+        crate::permissions::resolve_channel(&db, channel_id, q.u)
+            .await
+            .map(|p| p.has(crate::permissions::Permission::VIEW_CHANNEL))
+            .unwrap_or(false)
+    } else {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM server_members sm
+                WHERE sm.user_id = $2 AND sm.server_id IN (
+                    SELECT server_id FROM custom_emojis WHERE url = $1
+                    UNION
+                    SELECT id FROM servers WHERE icon_url = $1
+                )
+            ) OR EXISTS(
+                SELECT 1 FROM conversation_participants cp
+                JOIN messages m ON m.conversation_id = cp.conversation_id
+                WHERE cp.user_id = $2 AND m.attachment_url = $1
+            ) OR EXISTS(
+                SELECT 1 FROM users WHERE avatar_url = $1
+            )
+            "#,
+        )
+        .bind(&stored)
+        .bind(q.u)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or(false)
+    };
     if !allowed {
         return denied(StatusCode::NOT_FOUND);
     }
@@ -416,6 +443,122 @@ mod tests {
     fn init_secret() {
         std::env::set_var("JWT_SECRET", "x".repeat(40));
         let _ = crate::extractors::auth::init_jwt_secret();
+    }
+
+    async fn create_test_server(db: &Database, owner_id: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(server_id)
+            .bind(owner_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert owner membership");
+        server_id
+    }
+
+    async fn add_server_member(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+    }
+
+    async fn create_test_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'text') RETURNING id")
+            .bind(server_id)
+            .bind(format!("general-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test channel")
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    /// Before this fix, step 3 of `serve_file` only checked that the viewer
+    /// was still a member of the *server* a channel attachment's message
+    /// belonged to -- never the specific channel's `VIEW_CHANNEL`
+    /// permission. So a member denied `VIEW_CHANNEL` on a private channel
+    /// via a member overwrite could keep fetching that channel's
+    /// attachments through a signed link obtained before the overwrite was
+    /// added, for as long as the link stayed valid, even though they could
+    /// no longer see the channel's messages at all. An ordinary member
+    /// (still holding VIEW_CHANNEL) must still be able to fetch it.
+    #[tokio::test]
+    async fn member_denied_view_channel_cannot_fetch_that_channels_attachment() {
+        init_secret();
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel)
+            .bind(blocked)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+
+        let stored_name = format!("test_{}.txt", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO messages (channel_id, conversation_id, user_id, content, attachment_url, is_encrypted) VALUES ($1, NULL, $2, 'hi', $3, false)",
+        )
+        .bind(channel)
+        .bind(owner)
+        .bind(format!("{STORED_PREFIX}{stored_name}"))
+        .execute(&db.pool)
+        .await
+        .expect("failed to insert test message");
+
+        tokio::fs::create_dir_all(UPLOAD_DIR).await.expect("failed to create uploads dir");
+        let file_path = std::path::Path::new(UPLOAD_DIR).join(&stored_name);
+        tokio::fs::write(&file_path, b"test attachment bytes").await.expect("failed to write test file");
+
+        let viewer_session = create_test_session(&db, viewer).await;
+        let blocked_session = create_test_session(&db, blocked).await;
+        let dummy_request = || Request::builder().body(Body::empty()).expect("valid request");
+
+        let viewer_response = serve_file(
+            AxumState(db.clone()),
+            AxumPath(stored_name.clone()),
+            query_for(&stored_name, viewer, viewer_session),
+            dummy_request(),
+        )
+        .await;
+        assert_eq!(viewer_response.status(), StatusCode::OK, "a member with VIEW_CHANNEL must still be able to fetch the attachment");
+
+        let blocked_response = serve_file(
+            AxumState(db.clone()),
+            AxumPath(stored_name.clone()),
+            query_for(&stored_name, blocked, blocked_session),
+            dummy_request(),
+        )
+        .await;
+        assert_eq!(
+            blocked_response.status(),
+            StatusCode::NOT_FOUND,
+            "a member denied VIEW_CHANNEL must not be able to fetch that channel's attachment, even with an otherwise validly-signed link"
+        );
+
+        let _ = tokio::fs::remove_file(&file_path).await;
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
     }
 
     #[test]
