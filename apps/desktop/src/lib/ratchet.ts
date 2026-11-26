@@ -793,7 +793,18 @@ async function ensureSigningIdentity(deviceId: string): Promise<{ publicKey: str
   const kp = sodium.crypto_sign_keypair();
   const publicKey = b64(kp.publicKey);
   const privateKey = b64(kp.privateKey);
-  await setSigningKey(deviceId, publicKey);
+
+  // Persist locally BEFORE publishing to the server, not after -- same
+  // fail-closed discipline as `ensureSignedPrekey`/`maintainOneTimePrekeys`
+  // below, and for the same reason: if the local write fails, the server
+  // must never be left advertising a signing public key whose private half
+  // was never actually saved anywhere. That key would be permanently
+  // unusable by this device (nothing can sign with it) while still being
+  // exactly the key other devices' `verifySignedPrekey` checks would trust
+  // -- and since this device never rotates its signing identity once
+  // created, nothing would ever retry or replace it on its own. Failing
+  // closed here means a storage failure throws before anything is
+  // published, so a retry starts clean instead of orphaning the key.
   try {
     localStorage.setItem(SIGNING_PUBLIC_KEY_STORAGE_KEY, publicKey);
     localStorage.setItem(SIGNING_PRIVATE_KEY_STORAGE_KEY, privateKey);
@@ -802,6 +813,7 @@ async function ensureSigningIdentity(deviceId: string): Promise<{ publicKey: str
       "This device cannot store its ratchet signing key (local storage is unavailable, full, or disabled)."
     );
   }
+  await setSigningKey(deviceId, publicKey);
   return { publicKey, privateKey };
 }
 
