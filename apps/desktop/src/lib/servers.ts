@@ -1,4 +1,4 @@
-import { getAuthHeaders, apiFetch, apiBase } from './api';
+import { getAuthHeaders, apiFetch, apiBase, endSession } from './api';
 
 
 export interface Server {
@@ -24,9 +24,15 @@ export async function fetchUserServers(): Promise<Server[]> {
   });
 
   if (response.status === 401) {
-    localStorage.removeItem('svalinn_token');
-    localStorage.removeItem('svalinn_user');
-    window.location.reload();
+    // `svalinn_token`/`svalinn_user` were never this app's real session
+    // storage keys (see `api.ts`'s `token`/`refresh_token`/`user`), so
+    // clearing them was a no-op -- the actual stale token and user stayed
+    // in place and this just reloaded straight back into the same broken
+    // session (an infinite reload loop whenever `apiFetch` had no refresh
+    // token to retry with, since neither `token` nor `user` ever actually
+    // got cleared). `endSession()` is the real version of what this was
+    // trying to do: it clears the keys this app actually uses.
+    endSession('Session expired');
     throw new Error('Session expired');
   }
 
@@ -62,9 +68,15 @@ export async function createServer(name: string, icon?: string): Promise<Server>
   });
 
   if (response.status === 401) {
-    localStorage.removeItem('svalinn_token');
-    localStorage.removeItem('svalinn_user');
-    window.location.reload();
+    // `svalinn_token`/`svalinn_user` were never this app's real session
+    // storage keys (see `api.ts`'s `token`/`refresh_token`/`user`), so
+    // clearing them was a no-op -- the actual stale token and user stayed
+    // in place and this just reloaded straight back into the same broken
+    // session (an infinite reload loop whenever `apiFetch` had no refresh
+    // token to retry with, since neither `token` nor `user` ever actually
+    // got cleared). `endSession()` is the real version of what this was
+    // trying to do: it clears the keys this app actually uses.
+    endSession('Session expired');
     throw new Error('Session expired');
   }
 
@@ -92,9 +104,15 @@ export async function createChannel(
   });
 
   if (response.status === 401) {
-    localStorage.removeItem('svalinn_token');
-    localStorage.removeItem('svalinn_user');
-    window.location.reload();
+    // `svalinn_token`/`svalinn_user` were never this app's real session
+    // storage keys (see `api.ts`'s `token`/`refresh_token`/`user`), so
+    // clearing them was a no-op -- the actual stale token and user stayed
+    // in place and this just reloaded straight back into the same broken
+    // session (an infinite reload loop whenever `apiFetch` had no refresh
+    // token to retry with, since neither `token` nor `user` ever actually
+    // got cleared). `endSession()` is the real version of what this was
+    // trying to do: it clears the keys this app actually uses.
+    endSession('Session expired');
     throw new Error('Session expired');
   }
 
