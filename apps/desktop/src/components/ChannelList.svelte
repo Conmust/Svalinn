@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-  import { getAuthHeaders, apiFetch, apiBase } from '../lib/api';
+  import { getAuthHeaders, apiFetch, apiBase, endSession } from '../lib/api';
   import { logout } from '../lib/auth';
   import { wsClient } from '../lib/websocket';
   import { selfAvatarUrl } from '../lib/selfProfile';
@@ -212,9 +212,11 @@
           dispatch('channelDeleted', activeChannel);
         }
       } else if (response.status === 401) {
-        console.error("Unauthorized: Token missing or invalid");
-        localStorage.clear();
-        location.reload();
+        // Only the session (token/refresh_token/user) -- not a blanket
+        // localStorage.clear(), which would also wipe this device's E2EE
+        // identity (keypair, ratchet signing key, sessions) and force it to
+        // re-establish encryption with every peer.
+        endSession('Session expired');
       } else {
         const errText = await response.text();
         console.error(`Failed to load channels: ${response.status}`, errText);
