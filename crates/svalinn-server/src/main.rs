@@ -11,6 +11,7 @@ mod models;
 mod permissions;
 mod presence;
 mod rate_limit;
+mod retention;
 mod sessions;
 mod stats;
 mod tiers;
@@ -91,6 +92,11 @@ async fn main() {
     // Keeps the public signup-count history (for community growth charts)
     // topped up with one aggregate number per day.
     stats::spawn_snapshot_job(db.clone());
+
+    // Keeps each server's message history at or under its retention cap,
+    // exempting messages a current member still hasn't read (see
+    // retention.rs for the exact rule and why it has its own limits).
+    retention::spawn_sweeper(db.clone());
 
     // Loads (or mints, first run) each tier's blind-signing keypair.
     blind_tokens::init_keys(&db)
