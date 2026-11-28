@@ -65,6 +65,14 @@ export interface Message {
    * `toDisplayMessage`), so the UI can mark it as a moderator reveal
    * rather than this device's own decryption. */
   revealed_fallback?: boolean;
+  /** Client-only, never sent on a normal fetch: set for the rest of this
+   * session when a `message_updated` broadcast reports the server itself
+   * cleared `attachment_url` to free up the server's attachment storage
+   * quota (the oldest unpinned attachment is evicted to make room for a
+   * new one). Not a persisted column, so a reload of this channel's
+   * history won't show it again -- the message will just look like it
+   * never had an attachment. */
+  attachment_evicted?: boolean;
   attachment_url?: string | null;
   attachment_filename?: string | null;
   attachment_size?: number | null;
@@ -187,11 +195,16 @@ export interface SendChannelMessageOptions {
 export class SendChannelMessageError extends Error {
   status: number;
   serverMessage: string | null;
-  constructor(status: number, serverMessage: string | null) {
+  /** Seconds to wait before trying again, from the server's `Retry-After`
+   * header -- only meaningful (and only set) for a 429, such as hitting
+   * this channel's slowmode. */
+  retryAfterSeconds: number | null;
+  constructor(status: number, serverMessage: string | null, retryAfterSeconds: number | null = null) {
     super(serverMessage ?? 'Failed to send message');
     this.name = 'SendChannelMessageError';
     this.status = status;
     this.serverMessage = serverMessage;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -237,7 +250,13 @@ export async function sendChannelMessage(
     } catch {
       // Body wasn't JSON (or was empty) -- fall back to no server message.
     }
-    throw new SendChannelMessageError(response.status, serverMessage);
+    const retryAfterHeader = response.headers.get('Retry-After');
+    const retryAfterSeconds = retryAfterHeader !== null ? parseInt(retryAfterHeader, 10) : null;
+    throw new SendChannelMessageError(
+      response.status,
+      serverMessage,
+      retryAfterSeconds !== null && !isNaN(retryAfterSeconds) ? retryAfterSeconds : null
+    );
   }
   return response.json();
 }
@@ -292,8 +311,30 @@ export async function pinMessage(messageId: string, revealPlaintext?: string): P
   await request('POST', `/api/v1/messages/${messageId}/pin`, { reveal_plaintext: revealPlaintext ?? null });
 }
 
-export async function unpinMessage(messageId: string): Promise<void> {
-  await request('DELETE', `/api/v1/messages/${messageId}/pin`);
+export interface UnpinResult {
+  id: string;
+  /** True when this message is older than the server's immediate-loss
+   * threshold: unpinning it would delete it outright (it's already past
+   * what the retention cap would otherwise have protected it from)
+   * rather than just drop it back under the ordinary cap. Nothing has
+   * happened yet when this is set -- call `unpinMessage(messageId, true)`
+   * to actually go through with it, after showing `warning` to the user. */
+  requires_confirmation?: boolean;
+  warning?: string;
+  /** Set once a confirmed unpin has actually deleted the message. */
+  deleted?: boolean;
+}
+
+/**
+ * Unpins a message. If it's older than the server's immediate-loss
+ * threshold, the first call (with `confirm` left false) does nothing and
+ * instead comes back with `requires_confirmation: true` and a `warning`
+ * to show the user -- pass `confirm: true` on a second call, once they've
+ * agreed, to actually unpin (which for a message this old means deleting
+ * it immediately, not just dropping it back under the retention cap).
+ */
+export async function unpinMessage(messageId: string, confirm?: boolean): Promise<UnpinResult> {
+  return request('DELETE', `/api/v1/messages/${messageId}/pin${confirm ? '?confirm=true' : ''}`);
 }
 
 /**

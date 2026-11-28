@@ -66,6 +66,25 @@
   let loading = true;
   let newMessage = '';
   let sending = false;
+
+  // Channel slowmode: ticks down once a send comes back 429'd, so the
+  // person sees why Send is disabled instead of just hitting the same
+  // error again a moment later.
+  let slowmodeSecondsLeft = 0;
+  let slowmodeInterval: ReturnType<typeof setInterval> | null = null;
+
+  function startSlowmodeCountdown(seconds: number) {
+    slowmodeSecondsLeft = Math.max(1, Math.ceil(seconds));
+    if (slowmodeInterval) clearInterval(slowmodeInterval);
+    slowmodeInterval = setInterval(() => {
+      slowmodeSecondsLeft -= 1;
+      if (slowmodeSecondsLeft <= 0) {
+        slowmodeSecondsLeft = 0;
+        if (slowmodeInterval) clearInterval(slowmodeInterval);
+        slowmodeInterval = null;
+      }
+    }, 1000);
+  }
   let attachmentFile: File | null = null;
   let selectionMode = false;
   let selectedMessages: string[] = [];
@@ -512,15 +531,53 @@
 
   const handlePin = (e: CustomEvent<Message>) => run(async () => {
     const m = e.detail;
-    await (m.is_pinned ? unpinMessage(m.id) : pinMessage(m.id));
-    patchMessage(m.id, { is_pinned: !m.is_pinned });
+    if (m.is_pinned) {
+      const result = await unpinMessage(m.id);
+      if (result.requires_confirmation) {
+        // Nothing happened server-side yet -- the message is still
+        // pinned. Don't touch local state; `confirmUnpin` does the real
+        // work once the user agrees to lose it.
+        pendingUnpin = { message: m, warning: result.warning ?? "This message is old enough that unpinning it will delete it immediately. This can't be undone." };
+        return;
+      }
+      patchMessage(m.id, { is_pinned: false });
+      return;
+    }
+    await pinMessage(m.id);
+    patchMessage(m.id, { is_pinned: true });
     // Newly pinning a message that wasn't already in the pinned panel's
     // list needs a refetch to actually appear there -- `patchMessage`
     // only updates an entry already present.
-    if (!m.is_pinned && pinnedMessages && !pinnedMessages.some(p => p.id === m.id)) {
+    if (pinnedMessages && !pinnedMessages.some(p => p.id === m.id)) {
       void loadPinnedMessages(channelId);
     }
   });
+
+  /** A message pending the "unpinning this deletes it immediately"
+   * confirmation dialog, with the server's own explanation of why --
+   * see `unpinMessage`'s doc comment for the general rule. */
+  let pendingUnpin: { message: Message; warning: string } | null = null;
+
+  async function confirmUnpin() {
+    const pending = pendingUnpin;
+    pendingUnpin = null;
+    if (!pending) return;
+    const m = pending.message;
+    await run(async () => {
+      const result = await unpinMessage(m.id, true);
+      if (result.deleted) {
+        // The server already broadcasts `message_deleted` for this (same
+        // as an ordinary delete), which `onMessageDeleted` will pick up
+        // shortly -- but remove it locally right away too, same as
+        // `confirmDelete`, so the actor isn't left looking at a message
+        // that's actually already gone.
+        rawMessages = rawMessages.filter(x => x.id !== m.id);
+        if (pinnedMessages) pinnedMessages = pinnedMessages.filter(x => x.id !== m.id);
+        await deleteCachedPlaintext(m.id);
+        await deleteCachedPlaintext(`${m.id}:attachment-key`);
+      }
+    });
+  }
 
   /** A message pending the reveal confirmation dialog -- see
    * `confirmReveal` below for why this needs its own ConfirmModal rather
@@ -817,6 +874,7 @@
     wsClient.off('typing', onTyping);
     typingTracker.destroy();
     for (const url of createdObjectUrls) URL.revokeObjectURL(url);
+    if (slowmodeInterval) clearInterval(slowmodeInterval);
   });
 
   const handleEdit = (e: CustomEvent<{ message: Message; content: string }>) => run(async () => {
@@ -1051,7 +1109,7 @@
   async function handleSendMessage(e: Event) {
     e.preventDefault();
     const content = newMessage.trim();
-    if ((!content && !attachmentFile) || sending) return;
+    if ((!content && !attachmentFile) || sending || slowmodeSecondsLeft > 0) return;
 
     // The single most important invariant: never send plaintext when
     // encryption was supposed to happen. There is no silent plaintext
@@ -1077,10 +1135,21 @@
       console.error('Failed to send message:', e);
       if (isStaleDeviceListError(e)) {
         alert("Couldn't send: the channel's member devices changed, please try again");
+      } else if (e instanceof SendChannelMessageError && e.status === 429) {
+        // Slowmode -- show a countdown instead of the generic network-error
+        // alert, and don't throw the composed text/attachment away (unlike
+        // a successful send, nothing above cleared them).
+        startSlowmodeCountdown(e.retryAfterSeconds ?? 1);
       } else if (e instanceof CryptoLibraryError || e instanceof DeviceSetupError) {
         panelError = describeCryptoError(e);
       } else if (e instanceof TimeoutError) {
         alert('Timed out sending message. Please try again.');
+      } else if (e instanceof SendChannelMessageError && e.status === 400 && e.serverMessage) {
+        // A rejection with something specific to say -- e.g. the
+        // attachment-storage-quota check in `create_message` ("This
+        // attachment doesn't fit even after freeing everything...").
+        // Worth showing verbatim instead of the generic fallback below.
+        alert(e.serverMessage);
       } else {
         alert('Network error while sending message');
       }
@@ -1336,6 +1405,11 @@
       </div>
     {/if}
 
+    {#if slowmodeSecondsLeft > 0}
+      <div class="mb-1 text-xs text-[#ffaa00]">
+        {'>'} Slowmode: wait {slowmodeSecondsLeft}s before sending another message here
+      </div>
+    {/if}
     <form on:submit={handleSendMessage} class="flex gap-2">
       <!-- File Upload Button -->
       <label class="cursor-pointer px-3 py-2 border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black transition-all terminal-glow flex items-center justify-center" title="Attach File">
@@ -1362,10 +1436,10 @@
       <!-- Send Button -->
       <button
         type="submit"
-        disabled={sending || !canSend || (!newMessage.trim() && !attachmentFile)}
+        disabled={sending || !canSend || slowmodeSecondsLeft > 0 || (!newMessage.trim() && !attachmentFile)}
         class="px-6 py-2 bg-[#00ff00] text-black font-bold hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50 disabled:cursor-not-allowed"
       >
-        {sending ? '...' : 'Send'}
+        {sending ? '...' : slowmodeSecondsLeft > 0 ? `${slowmodeSecondsLeft}s` : 'Send'}
       </button>
     </form>
   </div>
@@ -1389,5 +1463,16 @@
     confirmText="Reveal it"
     on:confirm={confirmReveal}
     on:cancel={() => (pendingReveal = null)}
+  />
+{/if}
+
+{#if pendingUnpin}
+  <ConfirmModal
+    title="Unpin message"
+    variant="danger"
+    message={pendingUnpin.warning}
+    confirmText="Unpin and delete"
+    on:confirm={confirmUnpin}
+    on:cancel={() => (pendingUnpin = null)}
   />
 {/if}

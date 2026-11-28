@@ -221,6 +221,13 @@
             </a>
           {/if}
         </div>
+      {:else if message.attachment_evicted}
+        <div
+          class="mt-2 inline-flex items-center gap-2 px-3 py-2 bg-[#0a0e0a] border border-[#ffaa00] text-[#ffaa00] text-xs rounded"
+          title="The server automatically removes the oldest unpinned attachment when it's running low on storage space. Pin a message to protect its attachment from this."
+        >
+          📎 Attachment removed to free up server storage space
+        </div>
       {/if}
 
     <!-- Reactions: click a chip to add or remove your reaction -->
