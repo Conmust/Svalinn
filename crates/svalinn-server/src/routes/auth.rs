@@ -1154,10 +1154,15 @@ mod tests {
         .await
         .expect("registration should succeed");
 
-        // A token that was never issued.
+        // A token that was never issued. (Not debug-printing the match arm
+        // here: CodeQL's cleartext-logging check treats anything derived
+        // from a `reset_password(...)` call as credential-tainted by its
+        // name alone, regardless of the actual (passwordless) `StatusCode`
+        // return type -- a fixed message avoids that false positive.)
         match reset_password(State(db.clone()), Json(ResetPasswordRequest { token: "not-a-real-token".into(), new_password: "newpassword456".into() })).await {
             Err(AppError::BadRequest(_)) => {}
-            other => panic!("expected a BadRequest for an unknown token, got {other:?}"),
+            Ok(_) => panic!("expected a BadRequest for an unknown token, but it succeeded"),
+            Err(_) => panic!("expected a BadRequest for an unknown token, but got a different kind of error"),
         }
 
         let forgot = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email }))
@@ -1172,7 +1177,8 @@ mod tests {
 
         match reset_password(State(db.clone()), Json(ResetPasswordRequest { token, new_password: "yetanotherpassword789".into() })).await {
             Err(AppError::BadRequest(_)) => {}
-            other => panic!("expected a BadRequest when reusing an already-used token, got {other:?}"),
+            Ok(_) => panic!("expected a BadRequest when reusing an already-used token, but it succeeded"),
+            Err(_) => panic!("expected a BadRequest when reusing an already-used token, but got a different kind of error"),
         }
 
         cleanup_user(&db, &username).await;
@@ -1201,7 +1207,8 @@ mod tests {
 
         match reset_password(State(db.clone()), Json(ResetPasswordRequest { token, new_password: "short".into() })).await {
             Err(AppError::BadRequest(_)) => {}
-            other => panic!("expected a BadRequest for a too-short password, got {other:?}"),
+            Ok(_) => panic!("expected a BadRequest for a too-short password, but it succeeded"),
+            Err(_) => panic!("expected a BadRequest for a too-short password, but got a different kind of error"),
         }
 
         cleanup_user(&db, &username).await;
