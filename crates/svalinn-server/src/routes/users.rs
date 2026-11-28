@@ -563,7 +563,7 @@ pub async fn change_email(
     })?;
 
     let token = crate::routes::auth::issue_verification_token(&db, user_id).await?;
-    let dev_link = crate::routes::auth::send_verification_email(user_id, email, &token);
+    let dev_link = crate::routes::auth::send_verification_email(user_id, email, &token).await;
 
     Ok(Json(serde_json::json!({
         "email": email,

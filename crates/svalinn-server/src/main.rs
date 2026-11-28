@@ -3,6 +3,7 @@ mod badges;
 mod blind_tokens;
 mod db;
 mod disposable_email;
+mod email_delivery;
 mod email_privacy;
 mod errors;
 mod extractors;
@@ -59,6 +60,18 @@ async fn main() {
     // Same pattern as the JWT secret above: refuse to start without proper
     // keys for encrypting/blind-indexing emails (see email_privacy.rs).
     match crate::email_privacy::init_keys(&app_env) {
+        Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
+        Ok(None) => {}
+        Err(problem) => {
+            eprintln!("❌ {problem}");
+            std::process::exit(1);
+        }
+    }
+
+    // Same pattern again: refuse to start without a Resend API key and
+    // From address outside development, where verification/password-reset
+    // emails are never actually sent (see email_delivery.rs).
+    match crate::email_delivery::init(&app_env) {
         Ok(Some(warning)) => eprintln!("⚠️  {warning}"),
         Ok(None) => {}
         Err(problem) => {
