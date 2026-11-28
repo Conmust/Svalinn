@@ -90,19 +90,10 @@ impl Permission {
 pub struct Permissions(pub Bits);
 
 impl Permissions {
-    pub const NONE: Permissions = Permissions(0);
     pub const ALL: Permissions = Permissions(Permission::ALL);
 
     pub fn has(self, p: Permission) -> bool {
         self.0 & p.0 != 0
-    }
-
-    pub fn with(self, p: Permission) -> Permissions {
-        Permissions(self.0 | p.0)
-    }
-
-    pub fn union(self, other: Permissions) -> Permissions {
-        Permissions(self.0 | other.0)
     }
 
     /// Masks out `deny`'s bits, then sets `allow`'s -- an overwrite's
@@ -343,25 +334,6 @@ pub async fn require_channel_permission(
     }
 }
 
-/// Resolves the server's permissions for `user_id` and requires `p`,
-/// otherwise `Forbidden`.
-pub async fn require_server_permission(
-    db: &Database,
-    server_id: Uuid,
-    user_id: Uuid,
-    p: Permission,
-) -> Result<(), AppError> {
-    let perms = resolve_server(db, server_id, user_id).await?;
-    if perms.has(p) {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(format!(
-            "You don't have the {} permission in this server",
-            p.name().unwrap_or("required")
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +356,7 @@ mod tests {
 
     #[test]
     fn overwrite_can_grant_beyond_base() {
-        let base = Permissions::NONE;
+        let base = Permissions(0); // no permissions at all
         let out = base.apply_overwrite(Permission::VIEW_CHANNEL.0, 0);
         assert!(out.has(Permission::VIEW_CHANNEL));
     }
