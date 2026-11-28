@@ -47,7 +47,17 @@ export function pageErrors(page: Page): string[] {
 
 export async function openChannel(page: Page, serverName: string, channel = 'general') {
   await page.getByTitle(serverName, { exact: true }).click();
+  // Channel messages are mandatory end-to-end encrypted, so opening a
+  // channel always kicks off a member-devices fetch (to know who to
+  // encrypt a send "for"); sending can only use it once it lands, but
+  // nothing in the UI itself waits for that -- a message typed right
+  // after this call can race it and the send gets silently dropped.
+  // Waiting for it here, rather than leaving every caller to discover
+  // the race on its own, is what made that flake show up consistently
+  // across unrelated tests that otherwise never touched this file.
+  const deviceListLoaded = page.waitForResponse((r) => r.url().includes('/member-devices'), { timeout: 10_000 }).catch(() => {});
   await page.getByText(`# ${channel}`, { exact: true }).click();
+  await deviceListLoaded;
 }
 
 export async function sendMessage(page: Page, text: string) {

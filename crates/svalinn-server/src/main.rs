@@ -257,6 +257,10 @@ async fn main() {
             get(routes::messages::get_channel_messages),
         )
         .route(
+            "/api/v1/channels/:channel_id/pinned",
+            get(routes::messages::get_pinned_messages),
+        )
+        .route(
             "/api/v1/channels/:channel_id/messages",
             post(routes::messages::create_message)
                 .layer(DefaultBodyLimit::max(upload_body_limit(MAX_ATTACHMENT_BYTES))),
@@ -268,6 +272,10 @@ async fn main() {
         .route(
             "/api/v1/messages/:message_id/pin",
             post(routes::messages::pin_message).delete(routes::messages::unpin_message),
+        )
+        .route(
+            "/api/v1/messages/:message_id/pin-visibility",
+            axum::routing::put(routes::messages::set_pin_visibility),
         )
         .route(
             "/api/v1/messages/:message_id/lock",

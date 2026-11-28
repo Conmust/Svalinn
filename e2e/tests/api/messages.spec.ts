@@ -90,6 +90,56 @@ test('pin, lock, hide, react and delete follow their rules', async () => {
   expect((await call(member, 'DELETE', M)).status).toBe(200);
 });
 
+// Channel messages are per-device end-to-end encrypted with no history
+// backfill (see `routes::messages::create_message`'s doc comment), so a
+// member who joins after a message was sent never gets a decryption key
+// for it -- including a pinned announcement or rule. This exercises the
+// explicit, moderator-only escape hatch: revealing a pinned message's
+// plaintext on the server so a later joiner can still read it, and the
+// toggle/unpin rules around that reveal.
+test('pinning with a reveal lets a member who joins later read it; unpinning clears it', async () => {
+  const owner = await register('pinown');
+  const { server, channel } = await createServer(owner);
+  const msg = (await postMessage(owner, channel.id, 'Server rules: be kind.')).body;
+  const M = `/messages/${msg.id}`;
+
+  // A plain member can't reveal (or pin) at all.
+  const member = await register('pinmem');
+  await join(owner, server.id, member);
+  expect((await call(member, 'PUT', `${M}/pin-visibility`, { plaintext_content: 'sneaky' })).status).toBe(403);
+
+  // Revealing before pinning, or revealing a plaintext (unencrypted) row,
+  // doesn't make sense and is rejected.
+  expect((await call(owner, 'PUT', `${M}/pin-visibility`, { plaintext_content: 'too early' })).status).toBe(400);
+
+  // Pin-and-reveal in one step.
+  const pinned = await call(owner, 'POST', `${M}/pin`, { reveal_plaintext: 'Server rules: be kind.' });
+  expect(pinned.status).toBe(200);
+  expect(pinned.body.pin_plaintext_content).toBe('Server rules: be kind.');
+
+  // A member who joins AFTER the send -- and so has no `message_recipients`
+  // row for this message at all -- can still read it via the pinned list.
+  const lateJoiner = await register('pinlate');
+  await join(owner, server.id, lateJoiner);
+  const list = (await call(lateJoiner, 'GET', `/channels/${channel.id}/pinned`)).body;
+  expect(list).toHaveLength(1);
+  expect(list[0]).toMatchObject({ id: msg.id, pin_plaintext_content: 'Server rules: be kind.' });
+  expect(list[0].recipients ?? []).toEqual([]);
+
+  // The reveal can be hidden again without unpinning...
+  expect((await call(owner, 'PUT', `${M}/pin-visibility`, { plaintext_content: null })).status).toBe(200);
+  const stillPinned = (await call(lateJoiner, 'GET', `/channels/${channel.id}/pinned`)).body;
+  expect(stillPinned).toMatchObject([{ id: msg.id, pin_plaintext_content: null }]);
+
+  // ...and re-revealed later via the same toggle.
+  expect((await call(owner, 'PUT', `${M}/pin-visibility`, { plaintext_content: 'Server rules: be kind.' })).status).toBe(200);
+
+  // Unpinning clears any revealed plaintext -- the reveal is scoped to
+  // "while pinned", not a standing exception for this message.
+  expect((await call(owner, 'DELETE', `${M}/pin`)).status).toBe(200);
+  expect((await call(lateJoiner, 'GET', `/channels/${channel.id}/pinned`)).body).toEqual([]);
+});
+
 test('presence follows open connections and keeps a chosen status', async () => {
   const watcher = await register('watch');
   const bob = await register('bob');
