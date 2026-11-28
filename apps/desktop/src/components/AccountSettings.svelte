@@ -4,6 +4,7 @@
   import { getCurrentUser, updateUserInStorage } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
   import { clearMessageHistoryCache } from '../lib/message-history';
+  import { hasNotificationPermission, notificationsSupported, requestNotificationPermission } from '../lib/notifications';
   import { updateMyAvatar, updateMyBadgeEmblem, allowedEmblems, PATRON_TIERS, type PatronTier } from '../lib/users';
   import { uploadFile } from '../lib/messages';
   import { selfAvatarUrl } from '../lib/selfProfile';
@@ -224,6 +225,31 @@
     }
   }
 
+  // Desktop notifications for new messages (see `lib/notifications.ts`).
+  // This is a per-device OS/browser permission, not an account setting --
+  // there's nothing to store or sync, just whatever the permission prompt
+  // currently reports, refreshed every time this panel opens.
+  let notificationPermissionGranted = false;
+  let notificationBusy = false;
+  let notificationError = '';
+
+  async function handleEnableNotifications() {
+    notificationBusy = true;
+    notificationError = '';
+    try {
+      const granted = await requestNotificationPermission();
+      notificationPermissionGranted = granted;
+      if (!granted) {
+        notificationError =
+          "Permission wasn't granted. You may need to allow notifications for this app in your OS or browser settings.";
+      }
+    } catch (err: any) {
+      notificationError = err.message || 'Failed to request notification permission';
+    } finally {
+      notificationBusy = false;
+    }
+  }
+
   // Local, per-device message history cache (see `message-history.ts`).
   let historyClearBusy = false;
   let historyClearError = '';
@@ -436,6 +462,7 @@
     await loadDevices();
     await loadKeyBackup();
     pendingTokens = listPendingTokens();
+    notificationPermissionGranted = await hasNotificationPermission();
   });
 
   async function errorFrom(res: Response, fallback: string): Promise<string> {
@@ -735,6 +762,30 @@
               </li>
             {/each}
           </ul>
+        {/if}
+      </section>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Desktop notifications</h4>
+        <p class="text-[11px] text-[#00aa00]">
+          Get a native notification on this device for a new message when you aren't currently looking at Svalinn.
+          This is a per-device permission, like any other app -- it's never synced to the server or your other
+          devices, and you'll need to enable it again on each device you use.
+        </p>
+        {#if !notificationsSupported()}
+          <div class="text-xs text-[#00aa00]">{'>'} Notifications aren't supported in this environment.</div>
+        {:else if notificationPermissionGranted}
+          <div class="text-xs text-[#00ff00]">{'>'} Notifications are enabled on this device.</div>
+        {:else}
+          {#if notificationError}<div class="text-xs text-red-500">{'>'} {notificationError}</div>{/if}
+          <button
+            type="button"
+            class="text-xs text-[#00ff00] underline disabled:opacity-50"
+            disabled={notificationBusy}
+            on:click={handleEnableNotifications}
+          >
+            {notificationBusy ? 'Requesting...' : 'Enable notifications on this device'}
+          </button>
         {/if}
       </section>
 

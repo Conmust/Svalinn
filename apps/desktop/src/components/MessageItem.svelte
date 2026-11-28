@@ -83,7 +83,7 @@
 
 {#if message.is_hidden}
   <!-- Hidden for this user only -->
-  <div class="flex gap-3 px-4 py-1">
+  <div class="flex gap-3 px-4 py-1" data-message-id={message.id}>
     <div class="w-10 flex-shrink-0"></div>
     <div class="text-xs text-[#00aa00]/70 italic">
       Message from {displayName} hidden.
@@ -97,6 +97,7 @@
 {:else}
 <div
   class="group relative flex gap-3 px-4 py-2 hover:bg-[rgba(0,255,0,0.05)] transition-colors {isHighlighted ? 'bg-[rgba(0,255,0,0.1)] border-l-2 border-[#00ff00]' : mentionsMe ? 'bg-[rgba(255,204,0,0.08)] border-l-2 border-[#ffcc00]' : ''} {message.is_pinned ? 'border-l-2 border-[#00aa00]' : ''}"
+  data-message-id={message.id}
 >
   <!-- Selection Checkbox -->
   {#if selectionMode}

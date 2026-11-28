@@ -237,6 +237,81 @@ async fn handle_client_message(db: &Database, from_user: Uuid, text: &str) {
         relay_dm_signal(db, from_user, event).await;
     } else if VOICE_SIGNAL_EVENT_TYPES.contains(&event.event_type.as_str()) {
         relay_voice_signal(db, from_user, event).await;
+    } else if event.event_type == "typing" {
+        handle_typing(db, from_user, event).await;
+    }
+}
+
+/// Broadcasts a lightweight "this user is typing" signal -- never message
+/// content, just who and where -- to whoever would actually see it land:
+/// the rest of a channel's members who can view it, or the other
+/// participant of a DM conversation. The client is expected to resend this
+/// every few seconds while the user is actively composing (see
+/// `lib/typing.ts`) and the receiver times the indicator out on its own
+/// after a few seconds of silence, rather than this needing an explicit
+/// "stopped typing" event -- so a client that goes away mid-type (tab
+/// closed, connection dropped) never leaves a stuck indicator behind.
+async fn handle_typing(db: &Database, from_user: Uuid, event: ClientEvent) {
+    let Some(payload_map) = event.payload.as_object() else { return };
+
+    if let Some(channel_id) = payload_map
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        // The same permission a real send needs -- someone who can't post
+        // in a channel shouldn't be able to show up as "typing" in it
+        // either, and this also implicitly confirms they're a member who
+        // can view it (so the broadcast below can't be spoofed by sending
+        // a `channel_id` for a channel this user has no access to).
+        if crate::permissions::require_channel_permission(
+            db,
+            channel_id,
+            from_user,
+            crate::permissions::Permission::SEND_MESSAGES,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        let Ok(server_id) = crate::access::channel_server_id(db, channel_id).await else { return };
+        crate::routes::voice::broadcast_to_channel_viewers(
+            db,
+            "typing",
+            serde_json::json!({ "channel_id": channel_id, "user_id": from_user }),
+            server_id,
+            channel_id,
+        )
+        .await;
+        return;
+    }
+
+    if let Some(conversation_id) = payload_map
+        .get("conversation_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        let participants: Vec<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM conversation_participants WHERE conversation_id = $1")
+                .bind(conversation_id)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap_or_default();
+
+        if !participants.contains(&from_user) {
+            return; // not a participant of this conversation -- ignore, same as an unviewable channel_id above
+        }
+        let others: Vec<Uuid> = participants.into_iter().filter(|id| *id != from_user).collect();
+        if others.is_empty() {
+            return;
+        }
+
+        let _ = db.message_tx.send(BroadcastMessage::to_users(
+            "typing",
+            serde_json::json!({ "conversation_id": conversation_id, "user_id": from_user }),
+            others,
+        ));
     }
 }
 
@@ -379,6 +454,30 @@ mod tests {
             .expect("failed to insert test voice channel")
     }
 
+    async fn create_test_text_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'text') RETURNING id")
+            .bind(server_id)
+            .bind(format!("text-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test text channel")
+    }
+
+    async fn create_test_conversation(db: &Database, a: Uuid, b: Uuid) -> Uuid {
+        let conversation_id: Uuid = sqlx::query_scalar("INSERT INTO conversations DEFAULT VALUES RETURNING id")
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test conversation");
+        sqlx::query("INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)")
+            .bind(conversation_id)
+            .bind(a)
+            .bind(b)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test conversation participants");
+        conversation_id
+    }
+
     async fn cleanup_test_server(db: &Database, server_id: Uuid) {
         let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
     }
@@ -433,5 +532,87 @@ mod tests {
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, viewer).await;
         cleanup_test_user(&db, blocked).await;
+    }
+
+    fn typing_event(payload: serde_json::Value) -> ClientEvent {
+        ClientEvent { event_type: "typing".to_string(), payload }
+    }
+
+    /// Mirrors `announce_voice_departures_excludes_a_member_denied_view_channel`
+    /// above: a typing indicator must be scoped exactly like any other
+    /// channel broadcast, and must never be accepted from someone who
+    /// couldn't actually post there in the first place (so the broadcast
+    /// can't be spoofed with an arbitrary `channel_id`).
+    #[tokio::test]
+    async fn typing_in_a_channel_reaches_viewers_and_rejects_a_non_member() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_text_channel(&db, server).await;
+
+        let viewer = create_test_user(&db).await;
+        add_server_member(&db, server, viewer).await;
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+        sqlx::query("INSERT INTO channel_member_overwrites (channel_id, user_id, allow, deny) VALUES ($1, $2, 0, $3)")
+            .bind(channel)
+            .bind(blocked)
+            .bind(crate::permissions::Permission::VIEW_CHANNEL.0)
+            .execute(&db.pool)
+            .await
+            .expect("inserting the member overwrite should succeed");
+        let outsider = create_test_user(&db).await; // never joined the server at all
+
+        let mut rx = db.message_tx.subscribe();
+        handle_typing(&db, owner, typing_event(serde_json::json!({ "channel_id": channel }))).await;
+
+        let typing = rx.try_recv().expect("a typing event should have been broadcast");
+        assert_eq!(typing.event_type, "typing");
+        let recipients = typing.to_users.expect("typing must be scoped with to_users, not sent to the whole server");
+        assert!(recipients.contains(&viewer), "a member who can view the channel should see the typing indicator");
+        assert!(!recipients.contains(&blocked), "a member denied VIEW_CHANNEL must not see who's typing there");
+        assert_eq!(typing.payload["user_id"], owner.to_string(), "the typer's id must come from the authenticated connection, not the payload");
+
+        // An outsider with no SEND_MESSAGES permission here at all (they
+        // were never even added to the server) must not be able to make
+        // the channel broadcast a typing event under their name.
+        handle_typing(&db, outsider, typing_event(serde_json::json!({ "channel_id": channel }))).await;
+        assert!(rx.try_recv().is_err(), "a non-member's typing event must be silently dropped, not broadcast");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, viewer).await;
+        cleanup_test_user(&db, blocked).await;
+        cleanup_test_user(&db, outsider).await;
+    }
+
+    /// The DM counterpart: only the other participant of the conversation
+    /// should see the indicator, and a user who isn't part of the
+    /// conversation at all can't make it broadcast anything by guessing a
+    /// `conversation_id`.
+    #[tokio::test]
+    async fn typing_in_a_dm_reaches_only_the_other_participant() {
+        let db = test_db().await;
+        let a = create_test_user(&db).await;
+        let b = create_test_user(&db).await;
+        let outsider = create_test_user(&db).await;
+        let conversation = create_test_conversation(&db, a, b).await;
+
+        let mut rx = db.message_tx.subscribe();
+        handle_typing(&db, a, typing_event(serde_json::json!({ "conversation_id": conversation }))).await;
+
+        let typing = rx.try_recv().expect("a typing event should have been broadcast");
+        assert_eq!(typing.event_type, "typing");
+        let recipients = typing.to_users.expect("a DM typing event must be scoped with to_users");
+        assert_eq!(recipients, vec![b], "only the other participant should be notified");
+        assert_eq!(typing.payload["user_id"], a.to_string());
+
+        handle_typing(&db, outsider, typing_event(serde_json::json!({ "conversation_id": conversation }))).await;
+        assert!(rx.try_recv().is_err(), "a non-participant's typing event must be silently dropped, not broadcast");
+
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1").bind(conversation).execute(&db.pool).await;
+        cleanup_test_user(&db, a).await;
+        cleanup_test_user(&db, b).await;
+        cleanup_test_user(&db, outsider).await;
     }
 }

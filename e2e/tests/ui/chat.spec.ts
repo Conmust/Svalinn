@@ -189,6 +189,25 @@ test('revealing a pinned message lets a member who joins later read it; hiding i
   expect(pageErrors(latePage)).toEqual([]);
 });
 
+// Not E2EE, and deliberately carries no message content -- just "this
+// member is typing in this channel right now" (see
+// `routes/ws.rs::handle_typing` and `lib/typing.ts`). There's no explicit
+// "stopped typing" event; the indicator clears the moment the real message
+// arrives (`typingTracker.clear` in `ChatArea.svelte`), which this test
+// exercises rather than waiting out the multi-second idle timeout.
+test('a typing indicator appears for other members and clears once the message arrives', async ({ browser }) => {
+  const { ownerPage, memberPage } = await twoMembers(browser);
+
+  await ownerPage.getByPlaceholder('Type a message...').fill('working on it');
+  await expect(memberPage.getByText('is typing...')).toBeVisible();
+  // The typer's own view never shows their own indicator.
+  await expect(ownerPage.getByText('is typing...')).toHaveCount(0);
+
+  await ownerPage.getByRole('button', { name: 'Send' }).click();
+  await expect(memberPage.getByText('working on it')).toBeVisible();
+  await expect(memberPage.getByText('is typing...')).toHaveCount(0);
+});
+
 test('older messages load when scrolling up, keeping your place', async ({ browser }) => {
   const owner = await register('hist');
   const { server, channel } = await createServer(owner);
@@ -217,4 +236,51 @@ test('older messages load when scrolling up, keeping your place', async ({ brows
   await box.evaluate((el) => el.scrollTo(0, 0));
   await expect(shown).toHaveCount(120);
   await expect(page.getByText('This is the beginning of the channel')).toBeVisible();
+});
+
+// Channel messages are mandatory end-to-end encrypted, so there's no
+// server-side full-text search to call -- search instead pages in the rest
+// of a channel's history (same as scrolling to the top) and filters its
+// already-decrypted content client-side. This exercises that full path: a
+// match far enough back that it isn't part of the initially-loaded page.
+test('searching a channel finds and jumps to a message far back in its history', async ({ browser }) => {
+  const owner = await register('srch');
+  const { server, channel } = await createServer(owner);
+  await sql(
+    `INSERT INTO messages (channel_id, user_id, content, created_at)
+     SELECT $1, $2, 'filler ' || i, now() - interval '1 hour' + i * interval '1 second' FROM generate_series(1, 119) i`,
+    [channel.id, owner.user.id],
+  );
+  await sql(
+    `INSERT INTO messages (channel_id, user_id, content, created_at)
+     VALUES ($1, $2, 'the needle-marker-77 is buried here', now() - interval '1 hour' + 5 * interval '1 second')`,
+    [channel.id, owner.user.id],
+  );
+
+  const page = await openAs(browser, owner);
+  await openChannel(page, server.name);
+  await expect(page.getByText('filler 119', { exact: true })).toBeVisible();
+  // Not yet paginated into view -- the whole point of this test.
+  await expect(page.getByText('needle-marker-77')).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Search this channel' }).click();
+  await page.getByPlaceholder("Search this channel's messages...").fill('needle-marker-77');
+
+  const result = page.getByRole('button', { name: /needle-marker-77/ });
+  await expect(result).toBeVisible({ timeout: 15_000 });
+  await result.click();
+
+  // Jumping scrolled the real message into view and closed the search panel.
+  await expect(page.getByPlaceholder("Search this channel's messages...")).toHaveCount(0);
+  const found = messageRow(page, 'needle-marker-77');
+  await expect(found).toBeInViewport();
+});
+
+test('searching also finds a real (always-encrypted) message already on screen', async ({ browser }) => {
+  const { ownerPage } = await twoMembers(browser);
+  await sendMessage(ownerPage, 'the quokka guards the archive');
+
+  await ownerPage.getByRole('button', { name: 'Search this channel' }).click();
+  await ownerPage.getByPlaceholder("Search this channel's messages...").fill('quokka guards');
+  await expect(ownerPage.getByRole('button', { name: /quokka guards/ })).toBeVisible();
 });
