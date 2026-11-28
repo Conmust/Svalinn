@@ -2,7 +2,7 @@
   import { apiFetch, takeLogoutReason, apiBase, setServerUrl } from './lib/api';
   import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
-  import { getCurrentUser, login, register, logout } from './lib/auth';
+  import { getCurrentUser, login, register, logout, forgotPassword, completeTotpLogin, isTwoFactorRequired } from './lib/auth';
   import { deviceEncryptionReady, recoveryChoiceNeeded, recoveryCheckFailed, resetDeviceEncryptionSetup } from './lib/recovery';
   import ServerRail from './components/ServerRail.svelte';
   import SvalinnGauge from './components/SvalinnGauge.svelte';
@@ -108,6 +108,27 @@
   let serverUrl = apiBase();
   let editingServer = false;
 
+  // "Forgot password?" takes over the same card as the login form (see
+  // `showForgotPassword` in the template below) rather than being a
+  // separate route -- there's no router here, just the one login screen.
+  let showForgotPassword = false;
+  let forgotEmail = '';
+  let forgotLoading = false;
+  let forgotError = '';
+  let forgotMessage = '';
+  // Only ever set under APP_ENV=development -- see `forgotPassword`'s doc
+  // comment. In any other environment this stays undefined and the UI just
+  // shows the generic "check your email" message.
+  let forgotDevLink: string | undefined;
+
+  // 2FA login step: `login()` returns a pending token instead of a session
+  // when the account has TOTP enabled. Set, the login card swaps to a
+  // code-entry screen (see template below) in place of the normal form.
+  let pendingTotpToken: string | null = null;
+  let totpLoginCode = '';
+  let totpLoginError = '';
+  let totpLoginBusy = false;
+
   function handleServerSelected(event: CustomEvent<string | null>) {
     activeServer = event.detail;
     activeChannel = null;
@@ -176,8 +197,14 @@
       serverUrl = setServerUrl(serverUrl);
       editingServer = false;
       if (isLoginMode) {
-        const user = await login(authEmail, authPassword);
-        currentUser = user;
+        const result = await login(authEmail, authPassword);
+        if (isTwoFactorRequired(result)) {
+          pendingTotpToken = result.pendingToken;
+          totpLoginCode = '';
+          totpLoginError = '';
+        } else {
+          currentUser = result;
+        }
       } else {
         const user = await register(authUsername, authEmail, authPassword);
         currentUser = user;
@@ -190,6 +217,70 @@
       authError = err.message || 'Authentication failed';
     } finally {
       authLoading = false;
+    }
+  }
+
+  async function handleTotpLoginSubmit(e: Event) {
+    e.preventDefault();
+    if (!pendingTotpToken) return;
+    totpLoginError = '';
+    totpLoginBusy = true;
+    try {
+      currentUser = await completeTotpLogin(pendingTotpToken, totpLoginCode);
+      pendingTotpToken = null;
+      totpLoginCode = '';
+    } catch (err: any) {
+      totpLoginError = err.message || 'That code is incorrect';
+    } finally {
+      totpLoginBusy = false;
+    }
+  }
+
+  function cancelTotpLogin() {
+    pendingTotpToken = null;
+    totpLoginCode = '';
+    totpLoginError = '';
+  }
+
+  function openForgotPassword() {
+    showForgotPassword = true;
+    forgotError = '';
+    forgotMessage = '';
+    forgotDevLink = undefined;
+    // Carry over whatever the person already typed into the email field,
+    // since they're very likely requesting a reset for the account they
+    // were just trying to log into.
+    forgotEmail = authEmail;
+  }
+
+  function closeForgotPassword() {
+    showForgotPassword = false;
+    forgotEmail = '';
+    forgotError = '';
+    forgotMessage = '';
+    forgotDevLink = undefined;
+  }
+
+  async function handleForgotPasswordSubmit(e: Event) {
+    e.preventDefault();
+    forgotError = '';
+    forgotMessage = '';
+    forgotDevLink = undefined;
+    forgotLoading = true;
+
+    try {
+      serverUrl = setServerUrl(serverUrl);
+      editingServer = false;
+      const { devResetLink } = await forgotPassword(forgotEmail);
+      // Deliberately generic -- the server itself never reveals whether an
+      // account exists for this email (see `forgotPassword`'s doc comment),
+      // so neither does this message.
+      forgotMessage = 'If an account exists for that email, a password reset link has been sent. The link opens a page where you can set a new password.';
+      forgotDevLink = devResetLink;
+    } catch (err: any) {
+      forgotError = err.message || 'Could not request a password reset right now.';
+    } finally {
+      forgotLoading = false;
     }
   }
 </script>
@@ -303,86 +394,189 @@
         Svalinn
       </h1>
       <p class="text-xs text-[#00aa00] text-center mb-6 terminal-glow">
-        {'>'} {isLoginMode ? 'Access the network' : 'Join the network'}
+        {'>'} {showForgotPassword ? 'Reset your password' : pendingTotpToken ? 'Two-factor check' : (isLoginMode ? 'Access the network' : 'Join the network')}
       </p>
 
-      <form on:submit={handleAuthSubmit} class="space-y-4">
-        <div class="text-xs text-[#00aa00]">
-          {#if editingServer}
-            <label for="auth-server" class="block uppercase tracking-wider mb-1">Server</label>
+      {#if pendingTotpToken}
+        <form on:submit={handleTotpLoginSubmit} class="space-y-4">
+          <p class="text-xs text-[#00aa00]">
+            Enter the 6-digit code from your authenticator app, or one of your backup codes.
+          </p>
+
+          <div>
+            <label for="totp-login-code" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Code</label>
             <input
-              id="auth-server"
-              bind:value={serverUrl}
-              type="url"
+              id="totp-login-code"
+              bind:value={totpLoginCode}
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
               class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
-              placeholder="https://chat.example.com"
+              placeholder="123456"
               required
             />
-          {:else}
-            Server: <span class="text-[#00ff00]">{serverUrl}</span>
-            <button type="button" class="ml-1 underline hover:text-[#00ff00]" on:click={() => (editingServer = true)}>change</button>
-          {/if}
-        </div>
+          </div>
 
-        {#if !isLoginMode}
+          {#if totpLoginError}
+            <div class="text-xs text-red-500 terminal-glow">{'>'} {totpLoginError}</div>
+          {/if}
+
+          <button
+            type="submit"
+            disabled={totpLoginBusy}
+            class="w-full py-2 bg-[#00ff00] text-black font-bold uppercase tracking-wider hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50"
+          >
+            {totpLoginBusy ? 'Verifying...' : 'Verify'}
+          </button>
+        </form>
+
+        <div class="mt-6 text-center">
+          <button class="text-xs text-[#00aa00] hover:text-[#00ff00] terminal-glow" on:click={cancelTotpLogin}>
+            Back to login
+          </button>
+        </div>
+      {:else if showForgotPassword}
+        <form on:submit={handleForgotPasswordSubmit} class="space-y-4">
+          <p class="text-xs text-[#00aa00]">
+            Enter your account's email and we'll send a link to reset your password.
+          </p>
+
           <div>
-            <label for="auth-username" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Username</label>
-            <input 
-              id="auth-username"
-              bind:value={authUsername} 
-              type="text" 
-              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" 
-              placeholder="your_username"
-              required 
+            <label for="forgot-email" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Email</label>
+            <input
+              id="forgot-email"
+              bind:value={forgotEmail}
+              type="email"
+              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="you@example.com"
+              required
             />
           </div>
-        {/if}
 
-        <div>
-          <label for="auth-email" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Email</label>
-          <input 
-            id="auth-email"
-            bind:value={authEmail} 
-            type="email" 
-            class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" 
-            placeholder="you@example.com"
-            required 
-          />
+          {#if forgotError}
+            <div class="text-xs text-red-500 terminal-glow">{'>'} {forgotError}</div>
+          {/if}
+
+          {#if forgotMessage}
+            <div class="text-xs text-[#00ff00] terminal-glow">{'>'} {forgotMessage}</div>
+            {#if forgotDevLink}
+              <!-- Dev-only convenience: no real email provider is wired up yet
+                   (see svalinn-server's send_password_reset_email), so this
+                   link is handed back directly under APP_ENV=development. -->
+              <a
+                href={forgotDevLink}
+                target="_blank"
+                rel="noopener noreferrer"
+                class="block text-xs text-[#00aa00] underline hover:text-[#00ff00] break-all"
+              >
+                [dev] Open reset link
+              </a>
+            {/if}
+          {/if}
+
+          <button
+            type="submit"
+            disabled={forgotLoading}
+            class="w-full py-2 bg-[#00ff00] text-black font-bold uppercase tracking-wider hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50"
+          >
+            {forgotLoading ? 'Sending...' : 'Send reset link'}
+          </button>
+        </form>
+
+        <div class="mt-6 text-center">
+          <button
+            class="text-xs text-[#00aa00] hover:text-[#00ff00] terminal-glow"
+            on:click={closeForgotPassword}
+          >
+            Back to login
+          </button>
         </div>
+      {:else}
+        <form on:submit={handleAuthSubmit} class="space-y-4">
+          <div class="text-xs text-[#00aa00]">
+            {#if editingServer}
+              <label for="auth-server" class="block uppercase tracking-wider mb-1">Server</label>
+              <input
+                id="auth-server"
+                bind:value={serverUrl}
+                type="url"
+                class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+                placeholder="https://chat.example.com"
+                required
+              />
+            {:else}
+              Server: <span class="text-[#00ff00]">{serverUrl}</span>
+              <button type="button" class="ml-1 underline hover:text-[#00ff00]" on:click={() => (editingServer = true)}>change</button>
+            {/if}
+          </div>
 
-        <div>
-          <label for="auth-password" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Password</label>
-          <input 
-            id="auth-password"
-            bind:value={authPassword} 
-            type="password" 
-            class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]" 
-            placeholder="••••••••"
-            required 
-          />
+          {#if !isLoginMode}
+            <div>
+              <label for="auth-username" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Username</label>
+              <input
+                id="auth-username"
+                bind:value={authUsername}
+                type="text"
+                class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+                placeholder="your_username"
+                required
+              />
+            </div>
+          {/if}
+
+          <div>
+            <label for="auth-email" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Email</label>
+            <input
+              id="auth-email"
+              bind:value={authEmail}
+              type="email"
+              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="you@example.com"
+              required
+            />
+          </div>
+
+          <div>
+            <div class="flex items-baseline justify-between">
+              <label for="auth-password" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Password</label>
+              {#if isLoginMode}
+                <button type="button" class="text-xs text-[#00aa00] underline hover:text-[#00ff00]" on:click={openForgotPassword}>
+                  Forgot password?
+                </button>
+              {/if}
+            </div>
+            <input
+              id="auth-password"
+              bind:value={authPassword}
+              type="password"
+              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="••••••••"
+              required
+            />
+          </div>
+
+          {#if authError}
+            <div class="text-xs text-red-500 terminal-glow">{'>'} {authError}</div>
+          {/if}
+
+          <button
+            type="submit"
+            disabled={authLoading}
+            class="w-full py-2 bg-[#00ff00] text-black font-bold uppercase tracking-wider hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50"
+          >
+            {authLoading ? 'Processing...' : (isLoginMode ? 'Login' : 'Register')}
+          </button>
+        </form>
+
+        <div class="mt-6 text-center">
+          <button
+            class="text-xs text-[#00aa00] hover:text-[#00ff00] terminal-glow"
+            on:click={() => { isLoginMode = !isLoginMode; authError = ''; }}
+          >
+            {isLoginMode ? "Don't have an account? Register" : 'Already have an account? Login'}
+          </button>
         </div>
-
-        {#if authError}
-          <div class="text-xs text-red-500 terminal-glow">{'>'} {authError}</div>
-        {/if}
-
-        <button 
-          type="submit" 
-          disabled={authLoading}
-          class="w-full py-2 bg-[#00ff00] text-black font-bold uppercase tracking-wider hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50"
-        >
-          {authLoading ? 'Processing...' : (isLoginMode ? 'Login' : 'Register')}
-        </button>
-      </form>
-
-      <div class="mt-6 text-center">
-        <button 
-          class="text-xs text-[#00aa00] hover:text-[#00ff00] terminal-glow"
-          on:click={() => { isLoginMode = !isLoginMode; authError = ''; }}
-        >
-          {isLoginMode ? "Don't have an account? Register" : 'Already have an account? Login'}
-        </button>
-      </div>
+      {/if}
     </div>
   </div>
 {/if}

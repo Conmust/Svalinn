@@ -133,6 +133,28 @@ pub struct ResendVerificationResponse {
     pub dev_verification_link: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ForgotPasswordRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForgotPasswordResponse {
+    /// Same shape as `dev_verification_link` elsewhere, and for the same
+    /// reason (no real email provider wired up yet): only set under
+    /// `APP_ENV=development`. This field being absent never means "no
+    /// account with that email" -- the response is deliberately identical
+    /// either way; see `routes::auth::forgot_password`'s doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_reset_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub new_password: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub token: String,

@@ -56,6 +56,36 @@ pub const REAUTH_FAILURES_PER_USER: Rule = Rule { name: "reauth-user", limit: 5,
 pub const RESEND_VERIFICATION_PER_USER: Rule =
     Rule { name: "resend-verification-user", limit: 3, window: Duration::from_secs(15 * 60) };
 
+/// Forgot-password requests from one IP address. Unauthenticated (anyone
+/// can call it with any email), so this is the one that actually stops
+/// abuse; looser than the per-account rule below since a shared IP
+/// (office, NAT) legitimately requesting resets for several different
+/// accounts shouldn't collide with itself.
+pub const FORGOT_PASSWORD_PER_IP: Rule = Rule { name: "forgot-password-ip", limit: 10, window: Duration::from_secs(60 * 60) };
+/// Forgot-password requests for one account (by email blind index), from
+/// anywhere. Stops many IPs from being used to spam one victim's inbox with
+/// reset emails. Checked and recorded only once an account is confirmed to
+/// exist, and its result never changes the response -- see
+/// `routes::auth::forgot_password`'s doc comment for why that matters.
+pub const FORGOT_PASSWORD_PER_ACCOUNT: Rule =
+    Rule { name: "forgot-password-account", limit: 3, window: Duration::from_secs(60 * 60) };
+
+/// Wrong codes submitted to finish setting up 2FA (`routes::users::enable_totp`),
+/// per user. Loose-ish: someone legitimately fat-fingering a freshly
+/// scanned code a couple of times is normal; this only needs to stop
+/// unbounded guessing against a secret the attacker doesn't actually have.
+pub const TOTP_ENABLE_PER_USER: Rule = Rule { name: "totp-enable-user", limit: 10, window: Duration::from_secs(15 * 60) };
+/// Wrong codes (or backup codes) submitted to finish a 2FA login
+/// (`routes::auth::totp_login`), per *pending-login token*, not per
+/// account -- each pending token already comes from a correct password and
+/// expires in `PENDING_LOGIN_TTL_MINUTES`, so this just needs to stop an
+/// attacker who has stolen the pending token (and so the password) from
+/// brute-forcing the much smaller 6-digit space before it expires. Tight,
+/// because unlike a plain password there's no legitimate reason to need
+/// more than a handful of tries at one code.
+pub const TOTP_LOGIN_PER_PENDING_TOKEN: Rule =
+    Rule { name: "totp-login-pending", limit: 5, window: Duration::from_secs(10 * 60) };
+
 /// Prekey-bundle fetches from one caller against one SPECIFIC target
 /// device (`routes::ratchet::fetch_prekey_bundle`). That endpoint is
 /// deliberately open to any authenticated caller for any device id (a

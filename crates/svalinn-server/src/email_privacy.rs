@@ -111,6 +111,21 @@ pub fn is_plausible_format(email: &str) -> bool {
 /// Encrypts an email for storage. Randomized -- never use the output to
 /// compare two emails for equality; use `blind_index` for that instead.
 pub fn encrypt(email: &str) -> String {
+    // Encrypting normalized (not raw) input means decrypt() always returns
+    // the same canonical form that was hashed -- display code doesn't need
+    // to separately re-normalize before comparing it to anything.
+    encrypt_bytes(normalize(email).as_bytes())
+}
+
+/// The same AES-256-GCM key and scheme as [`encrypt`]/[`decrypt`], for
+/// anything that needs "recoverable by the server, never stored in
+/// plaintext" but isn't an email address and so shouldn't go through
+/// email's own trim/lowercase normalization (which would corrupt, say, a
+/// base32 secret or any other binary-ish payload). Currently used for TOTP
+/// secrets (`crate::totp`) -- there's no reason to manage a second
+/// encryption key for one more small secret with the exact same
+/// requirement as an email address.
+pub fn encrypt_bytes(data: &[u8]) -> String {
     let cipher = Aes256Gcm::new(encryption_key().into());
     // Drawn fresh from the OS CSPRNG for every call, never from a fixed or
     // zeroed buffer -- `generate_nonce` is the crate's own recommended way
@@ -118,12 +133,8 @@ pub fn encrypt(email: &str) -> String {
     // filling a stack buffer by hand) keeps the "this is genuinely random,
     // not a placeholder" property visible at the type level.
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-
-    // Encrypting normalized (not raw) input means decrypt() always returns
-    // the same canonical form that was hashed -- display code doesn't need
-    // to separately re-normalize before comparing it to anything.
     let ciphertext = cipher
-        .encrypt(&nonce, normalize(email).as_bytes())
+        .encrypt(&nonce, data)
         .expect("AES-GCM encryption with a valid 32-byte key cannot fail");
 
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -148,6 +159,12 @@ pub enum DecryptError {
 /// uses are sending mail to it (verification, password reset) and one-time
 /// migration backfills -- never a lookup/comparison path.
 pub fn decrypt(stored: &str) -> Result<String, DecryptError> {
+    let plaintext = decrypt_bytes(stored)?;
+    String::from_utf8(plaintext).map_err(|_| DecryptError::NotUtf8)
+}
+
+/// The raw-bytes counterpart to [`encrypt_bytes`] -- see its doc comment.
+pub fn decrypt_bytes(stored: &str) -> Result<Vec<u8>, DecryptError> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(stored)
         .map_err(|_| DecryptError::Encoding)?;
@@ -156,10 +173,9 @@ pub fn decrypt(stored: &str) -> Result<String, DecryptError> {
     }
     let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
     let cipher = Aes256Gcm::new(encryption_key().into());
-    let plaintext = cipher
+    cipher
         .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
-        .map_err(|_| DecryptError::Cipher)?;
-    String::from_utf8(plaintext).map_err(|_| DecryptError::NotUtf8)
+        .map_err(|_| DecryptError::Cipher)
 }
 
 /// A short, one-way stand-in for an account id, safe to put in a log line
