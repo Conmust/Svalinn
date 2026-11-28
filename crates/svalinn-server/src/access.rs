@@ -108,6 +108,14 @@ pub async fn channel_server_id(db: &Database, channel_id: Uuid) -> Result<Uuid, 
 pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
 /// Largest custom emoji image accepted, in bytes.
 pub const MAX_EMOJI_BYTES: usize = 2 * 1024 * 1024;
+/// Non-pinned attachment bytes a single server may have stored across all
+/// its channels at once -- see `routes::messages::check_attachment_quota`.
+/// Independent of `MAX_ATTACHMENT_BYTES`: a server can still accept any
+/// number of max-size attachments one at a time, this just stops the
+/// *total* from growing without bound on local disk. A pinned message's
+/// attachment doesn't count against it, same carve-out as the per-server
+/// message cap (`retention::MESSAGE_CAP_PER_SERVER`).
+pub const MAX_SERVER_ATTACHMENT_STORAGE_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 /// Request body limit for an upload of `max_file` bytes: the file plus room
 /// for the other form fields and multipart framing.
 pub const fn upload_body_limit(max_file: usize) -> usize {

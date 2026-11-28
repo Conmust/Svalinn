@@ -197,7 +197,8 @@ struct MessageContext {
 /// bypasses it the same way `resolve_channel` always lets them bypass
 /// everything.
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, Uuid, bool, bool, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+    type Row = (Uuid, Uuid, Uuid, bool, bool, bool, chrono::DateTime<chrono::Utc>);
+    let row: Option<Row> = sqlx::query_as(
         r#"
         SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted, COALESCE(m.is_pinned, false), m.created_at
         FROM messages m JOIN channels c ON m.channel_id = c.id
@@ -215,6 +216,41 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     crate::permissions::require_channel_permission(db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
 
     Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, created_at, role })
+}
+
+/// Rejects a new attachment once the server's existing non-pinned
+/// attachments already total `MAX_SERVER_ATTACHMENT_STORAGE_BYTES` --
+/// checked at send time (not cleaned up after the fact) so the server
+/// never silently evicts an old attachment to make room for a new one.
+/// `incoming_bytes` is the client-reported size of the attachment about to
+/// be attached; a non-positive value (no real attachment, or a client that
+/// never reported one) can't push anything over the line, so it's skipped
+/// without a query.
+async fn check_attachment_quota(db: &Database, server_id: Uuid, incoming_bytes: i64) -> Result<(), AppError> {
+    if incoming_bytes <= 0 {
+        return Ok(());
+    }
+
+    let current_total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(m.attachment_size), 0)::bigint
+        FROM messages m
+        JOIN channels c ON c.id = m.channel_id
+        WHERE c.server_id = $1 AND COALESCE(m.is_pinned, false) = false
+        "#,
+    )
+    .bind(server_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if current_total + incoming_bytes > crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "This server has reached its {}GB attachment storage limit. Pinning a message exempts its attachment from the limit; otherwise free up space before sending another.",
+            crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES / (1024 * 1024 * 1024)
+        )));
+    }
+    Ok(())
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -615,6 +651,22 @@ pub async fn create_message(
             return Err(AppError::BadRequest(
                 "attachment_url must be one of your own uploaded files or an http(s) URL".into(),
             ));
+        }
+    }
+    if has_attachment {
+        if let Err(e) = check_attachment_quota(&db, server_id, payload.attachment_size.unwrap_or(0)).await {
+            // The file behind `attachment_url` was already written to disk
+            // by the earlier upload step and is about to be rejected here
+            // with nothing ever pointing at it -- clean it up rather than
+            // leaving an orphan that doesn't even count toward the quota
+            // it just tripped. Only for our own local uploads (never an
+            // arbitrary http(s) URL, which isn't ours to delete).
+            if let Some(url) = payload.attachment_url.as_deref() {
+                if let Some(name) = url.strip_prefix("/uploads/") {
+                    let _ = tokio::fs::remove_file(std::path::Path::new("uploads").join(name)).await;
+                }
+            }
+            return Err(e);
         }
     }
 
@@ -2552,6 +2604,114 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::BadRequest(_))), "over the cap must be rejected, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Inserts a message with an attachment directly, bypassing
+    /// `create_message` -- these tests need to seed an existing attachment
+    /// total without going through a real upload.
+    async fn insert_raw_attachment(db: &Database, channel: Uuid, user: Uuid, size: i64, pinned: bool) {
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_size, is_pinned, pinned_by)
+            VALUES ($1, $2, 'att', '/uploads/seed.bin', $3, $4, CASE WHEN $4 THEN $2 ELSE NULL END)
+            "#,
+        )
+        .bind(channel)
+        .bind(user)
+        .bind(size)
+        .bind(pinned)
+        .execute(&db.pool)
+        .await
+        .expect("failed to seed a raw attachment");
+    }
+
+    async fn send_test_message_with_attachment(db: &Database, channel: Uuid, sender: Uuid, sender_device: Uuid, size: i64) -> Result<Message, AppError> {
+        create_message(
+            State(db.clone()),
+            CurrentSession { user_id: sender, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: Some("/uploads/new.bin".into()),
+                attachment_filename: Some("new.bin".into()),
+                attachment_size: Some(size),
+                attachment_mime_type: Some("application/octet-stream".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                encrypted_for: vec![EncryptedRecipient {
+                    device_id: sender_device,
+                    ciphertext: "ciphertext".into(),
+                    nonce: "nonce".into(),
+                    attachment_key_ciphertext: Some("key".into()),
+                    attachment_key_nonce: Some("key-nonce".into()),
+                    ratchet_header_json: None,
+                    attachment_key_ratchet_header_json: None,
+                }],
+                sender_device_id: sender_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await
+        .map(|Json(m)| m)
+    }
+
+    #[tokio::test]
+    async fn attachment_is_rejected_once_the_server_hits_its_storage_quota() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 95).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES - 1000, false).await;
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 2000).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "an attachment that would push the server over its storage quota must be rejected, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_is_accepted_when_it_fits_the_remaining_quota() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 96).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES - 5000, false).await;
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 1000).await;
+        assert!(result.is_ok(), "an attachment that still fits under the quota must be accepted, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Same carve-out as the message cap itself (`retention::MESSAGE_CAP_PER_SERVER`):
+    /// a pinned message's attachment is exempt from the quota entirely, not
+    /// merely cheaper -- a pinned attachment alone twice the size of the
+    /// whole quota must not block an ordinary new one.
+    #[tokio::test]
+    async fn pinned_attachments_do_not_count_toward_the_storage_quota() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 97).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES * 2, true).await;
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 1000).await;
+        assert!(
+            result.is_ok(),
+            "a pinned attachment must not count toward the storage quota, got {result:?}"
+        );
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
