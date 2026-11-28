@@ -197,7 +197,8 @@ struct MessageContext {
 /// bypasses it the same way `resolve_channel` always lets them bypass
 /// everything.
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, Uuid, bool, bool, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+    type Row = (Uuid, Uuid, Uuid, bool, bool, bool, chrono::DateTime<chrono::Utc>);
+    let row: Option<Row> = sqlx::query_as(
         r#"
         SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted, COALESCE(m.is_pinned, false), m.created_at
         FROM messages m JOIN channels c ON m.channel_id = c.id
@@ -215,6 +216,126 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     crate::permissions::require_channel_permission(db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
 
     Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, created_at, role })
+}
+
+async fn server_attachment_total(db: &Database, server_id: Uuid) -> Result<i64, AppError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(m.attachment_size), 0)::bigint
+        FROM messages m
+        JOIN channels c ON c.id = m.channel_id
+        WHERE c.server_id = $1 AND COALESCE(m.is_pinned, false) = false
+        "#,
+    )
+    .bind(server_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Strips the attachment from the single oldest non-pinned, still-attached
+/// message in `server_id`, deletes its file, and tells connected clients
+/// the attachment is gone (a `message_updated` with `attachment_url: null`,
+/// same event type every other in-place message change already uses) --
+/// the message itself, and its text content, are untouched. Also clears
+/// the now-meaningless per-device wrapped file keys in `message_recipients`
+/// for it, since they'd otherwise outlive the attachment they used to
+/// unlock. Returns `false` if there's nothing left eligible to evict
+/// (everything remaining is pinned, or the server has no attachments at
+/// all) -- a pinned attachment is never evicted to make room for anything.
+async fn evict_oldest_attachment(db: &Database, server_id: Uuid) -> Result<bool, AppError> {
+    type Row = (Uuid, Uuid, String);
+    let row: Option<Row> = sqlx::query_as(
+        r#"
+        SELECT m.id, m.channel_id, m.attachment_url
+        FROM messages m
+        JOIN channels c ON c.id = m.channel_id
+        WHERE c.server_id = $1 AND COALESCE(m.is_pinned, false) = false AND m.attachment_url IS NOT NULL
+        ORDER BY m.created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(server_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let Some((message_id, channel_id, attachment_url)) = row else {
+        return Ok(false);
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE messages SET
+            attachment_url = NULL, attachment_filename = NULL,
+            attachment_mime_type = NULL, attachment_size = NULL, attachment_nonce = NULL
+        WHERE id = $1
+        "#,
+    )
+    .bind(message_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    sqlx::query(
+        r#"
+        UPDATE message_recipients SET
+            attachment_key_ciphertext = NULL, attachment_key_nonce = NULL, attachment_key_ratchet_header_json = NULL
+        WHERE message_id = $1
+        "#,
+    )
+    .bind(message_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some(name) = attachment_url.strip_prefix("/uploads/") {
+        let _ = tokio::fs::remove_file(std::path::Path::new("uploads").join(name)).await; // already gone is fine
+    }
+
+    broadcast(
+        db,
+        "message_updated",
+        serde_json::json!({ "id": message_id, "attachment_url": serde_json::Value::Null, "attachment_evicted": true }),
+        server_id,
+        channel_id,
+    )
+    .await;
+
+    Ok(true)
+}
+
+/// Makes room for a new attachment under `MAX_SERVER_ATTACHMENT_STORAGE_BYTES`
+/// by evicting the server's oldest non-pinned attachments, one at a time,
+/// oldest first, until the new one fits -- a sliding window over the
+/// server's attachment history rather than a hard "no more until someone
+/// cleans up" wall. Pinning a message is still the way to exempt an
+/// attachment from ever being evicted this way. Only fails if the incoming
+/// attachment alone can't fit even once every evictable attachment is
+/// gone (it's bigger than the whole quota, or everything left is pinned) --
+/// that's the one case eviction genuinely can't solve.
+///
+/// `incoming_bytes` is the client-reported size of the attachment about to
+/// be attached; a non-positive value (no real attachment, or a client that
+/// never reported one) can't push anything over the line, so it's skipped
+/// without a query.
+async fn make_room_for_attachment(db: &Database, server_id: Uuid, incoming_bytes: i64) -> Result<(), AppError> {
+    if incoming_bytes <= 0 {
+        return Ok(());
+    }
+
+    loop {
+        let current_total = server_attachment_total(db, server_id).await?;
+        if current_total + incoming_bytes <= crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES {
+            return Ok(());
+        }
+        if !evict_oldest_attachment(db, server_id).await? {
+            return Err(AppError::BadRequest(format!(
+                "This attachment doesn't fit even after freeing everything this server's {}GB attachment limit allows evicting -- pin anything you need to keep, or send a smaller file.",
+                crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES / (1024 * 1024 * 1024)
+            )));
+        }
+    }
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -615,6 +736,22 @@ pub async fn create_message(
             return Err(AppError::BadRequest(
                 "attachment_url must be one of your own uploaded files or an http(s) URL".into(),
             ));
+        }
+    }
+    if has_attachment {
+        if let Err(e) = make_room_for_attachment(&db, server_id, payload.attachment_size.unwrap_or(0)).await {
+            // The file behind `attachment_url` was already written to disk
+            // by the earlier upload step and is about to be rejected here
+            // with nothing ever pointing at it -- clean it up rather than
+            // leaving an orphan that doesn't even count toward the quota
+            // it just tripped. Only for our own local uploads (never an
+            // arbitrary http(s) URL, which isn't ours to delete).
+            if let Some(url) = payload.attachment_url.as_deref() {
+                if let Some(name) = url.strip_prefix("/uploads/") {
+                    let _ = tokio::fs::remove_file(std::path::Path::new("uploads").join(name)).await;
+                }
+            }
+            return Err(e);
         }
     }
 
@@ -2552,6 +2689,198 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::BadRequest(_))), "over the cap must be rejected, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Inserts a message with an attachment directly, bypassing
+    /// `create_message` -- these tests need to seed an existing attachment
+    /// total without going through a real upload.
+    async fn insert_raw_attachment(db: &Database, channel: Uuid, user: Uuid, size: i64, pinned: bool) {
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_size, is_pinned, pinned_by)
+            VALUES ($1, $2, 'att', '/uploads/seed.bin', $3, $4, CASE WHEN $4 THEN $2 ELSE NULL END)
+            "#,
+        )
+        .bind(channel)
+        .bind(user)
+        .bind(size)
+        .bind(pinned)
+        .execute(&db.pool)
+        .await
+        .expect("failed to seed a raw attachment");
+    }
+
+    async fn send_test_message_with_attachment(db: &Database, channel: Uuid, sender: Uuid, sender_device: Uuid, size: i64) -> Result<Message, AppError> {
+        create_message(
+            State(db.clone()),
+            CurrentSession { user_id: sender, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: Some("/uploads/new.bin".into()),
+                attachment_filename: Some("new.bin".into()),
+                attachment_size: Some(size),
+                attachment_mime_type: Some("application/octet-stream".into()),
+                attachment_nonce: Some("file-nonce".into()),
+                encrypted_for: vec![EncryptedRecipient {
+                    device_id: sender_device,
+                    ciphertext: "ciphertext".into(),
+                    nonce: "nonce".into(),
+                    attachment_key_ciphertext: Some("key".into()),
+                    attachment_key_nonce: Some("key-nonce".into()),
+                    ratchet_header_json: None,
+                    attachment_key_ratchet_header_json: None,
+                }],
+                sender_device_id: sender_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await
+        .map(|Json(m)| m)
+    }
+
+    async fn has_attachment(db: &Database, message_id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT attachment_url IS NOT NULL FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to check attachment presence")
+    }
+
+    /// The headline behavior requested: instead of just refusing a send
+    /// that would bust the quota, the server frees room by stripping the
+    /// oldest non-pinned attachment(s) first, same direction as everything
+    /// else in this file (cap, not a wall) -- the send itself still
+    /// succeeds.
+    #[tokio::test]
+    async fn sending_an_attachment_evicts_the_oldest_non_pinned_one_to_make_room() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 95).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES - 1000, false).await;
+        let oldest_id: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = $1")
+            .bind(channel)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to find the seeded attachment's message");
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 2000).await;
+        assert!(result.is_ok(), "the send itself should succeed once enough room is freed, got {result:?}");
+
+        assert!(!has_attachment(&db, oldest_id).await, "the oldest non-pinned attachment should have been evicted to make room");
+        assert!(
+            server_attachment_total(&db, server).await.expect("failed to total attachments") <= crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES,
+            "the server's attachment total must be back under quota after eviction"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// One eviction isn't always enough -- a new attachment that needs
+    /// more room than any single old one holds should walk further back
+    /// through history, oldest first, until it fits.
+    #[tokio::test]
+    async fn sending_an_attachment_evicts_multiple_oldest_ones_if_one_is_not_enough() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 98).await;
+
+        // Three small attachments that together fill the quota -- no one
+        // of them is enough room on its own for the new send below.
+        let third = crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES / 3;
+        insert_raw_attachment(&db, channel, owner, third, false).await;
+        insert_raw_attachment(&db, channel, owner, third, false).await;
+        insert_raw_attachment(&db, channel, owner, third, false).await;
+        let seeded_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = $1 ORDER BY created_at ASC")
+            .bind(channel)
+            .fetch_all(&db.pool)
+            .await
+            .expect("failed to list seeded messages");
+
+        // Needs room two of the three don't have alone.
+        let result = send_test_message_with_attachment(&db, channel, owner, device, third * 2).await;
+        assert!(result.is_ok(), "the send should succeed once enough of the backlog is evicted, got {result:?}");
+
+        assert!(!has_attachment(&db, seeded_ids[0]).await, "the oldest seeded attachment should be evicted first");
+        assert!(!has_attachment(&db, seeded_ids[1]).await, "a second eviction should follow once the first alone isn't enough room");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// A pinned attachment is never evicted to make room, even if it's the
+    /// oldest thing in the channel and even if nothing else is evictable --
+    /// the send should fail rather than touch it.
+    #[tokio::test]
+    async fn eviction_never_touches_a_pinned_attachment() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 99).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES, true).await;
+        let pinned_id: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = $1")
+            .bind(channel)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to find the seeded pinned message");
+
+        // The server's non-pinned total is 0 (the only attachment is
+        // pinned), so this alone exceeding the whole quota is the one case
+        // eviction genuinely can't solve -- there's nothing left to evict.
+        let result = send_test_message_with_attachment(&db, channel, owner, device, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES + 1).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "a send that can't fit even with nothing left to evict must be rejected, got {result:?}");
+        assert!(has_attachment(&db, pinned_id).await, "a pinned attachment must survive even when eviction can't free enough room");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn attachment_is_accepted_when_it_fits_the_remaining_quota() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 96).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES - 5000, false).await;
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 1000).await;
+        assert!(result.is_ok(), "an attachment that still fits under the quota must be accepted, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Same carve-out as the message cap itself (`retention::MESSAGE_CAP_PER_SERVER`):
+    /// a pinned message's attachment is exempt from the quota entirely, not
+    /// merely cheaper -- a pinned attachment alone twice the size of the
+    /// whole quota must not block an ordinary new one.
+    #[tokio::test]
+    async fn pinned_attachments_do_not_count_toward_the_storage_quota() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let device = register_test_device(&db, owner, 97).await;
+
+        insert_raw_attachment(&db, channel, owner, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES * 2, true).await;
+
+        let result = send_test_message_with_attachment(&db, channel, owner, device, 1000).await;
+        assert!(
+            result.is_ok(),
+            "a pinned attachment must not count toward the storage quota, got {result:?}"
+        );
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
