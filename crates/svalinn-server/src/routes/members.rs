@@ -259,6 +259,7 @@ pub async fn kick_member(
         return Err(AppError::NotFound("That user isn't a member of this server".into()));
     }
     remove_member(&db, server_id, &server_name, target, "kicked").await?;
+    crate::audit_log::record(&db, server_id, actor, crate::audit_log::MEMBER_KICKED, Some(target), None, None, serde_json::json!({})).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -350,6 +351,7 @@ pub async fn ban_member(
     }
 
     remove_member(&db, server_id, &server_name, payload.user_id, "banned").await?;
+    crate::audit_log::record(&db, server_id, actor, crate::audit_log::MEMBER_BANNED, Some(payload.user_id), None, reason, serde_json::json!({})).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -444,6 +446,7 @@ pub async fn unban_member(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
     }
+    crate::audit_log::record(&db, server_id, actor, crate::audit_log::MEMBER_UNBANNED, Some(target), None, None, serde_json::json!({})).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -486,6 +489,13 @@ pub async fn set_member_role(
         return Err(AppError::Forbidden("You can only give roles below your own".into()));
     }
 
+    let old_role: Option<String> = sqlx::query_scalar("SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2")
+        .bind(server_id)
+        .bind(target)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
     sqlx::query("UPDATE server_members SET role = $1 WHERE server_id = $2 AND user_id = $3")
         .bind(role)
         .bind(server_id)
@@ -493,6 +503,18 @@ pub async fn set_member_role(
         .execute(&db.pool)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+    crate::audit_log::record(
+        &db,
+        server_id,
+        actor,
+        crate::audit_log::ROLE_CHANGED,
+        Some(target),
+        None,
+        None,
+        serde_json::json!({ "old_role": old_role.unwrap_or_else(|| "member".to_string()), "new_role": role }),
+    )
+    .await;
 
     let payload = serde_json::json!({ "server_id": server_id, "user_id": target, "role": role });
     let _ = db.message_tx.send(BroadcastMessage::to_server("member_updated", payload.clone(), server_id));
@@ -930,5 +952,119 @@ mod tests {
         );
 
         cleanup(&db, server_id, &[owner, evader]).await;
+    }
+
+    async fn audit_log_action(db: &Database, server_id: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT action FROM moderation_audit_log WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_optional(&db.pool)
+            .await
+            .expect("querying moderation_audit_log failed")
+    }
+
+    #[tokio::test]
+    async fn kick_member_is_recorded_in_the_audit_log() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let target = create_test_user(&db).await;
+        join_server(&db, server_id, target, "member").await;
+
+        kick_member(State(db.clone()), CurrentUser(owner), Path((server_id, target)))
+            .await
+            .expect("owner should be able to kick a plain member");
+
+        assert_eq!(audit_log_action(&db, server_id).await, Some(crate::audit_log::MEMBER_KICKED.to_string()));
+
+        cleanup(&db, server_id, &[owner, target]).await;
+    }
+
+    #[tokio::test]
+    async fn ban_member_is_recorded_in_the_audit_log_with_its_reason() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let target = create_test_user(&db).await;
+        join_server(&db, server_id, target, "member").await;
+
+        ban_member(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(server_id),
+            Json(BanRequest { user_id: target, reason: Some("spamming".into()) }),
+        )
+        .await
+        .expect("owner should be able to ban a plain member");
+
+        let entry: (String, Option<String>) =
+            sqlx::query_as("SELECT action, reason FROM moderation_audit_log WHERE server_id = $1")
+                .bind(server_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("a ban should write exactly one audit log entry");
+        assert_eq!(entry.0, crate::audit_log::MEMBER_BANNED);
+        assert_eq!(entry.1, Some("spamming".to_string()));
+
+        cleanup(&db, server_id, &[owner, target]).await;
+    }
+
+    #[tokio::test]
+    async fn unban_member_is_recorded_in_the_audit_log() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let target = create_test_user(&db).await;
+        join_server(&db, server_id, target, "member").await;
+        ban_member(State(db.clone()), CurrentUser(owner), Path(server_id), Json(BanRequest { user_id: target, reason: None }))
+            .await
+            .expect("owner should be able to ban a plain member");
+
+        unban_member(State(db.clone()), CurrentUser(owner), Path((server_id, target)))
+            .await
+            .expect("owner should be able to lift the ban");
+
+        let actions: Vec<String> = sqlx::query_scalar(
+            "SELECT action FROM moderation_audit_log WHERE server_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(server_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("querying moderation_audit_log failed");
+        assert_eq!(
+            actions,
+            vec![crate::audit_log::MEMBER_BANNED.to_string(), crate::audit_log::MEMBER_UNBANNED.to_string()]
+        );
+
+        cleanup(&db, server_id, &[owner, target]).await;
+    }
+
+    #[tokio::test]
+    async fn set_member_role_is_recorded_in_the_audit_log_with_old_and_new_role() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server_id = create_test_server(&db, owner).await;
+        let target = create_test_user(&db).await;
+        join_server(&db, server_id, target, "member").await;
+
+        set_member_role(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path((server_id, target)),
+            Json(SetRoleRequest { role: "moderator".into() }),
+        )
+        .await
+        .expect("owner should be able to promote a member to moderator");
+
+        let entry: (String, serde_json::Value) =
+            sqlx::query_as("SELECT action, metadata FROM moderation_audit_log WHERE server_id = $1")
+                .bind(server_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("a role change should write exactly one audit log entry");
+        assert_eq!(entry.0, crate::audit_log::ROLE_CHANGED);
+        assert_eq!(entry.1["old_role"], "member");
+        assert_eq!(entry.1["new_role"], "moderator");
+
+        cleanup(&db, server_id, &[owner, target]).await;
     }
 }
