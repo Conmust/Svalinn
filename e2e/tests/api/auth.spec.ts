@@ -81,6 +81,86 @@ test.describe('login tokens', () => {
   });
 });
 
+test.describe('password reset', () => {
+  test('forgot-password never reveals whether the account exists', async () => {
+    const u = await register('fp');
+
+    const known = await post('/auth/forgot-password', { email: u.email });
+    const unknown = await post('/auth/forgot-password', { email: `${uniq('nobody')}@example.test` });
+
+    // Same status, same shape, both times -- including for the known
+    // account, since the suite runs with APP_ENV=test (see support/config.ts),
+    // where `dev_reset_link` is just as absent as it is in real production.
+    expect(known.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    expect(known.body).toEqual(unknown.body);
+    expect(known.body.dev_reset_link).toBeUndefined();
+  });
+
+  test('a reset token actually changes the password and ends every existing session, not just other ones', async () => {
+    const u = await register('fp');
+    const second = await login(u.email, u.password); // a second, independent session for the same account
+    expect(second.status).toBe(200);
+
+    // No real email provider is wired up, and the suite's APP_ENV=test means
+    // even the dev-link convenience is off -- so the token is minted here
+    // directly, hashed exactly the way the server stores it (SHA-256 hex of
+    // the raw token -- see `routes::auth::hash_token`), standing in for "the
+    // user clicked the link they were emailed."
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await sql(
+      "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, NOW() + interval '1 hour')",
+      [tokenHash, u.user.id],
+    );
+
+    const reset = await post('/auth/reset-password', { token, new_password: 'a-brand-new-password' });
+    expect(reset.status).toBe(204);
+
+    expect((await login(u.email, u.password)).status).toBe(400);
+    expect((await login(u.email, 'a-brand-new-password')).status).toBe(200);
+
+    // Unlike `change_password` (which spares the session making the
+    // change), a forgot-password reset has no "current session" to spare --
+    // every refresh token for the account, including the second session
+    // opened above, should be revoked.
+    expect((await post('/auth/refresh', { refresh_token: u.refresh_token })).status).toBe(401);
+    expect((await post('/auth/refresh', { refresh_token: second.body.refresh_token })).status).toBe(401);
+  });
+
+  test('a reset token can only be used once, and an unknown token is rejected', async () => {
+    const u = await register('fp');
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await sql(
+      "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, NOW() + interval '1 hour')",
+      [tokenHash, u.user.id],
+    );
+
+    expect((await post('/auth/reset-password', { token: 'not-a-real-token', new_password: 'a-brand-new-password' })).status).toBe(400);
+    expect((await post('/auth/reset-password', { token, new_password: 'a-brand-new-password' })).status).toBe(204);
+    expect((await post('/auth/reset-password', { token, new_password: 'yet-another-password' })).status).toBe(400); // already used
+  });
+
+  test('an expired reset token is rejected', async () => {
+    const u = await register('fp');
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    await sql(
+      "INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, NOW() - interval '1 minute')",
+      [tokenHash, u.user.id],
+    );
+
+    expect((await post('/auth/reset-password', { token, new_password: 'a-brand-new-password' })).status).toBe(400);
+  });
+
+  test('limits forgot-password requests per IP address', async () => {
+    const ip = randomIp();
+    for (let i = 0; i < 10; i++) expect((await post('/auth/forgot-password', { email: `${uniq('nobody')}@example.test` }, ip)).status).toBe(200);
+    expect((await post('/auth/forgot-password', { email: `${uniq('nobody')}@example.test` }, ip)).status).toBe(429);
+  });
+});
+
 test.describe('rate limits', () => {
   test('locks an account from one IP after 5 wrong passwords, without locking the real owner out from elsewhere or affecting others', async () => {
     const u = await register('rl');

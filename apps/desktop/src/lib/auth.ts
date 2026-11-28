@@ -108,6 +108,35 @@ export async function resendVerificationEmail(): Promise<void> {
   }
 }
 
+/**
+ * Requests a password-reset email. Always resolves (there's no "that email
+ * doesn't exist" error to surface) -- the server deliberately returns the
+ * same response whether or not the account exists, so this can't be used to
+ * check whether someone has a Svalinn account. Returns a link to the reset
+ * page only under APP_ENV=development, for local testing without a real
+ * inbox; this is a standalone web page (not part of the desktop app), since
+ * actually resetting the password means typing one in, which a clicked
+ * link alone can't do for an app with no deep-link handler.
+ */
+export async function forgotPassword(email: string): Promise<{ devResetLink?: string }> {
+  const response = await fetch(`${apiBase()}/api/v1/auth/forgot-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+
+  if (!response.ok) {
+    // The server only fails this closed on its own rate limit, which still
+    // shouldn't reveal account existence -- so there's nothing account-
+    // specific to show here either.
+    const err = await response.json().catch(() => ({ error: 'Could not request a password reset right now.' }));
+    throw new Error(err.error || 'Could not request a password reset right now.');
+  }
+
+  const data = await response.json().catch(() => ({}));
+  return { devResetLink: data.dev_reset_link };
+}
+
 export function setAuth(token: string, user: User, refreshToken?: string): void {
   storeTokens(token, refreshToken);
   localStorage.setItem('user', JSON.stringify(user));

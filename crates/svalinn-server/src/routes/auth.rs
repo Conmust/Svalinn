@@ -12,7 +12,8 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse},
     Json,
 };
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -29,17 +30,23 @@ use crate::email_privacy;
 use crate::errors::AppError;
 use crate::extractors::auth::{jwt_secret, CurrentUser};
 use crate::rate_limit::{
-    ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_FAILURES_PER_ACCOUNT_IP, LOGIN_PER_IP, REGISTER_PER_IP,
-    RESEND_VERIFICATION_PER_USER,
+    ClientIp, FORGOT_PASSWORD_PER_ACCOUNT, FORGOT_PASSWORD_PER_IP, LOGIN_FAILURES_PER_ACCOUNT,
+    LOGIN_FAILURES_PER_ACCOUNT_IP, LOGIN_PER_IP, REGISTER_PER_IP, RESEND_VERIFICATION_PER_USER,
 };
 use crate::sessions::AccessDenied;
 use crate::models::user::{
-    AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, ResendVerificationResponse,
-    TokenResponse, User, VerifyEmailRequest,
+    AuthResponse, Claims, ForgotPasswordRequest, ForgotPasswordResponse, LoginRequest, RefreshRequest,
+    RegisterRequest, ResendVerificationResponse, ResetPasswordRequest, TokenResponse, User,
+    VerifyEmailRequest,
 };
 
 /// How long an emailed verification link stays usable.
 const EMAIL_VERIFICATION_TTL_HOURS: i64 = 48;
+/// How long an emailed password-reset link stays usable. Deliberately
+/// shorter than email verification -- a reset link is far more sensitive
+/// (anyone holding a live one can take over the account outright), and most
+/// people who request one use it within minutes.
+const PASSWORD_RESET_TTL_HOURS: i64 = 2;
 
 /// How long an access token (JWT) is valid.
 pub const ACCESS_TOKEN_TTL_SECONDS: i64 = 5 * 60;
@@ -342,6 +349,262 @@ pub(crate) fn send_verification_email(user_id: Uuid, _email: &str, token: &str) 
         None
     }
 }
+
+/// POST /api/v1/auth/forgot-password  `{ "email": "..." }`
+///
+/// Unauthenticated by nature (the whole point is the caller is locked out).
+/// Always returns the same `200` with the same shape whether or not an
+/// account exists for that email, and whether or not it just got rate
+/// limited -- the only way this handler is allowed to vary its behavior is
+/// internally (issuing a token, sending mail), never in what it tells the
+/// caller. Otherwise this endpoint would double as an account-existence
+/// oracle: "no email sent" vs "email sent" is exactly the signal an
+/// attacker enumerating email addresses wants, and a different error for
+/// "too many requests for this specific account" leaks the same thing.
+pub async fn forgot_password(
+    State(db): State<Database>,
+    ClientIp(ip): ClientIp,
+    Json(payload): Json<ForgotPasswordRequest>,
+) -> Result<Json<ForgotPasswordResponse>, AppError> {
+    let ip = ip.to_string();
+    db.limits.check(&FORGOT_PASSWORD_PER_IP, &ip)?;
+    db.limits.record(&FORGOT_PASSWORD_PER_IP, &ip);
+
+    let email_hash = email_privacy::blind_index(&payload.email);
+    let mut dev_reset_link = None;
+
+    let user_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE email_hash = $1")
+        .bind(&email_hash)
+        .fetch_optional(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some(user_id) = user_id {
+        // Checked (and only recorded on success) after the per-IP check
+        // above, not instead of it -- this one's job is stopping many IPs
+        // from piling onto a single victim's inbox, which the per-IP rule
+        // alone can't see. Failing it silently skips the email rather than
+        // returning any different response; see this function's doc comment.
+        if db.limits.check(&FORGOT_PASSWORD_PER_ACCOUNT, &email_hash).is_ok() {
+            db.limits.record(&FORGOT_PASSWORD_PER_ACCOUNT, &email_hash);
+            let token = issue_password_reset_token(&db, user_id).await?;
+            dev_reset_link = send_password_reset_email(user_id, &payload.email, &token);
+        }
+    }
+
+    Ok(Json(ForgotPasswordResponse { dev_reset_link }))
+}
+
+/// POST /api/v1/auth/reset-password  `{ "token": "...", "new_password": "..." }`
+pub async fn reset_password(
+    State(db): State<Database>,
+    Json(payload): Json<ResetPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    if payload.new_password.len() < 6 {
+        return Err(AppError::BadRequest("Password must be at least 6 characters".into()));
+    }
+
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let token_hash = hash_token(&payload.token);
+
+    let row: Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(db_err)?;
+
+    let Some((user_id, expires_at, used_at)) = row else {
+        return Err(AppError::BadRequest("That reset link is invalid.".into()));
+    };
+    if used_at.is_some() {
+        return Err(AppError::BadRequest("That reset link has already been used.".into()));
+    }
+    if expires_at <= Utc::now() {
+        return Err(AppError::BadRequest("That reset link has expired. Request a new one.".into()));
+    }
+
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let hash = Argon2::default()
+        .hash_password(payload.new_password.as_bytes(), &salt)
+        .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))?
+        .to_string();
+
+    let mut tx = db.pool.begin().await.map_err(db_err)?;
+    sqlx::query("UPDATE password_reset_tokens SET used_at = NOW() WHERE token_hash = $1")
+        .bind(&token_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&hash)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    // Unlike `change_password` (which spares the session making the
+    // change), a password reset has no "current session" to spare -- the
+    // caller isn't logged in, that's the entire premise. So every session
+    // ends, not just other ones: if this reset is happening because the
+    // account was compromised, leaving the attacker's own session alive
+    // through it would defeat the point.
+    sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Generates a one-time password-reset token, stores only its hash (same
+/// pattern as refresh/verification tokens), and returns the raw token.
+pub(crate) async fn issue_password_reset_token(db: &Database, user_id: Uuid) -> Result<String, AppError> {
+    let token = new_refresh_token();
+    let expires_at = Utc::now() + Duration::hours(PASSWORD_RESET_TTL_HOURS);
+
+    sqlx::query("INSERT INTO password_reset_tokens (token_hash, user_id, expires_at) VALUES ($1, $2, $3)")
+        .bind(hash_token(&token))
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(token)
+}
+
+/// Stub until a real transactional-email provider is chosen and wired up --
+/// see `send_verification_email`'s doc comment, which this mirrors exactly,
+/// down to never logging the address itself. The link points at
+/// `reset_password_page`, a small server-rendered page (no desktop app
+/// needed) where the new password is actually typed in; in development,
+/// also returned directly for local testing without a real inbox.
+pub(crate) fn send_password_reset_email(user_id: Uuid, _email: &str, token: &str) -> Option<String> {
+    let base = std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "http://localhost:3001".into());
+    let link = format!("{base}/api/v1/auth/reset-password-page?token={token}");
+    println!(
+        "✉️  Password reset link issued for user {} (TODO: wire up a real email provider to send it)",
+        crate::email_privacy::log_ref(user_id)
+    );
+
+    if std::env::var("APP_ENV").as_deref() == Ok("development") {
+        Some(link)
+    } else {
+        None
+    }
+}
+
+/// GET /api/v1/auth/reset-password-page?token=...
+///
+/// A minimal, entirely static, server-rendered page -- so the link in a
+/// password-reset email works for anyone with a browser, with no need to
+/// have the desktop app installed (unlike email verification, resetting a
+/// password needs the person to actually type something, which `verify_email`
+/// never did). The token from the query string is read client-side, by this
+/// page's own script, from `location.search` -- it is never interpolated
+/// into the returned HTML itself, so there's nothing here for a crafted
+/// `token` value to inject into. The page is one fixed string regardless of
+/// the query string; all per-request behavior happens in the browser, via
+/// `fetch` against the JSON endpoints above.
+pub async fn reset_password_page() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Defense in depth only -- see the doc comment above for why
+            // there's no injection surface here in the first place. Blocks
+            // this page from being framed or used to phone home anywhere
+            // but this same origin.
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+            ),
+        ],
+        Html(RESET_PASSWORD_PAGE_HTML),
+    )
+}
+
+const RESET_PASSWORD_PAGE_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Reset your Svalinn password</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: ui-monospace, monospace; background: #0a0e0a; color: #00ff00; display: flex;
+         align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  main { width: 100%; max-width: 360px; padding: 2rem; border: 2px solid #00ff00; box-sizing: border-box; }
+  h1 { font-size: 1.1rem; text-transform: uppercase; letter-spacing: 0.1em; }
+  label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+          color: #00aa00; margin: 1rem 0 0.25rem; }
+  input { width: 100%; box-sizing: border-box; background: black; border: 1px solid #00ff00;
+          color: #00ff00; padding: 0.5rem; font: inherit; }
+  button { margin-top: 1.5rem; width: 100%; padding: 0.6rem; background: #00ff00; color: black;
+           border: none; font-weight: bold; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #msg { margin-top: 1rem; font-size: 0.8rem; white-space: pre-wrap; }
+  .error { color: #ff5555; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reset your password</h1>
+  <form id="f">
+    <label for="p1">New password</label>
+    <input id="p1" type="password" required minlength="6" autocomplete="new-password">
+    <label for="p2">Confirm new password</label>
+    <input id="p2" type="password" required minlength="6" autocomplete="new-password">
+    <button type="submit" id="submit">Reset password</button>
+  </form>
+  <div id="msg"></div>
+</main>
+<script>
+(function () {
+  var token = new URLSearchParams(location.search).get('token') || '';
+  var form = document.getElementById('f');
+  var msg = document.getElementById('msg');
+  var submit = document.getElementById('submit');
+  if (!token) {
+    msg.textContent = 'This link is missing its token. Request a new one from the app.';
+    msg.className = 'error';
+    form.style.display = 'none';
+    return;
+  }
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var p1 = document.getElementById('p1').value;
+    var p2 = document.getElementById('p2').value;
+    msg.className = '';
+    if (p1 !== p2) { msg.textContent = 'Passwords do not match.'; msg.className = 'error'; return; }
+    submit.disabled = true;
+    msg.textContent = 'Resetting...';
+    fetch('/api/v1/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, new_password: p1 }),
+    }).then(function (res) {
+      if (res.ok) {
+        msg.textContent = 'Password reset. You can close this page and log in with your new password.';
+        form.style.display = 'none';
+      } else {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          msg.textContent = body.error || 'Could not reset the password.';
+          msg.className = 'error';
+          submit.disabled = false;
+        });
+      }
+    }).catch(function () {
+      msg.textContent = 'Network error. Check your connection and try again.';
+      msg.className = 'error';
+      submit.disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>"#;
 
 /// POST /api/v1/auth/refresh  `{ "refresh_token": "..." }`
 ///
@@ -804,6 +1067,176 @@ mod tests {
             Err(AppError::TooManyRequests { .. }) => {}
             other => panic!("expected a TooManyRequests once the per-user limit is exceeded, got {other:?}"),
         }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn forgot_password_then_reset_logs_in_with_the_new_password_and_ends_every_session() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("ForgotPw-{}@Example.Invalid", Uuid::new_v4());
+
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let old_refresh_token = reg.0.refresh_token.clone();
+
+        let forgot = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email: email.clone() }))
+            .await
+            .expect("forgot-password should always succeed");
+        let link = forgot.0.dev_reset_link.expect("dev link is returned under APP_ENV=development");
+        let token = link.split("token=").nth(1).expect("link should carry a token").to_string();
+
+        reset_password(State(db.clone()), Json(ResetPasswordRequest { token, new_password: "newpassword456".into() }))
+            .await
+            .expect("reset should succeed with a fresh, unused token");
+
+        // The old password no longer works...
+        match login(State(db.clone()), test_ip(), Json(LoginRequest { email: email.clone(), password: "password123".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected the old password to be rejected, got {other:?}"),
+        }
+        // ...the new one does...
+        login(State(db.clone()), test_ip(), Json(LoginRequest { email, password: "newpassword456".into() }))
+            .await
+            .expect("the new password should work");
+        // ...and the session that existed before the reset was ended, not
+        // just the password changed -- this is what makes a reset actually
+        // safe to use when the account may be compromised.
+        match refresh(State(db.clone()), Json(RefreshRequest { refresh_token: old_refresh_token })).await {
+            Err(_) => {}
+            Ok(_) => panic!("the pre-reset session's refresh token should have been revoked"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn forgot_password_does_not_reveal_whether_the_account_exists() {
+        ensure_test_secrets();
+        let db = test_db().await;
+
+        // No account at all for this address.
+        let unknown = forgot_password(
+            State(db.clone()),
+            test_ip(),
+            Json(ForgotPasswordRequest { email: format!("NoSuchAccount-{}@Example.Invalid", Uuid::new_v4()) }),
+        )
+        .await
+        .expect("forgot-password must never error just because the account doesn't exist");
+
+        // The response shape is identical either way: no field that's only
+        // present (or only absent) depending on account existence, besides
+        // `dev_reset_link`, which is a `development`-only debugging
+        // convenience and is `None` here precisely because no email was
+        // actually sent -- see this function's own doc comment.
+        assert!(unknown.0.dev_reset_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_an_unknown_or_already_used_token() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("ResetReuse-{}@Example.Invalid", Uuid::new_v4());
+
+        register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+
+        // A token that was never issued.
+        match reset_password(State(db.clone()), Json(ResetPasswordRequest { token: "not-a-real-token".into(), new_password: "newpassword456".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for an unknown token, got {other:?}"),
+        }
+
+        let forgot = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email }))
+            .await
+            .expect("forgot-password should succeed");
+        let link = forgot.0.dev_reset_link.expect("dev link expected under APP_ENV=development");
+        let token = link.split("token=").nth(1).unwrap().to_string();
+
+        reset_password(State(db.clone()), Json(ResetPasswordRequest { token: token.clone(), new_password: "newpassword456".into() }))
+            .await
+            .expect("the first use should succeed");
+
+        match reset_password(State(db.clone()), Json(ResetPasswordRequest { token, new_password: "yetanotherpassword789".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest when reusing an already-used token, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_a_too_short_password() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("ResetShort-{}@Example.Invalid", Uuid::new_v4());
+
+        register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+
+        let forgot = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email }))
+            .await
+            .expect("forgot-password should succeed");
+        let link = forgot.0.dev_reset_link.unwrap();
+        let token = link.split("token=").nth(1).unwrap().to_string();
+
+        match reset_password(State(db.clone()), Json(ResetPasswordRequest { token, new_password: "short".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for a too-short password, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn forgot_password_is_rate_limited_per_account() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("ForgotPwRate-{}@Example.Invalid", Uuid::new_v4());
+
+        register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+
+        // FORGOT_PASSWORD_PER_ACCOUNT allows 3 per window. A 4th request for
+        // the same account should still return the same generic success
+        // shape (never a TooManyRequests -- that would leak that the
+        // account exists), just with no token actually issued, which shows
+        // up here as `dev_reset_link` going back to `None`.
+        for _ in 0..3 {
+            let got = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email: email.clone() }))
+                .await
+                .expect("should be within the per-account limit");
+            assert!(got.0.dev_reset_link.is_some());
+        }
+        let fourth = forgot_password(State(db.clone()), test_ip(), Json(ForgotPasswordRequest { email }))
+            .await
+            .expect("forgot-password must still return success once the account is rate limited");
+        assert!(fourth.0.dev_reset_link.is_none());
 
         cleanup_user(&db, &username).await;
     }

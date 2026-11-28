@@ -56,6 +56,20 @@ pub const REAUTH_FAILURES_PER_USER: Rule = Rule { name: "reauth-user", limit: 5,
 pub const RESEND_VERIFICATION_PER_USER: Rule =
     Rule { name: "resend-verification-user", limit: 3, window: Duration::from_secs(15 * 60) };
 
+/// Forgot-password requests from one IP address. Unauthenticated (anyone
+/// can call it with any email), so this is the one that actually stops
+/// abuse; looser than the per-account rule below since a shared IP
+/// (office, NAT) legitimately requesting resets for several different
+/// accounts shouldn't collide with itself.
+pub const FORGOT_PASSWORD_PER_IP: Rule = Rule { name: "forgot-password-ip", limit: 10, window: Duration::from_secs(60 * 60) };
+/// Forgot-password requests for one account (by email blind index), from
+/// anywhere. Stops many IPs from being used to spam one victim's inbox with
+/// reset emails. Checked and recorded only once an account is confirmed to
+/// exist, and its result never changes the response -- see
+/// `routes::auth::forgot_password`'s doc comment for why that matters.
+pub const FORGOT_PASSWORD_PER_ACCOUNT: Rule =
+    Rule { name: "forgot-password-account", limit: 3, window: Duration::from_secs(60 * 60) };
+
 /// Prekey-bundle fetches from one caller against one SPECIFIC target
 /// device (`routes::ratchet::fetch_prekey_bundle`). That endpoint is
 /// deliberately open to any authenticated caller for any device id (a

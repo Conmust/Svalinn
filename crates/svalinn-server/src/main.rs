@@ -113,6 +113,9 @@ async fn main() {
         .route("/api/v1/auth/logout", post(routes::auth::logout))
         .route("/api/v1/auth/verify-email", get(routes::auth::verify_email))
         .route("/api/v1/auth/resend-verification", post(routes::auth::resend_verification))
+        .route("/api/v1/auth/forgot-password", post(routes::auth::forgot_password))
+        .route("/api/v1/auth/reset-password", post(routes::auth::reset_password))
+        .route("/api/v1/auth/reset-password-page", get(routes::auth::reset_password_page))
 
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))
