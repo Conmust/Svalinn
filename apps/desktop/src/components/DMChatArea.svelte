@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick, createEventDispatcher } from 'svelte';
   import { wsClient } from '../lib/websocket';
+  import InlineEmojiPicker from './InlineEmojiPicker.svelte';
   import {
     type ConversationMessage,
     type MessageRecipientEntry,
@@ -89,6 +90,7 @@
    * the user removes it explicitly. */
   let selectedFile: File | null = null;
   let fileInputEl: HTMLInputElement;
+  let messageInput: HTMLInputElement;
   /** Set when a selected file is rejected client-side (too large) --
    * shown next to the compose box; distinct from `panelError` since
    * nothing else about the panel is affected. */
@@ -878,6 +880,19 @@
     attachmentError = null;
   }
 
+  // Insert the picked emoji where the cursor is, then put the cursor after
+  // it -- mirrors ChatArea.svelte's identical helper.
+  async function insertEmoji(event: CustomEvent<string>) {
+    const emoji = event.detail;
+    const start = messageInput?.selectionStart ?? newMessage.length;
+    const end = messageInput?.selectionEnd ?? newMessage.length;
+    newMessage = newMessage.slice(0, start) + emoji + newMessage.slice(end);
+    await tick();
+    messageInput?.focus();
+    const pos = start + emoji.length;
+    messageInput?.setSelectionRange(pos, pos);
+  }
+
   async function handleSendMessage(e: Event) {
     e.preventDefault();
     const content = newMessage.trim();
@@ -1134,7 +1149,9 @@
       >
         📎
       </button>
+      <InlineEmojiPicker on:select={insertEmoji} />
       <input
+        bind:this={messageInput}
         bind:value={newMessage}
         type="text"
         class="flex-1 min-w-0 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)] disabled:opacity-50"
