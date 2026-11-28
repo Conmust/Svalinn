@@ -491,19 +491,49 @@ mod tests {
         // Old, unread by nobody-in-particular (no other member exists to
         // even be "unread" for), and squarely beyond the cap -- the only
         // reason this should survive is `is_pinned`.
-        insert_messages_ending(&db, channel, owner, MESSAGE_CAP_PER_SERVER + 10, Utc::now() - chrono::Duration::days(UNREAD_GRACE_DAYS + 5)).await;
-        mark_fully_read(&db, owner, channel).await;
+        //
+        // `sweep_once` sweeps every server in the database, not just this
+        // test's own -- it has to, that's the feature. `cargo test` runs
+        // tests concurrently by default, and several other tests in this
+        // module call `sweep_once` directly too. Inserting the messages and
+        // then pinning the oldest one as two separate, separately-committed
+        // statements left a real window where a concurrently-running
+        // test's own `sweep_once` call could see this channel after the
+        // insert but before the pin landed -- unpinned, already past the
+        // grace period, over the cap -- and delete the very message this
+        // test is about to pin, failing it outright. Doing both inside one
+        // transaction closes that window: under Postgres's default READ
+        // COMMITTED isolation, no other session (including another test's
+        // concurrent sweep) can see any of these rows until this commits,
+        // by which point the oldest one is already pinned.
+        let mut tx = db.pool.begin().await.expect("failed to start transaction");
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, created_at)
+            SELECT $1, $2, 'msg ' || i, $3::timestamptz - (($4 - i) * interval '1 minute')
+            FROM generate_series(1, $4) AS i
+            "#,
+        )
+        .bind(channel)
+        .bind(owner)
+        .bind(Utc::now() - chrono::Duration::days(UNREAD_GRACE_DAYS + 5))
+        .bind(MESSAGE_CAP_PER_SERVER + 10)
+        .execute(&mut *tx)
+        .await
+        .expect("failed to bulk insert test messages");
 
-        let oldest_id: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = $1 ORDER BY created_at ASC LIMIT 1")
-            .bind(channel)
-            .fetch_one(&db.pool)
-            .await
-            .expect("failed to find the oldest message");
-        sqlx::query("UPDATE messages SET is_pinned = true WHERE id = $1")
-            .bind(oldest_id)
-            .execute(&db.pool)
-            .await
-            .expect("failed to pin the oldest message");
+        let oldest_id: Uuid = sqlx::query_scalar(
+            "UPDATE messages SET is_pinned = true \
+             WHERE id = (SELECT id FROM messages WHERE channel_id = $1 ORDER BY created_at ASC LIMIT 1) \
+             RETURNING id",
+        )
+        .bind(channel)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("failed to pin the oldest message");
+        tx.commit().await.expect("failed to commit the insert+pin setup");
+
+        mark_fully_read(&db, owner, channel).await;
 
         sweep_once(&db).await.expect("sweep should succeed");
 
