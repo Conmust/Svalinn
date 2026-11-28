@@ -233,6 +233,11 @@ async fn main() {
             "/api/v1/channels/:channel_id/member-devices",
             get(routes::channels::get_channel_member_devices),
         )
+        .route(
+            "/api/v1/channels/:channel_id/slowmode",
+            patch(routes::channels::set_channel_slowmode),
+        )
+        .route("/api/v1/servers/:server_id/usage", get(routes::servers::get_server_usage))
 
         // --- Voice Channel Routes: join/leave/mute go over REST; the
         // WebRTC mesh those joins set up is signaled over the WS instead

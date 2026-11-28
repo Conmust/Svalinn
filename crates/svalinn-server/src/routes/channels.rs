@@ -22,6 +22,10 @@ pub struct Channel {
     pub channel_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub has_unread: bool,
+    /// Minimum seconds an ordinary member must wait between messages in
+    /// this channel; 0 means no slowmode. See `set_channel_slowmode` and
+    /// its enforcement in `routes::messages::create_message`.
+    pub slowmode_seconds: i32,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +65,7 @@ pub async fn get_server_channels(
         r#"
         SELECT
             c.id, c.server_id, c.name, COALESCE(c.type, 'text') AS channel_type, c.created_at,
+            c.slowmode_seconds,
             EXISTS(
                 SELECT 1 FROM messages m
                 WHERE m.channel_id = c.id
@@ -155,7 +160,7 @@ pub async fn create_channel(
     let channel: Channel = sqlx::query_as(
         r#"
         INSERT INTO channels (server_id, name, type) VALUES ($1, $2, $3)
-        RETURNING id, server_id, name, COALESCE(type, 'text') AS channel_type, created_at, false AS has_unread
+        RETURNING id, server_id, name, COALESCE(type, 'text') AS channel_type, created_at, false AS has_unread, slowmode_seconds
         "#,
     )
     .bind(server_id)
@@ -197,6 +202,56 @@ pub async fn rename_channel(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let payload = serde_json::json!({ "id": channel_id, "server_id": server_id, "name": name });
+    let recipients = members_who_can_view(&db, server_id, channel_id).await?;
+    let _ = db.message_tx.send(BroadcastMessage::to_users("channel_updated", payload.clone(), recipients));
+    Ok(Json(payload))
+}
+
+/// Six hours -- comfortably above anything a real slowmode setting would
+/// use (Discord's own UI tops out at the same value), just a backstop
+/// against a typo locking a channel to an absurd wait.
+pub const MAX_SLOWMODE_SECONDS: i32 = 21_600;
+
+#[derive(Deserialize)]
+pub struct SetSlowmodeRequest {
+    pub seconds: i32,
+}
+
+/// PATCH /api/v1/channels/:channel_id/slowmode  `{ "seconds": 0 }`
+///
+/// Sets the minimum gap an ordinary member must leave between messages in
+/// this channel; 0 turns slowmode off. Any non-negative value up to
+/// `MAX_SLOWMODE_SECONDS` is accepted -- the client is expected to offer
+/// quick presets (15s, 30s, ...) alongside a custom value, but the server
+/// doesn't restrict it to those presets. Same gate as rename/delete:
+/// admin rank or the `manage_channels` permission.
+///
+/// Enforcement itself lives in `routes::messages::create_message`; members
+/// holding `manage_messages` on the channel are exempt from it, same as
+/// Discord's moderator exemption.
+pub async fn set_channel_slowmode(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(channel_id): Path<Uuid>,
+    Json(payload): Json<SetSlowmodeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let server_id = channel_server_id(&db, channel_id).await?;
+    require_channel_admin(&db, server_id, user_id).await?;
+
+    if !(0..=MAX_SLOWMODE_SECONDS).contains(&payload.seconds) {
+        return Err(AppError::BadRequest(format!(
+            "slowmode seconds must be between 0 and {MAX_SLOWMODE_SECONDS}"
+        )));
+    }
+
+    sqlx::query("UPDATE channels SET slowmode_seconds = $1 WHERE id = $2")
+        .bind(payload.seconds)
+        .bind(channel_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let payload = serde_json::json!({ "id": channel_id, "server_id": server_id, "slowmode_seconds": payload.seconds });
     let recipients = members_who_can_view(&db, server_id, channel_id).await?;
     let _ = db.message_tx.send(BroadcastMessage::to_users("channel_updated", payload.clone(), recipients));
     Ok(Json(payload))
@@ -290,4 +345,159 @@ pub async fn get_channel_member_devices(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(Json(devices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> Database {
+        dotenvy::dotenv().ok();
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required for tests");
+        Database::new(&database_url).await.expect("failed to connect to test database")
+    }
+
+    async fn create_test_user(db: &Database) -> Uuid {
+        let unique = Uuid::new_v4();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind("not-a-real-hash")
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    async fn create_test_server(db: &Database, owner_id: Uuid) -> Uuid {
+        let server_id: Uuid = sqlx::query_scalar("INSERT INTO servers (name, owner_id) VALUES ($1, $2) RETURNING id")
+            .bind(format!("Test Server {}", Uuid::new_v4()))
+            .bind(owner_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test server");
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'owner')")
+            .bind(server_id)
+            .bind(owner_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert owner membership");
+        server_id
+    }
+
+    async fn add_server_member(db: &Database, server_id: Uuid, user_id: Uuid) {
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+    }
+
+    async fn create_test_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'text') RETURNING id")
+            .bind(server_id)
+            .bind(format!("general-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test channel")
+    }
+
+    async fn cleanup_test_server(db: &Database, server_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM servers WHERE id = $1").bind(server_id).execute(&db.pool).await;
+    }
+
+    async fn cleanup_test_user(db: &Database, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1").bind(user_id).execute(&db.pool).await;
+    }
+
+    async fn slowmode_of(db: &Database, channel_id: Uuid) -> i32 {
+        sqlx::query_scalar("SELECT slowmode_seconds FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to read slowmode_seconds")
+    }
+
+    #[tokio::test]
+    async fn an_admin_can_set_and_clear_channel_slowmode() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let _ = set_channel_slowmode(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetSlowmodeRequest { seconds: 30 }))
+            .await
+            .expect("an owner should be able to set slowmode");
+        assert_eq!(slowmode_of(&db, channel).await, 30);
+
+        let _ = set_channel_slowmode(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetSlowmodeRequest { seconds: 0 }))
+            .await
+            .expect("an owner should be able to turn slowmode back off");
+        assert_eq!(slowmode_of(&db, channel).await, 0);
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_member_cannot_set_channel_slowmode() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+
+        let result = set_channel_slowmode(State(db.clone()), CurrentUser(member), Path(channel), Json(SetSlowmodeRequest { seconds: 15 })).await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))), "an ordinary member must not be able to set slowmode, got {result:?}");
+        assert_eq!(slowmode_of(&db, channel).await, 0, "the rejected attempt must not have changed anything");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    #[tokio::test]
+    async fn slowmode_seconds_out_of_range_is_rejected() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let negative = set_channel_slowmode(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetSlowmodeRequest { seconds: -1 })).await;
+        assert!(matches!(negative, Err(AppError::BadRequest(_))), "a negative slowmode should be rejected, got {negative:?}");
+
+        let too_large =
+            set_channel_slowmode(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetSlowmodeRequest { seconds: MAX_SLOWMODE_SECONDS + 1 })).await;
+        assert!(matches!(too_large, Err(AppError::BadRequest(_))), "a slowmode above the max should be rejected, got {too_large:?}");
+
+        assert_eq!(slowmode_of(&db, channel).await, 0, "neither rejected attempt should have changed anything");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn get_server_channels_reports_the_current_slowmode() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let _ = set_channel_slowmode(State(db.clone()), CurrentUser(owner), Path(channel), Json(SetSlowmodeRequest { seconds: 45 }))
+            .await
+            .expect("setting slowmode should succeed");
+
+        let channels = get_server_channels(State(db.clone()), CurrentUser(owner), Path(server))
+            .await
+            .expect("listing channels should succeed")
+            .0;
+        let listed = channels.iter().find(|c| c.id == channel).expect("the channel should be listed");
+        assert_eq!(listed.slowmode_seconds, 45, "the channel list must reflect the current slowmode setting");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
 }

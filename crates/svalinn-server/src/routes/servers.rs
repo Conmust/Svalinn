@@ -217,6 +217,24 @@ pub async fn update_server(
     sign_opt(&mut server.icon_url, user_id, session_id);
     Ok(Json(server))
 }
+// ---------- USAGE ----------
+
+/// GET /api/v1/servers/:server_id/usage
+///
+/// Owner/admin-only visibility into where this server stands against the
+/// retention, pin and attachment-storage caps -- see `retention::ServerUsage`
+/// for what each field means. Without this, a server's own owner has no way
+/// to see "480/500 messages" or "4.2GB/5GB" before the hourly sweep or the
+/// attachment quota's sliding-window eviction silently acts on their behalf.
+pub async fn get_server_usage(
+    State(db): State<Database>,
+    CurrentSession { user_id, .. }: CurrentSession,
+    Path(server_id): Path<Uuid>,
+) -> Result<Json<crate::retention::ServerUsage>, AppError> {
+    require_admin(&db, server_id, user_id).await?;
+    Ok(Json(crate::retention::usage_summary(&db, server_id).await?))
+}
+
 #[derive(Deserialize)]
 pub struct DeleteServerRequest {
     pub current_password: String,
@@ -506,5 +524,90 @@ mod tests {
 
         cleanup_test_server(&db, result.0.id).await;
         cleanup_test_user(&db, owner).await;
+    }
+
+    // ---------- Server usage ----------
+
+    async fn create_test_channel(db: &Database, server_id: Uuid) -> Uuid {
+        sqlx::query_scalar("INSERT INTO channels (server_id, name, type) VALUES ($1, $2, 'text') RETURNING id")
+            .bind(server_id)
+            .bind(format!("general-{}", Uuid::new_v4()))
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to insert test channel")
+    }
+
+    async fn insert_plain_message(db: &Database, channel_id: Uuid, user_id: Uuid, pinned: bool) {
+        sqlx::query("INSERT INTO messages (channel_id, user_id, content, is_pinned) VALUES ($1, $2, 'hi', $3)")
+            .bind(channel_id)
+            .bind(user_id)
+            .bind(pinned)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert test message");
+    }
+
+    async fn insert_message_with_attachment(db: &Database, channel_id: Uuid, user_id: Uuid, size: i64, pinned: bool) {
+        sqlx::query(
+            "INSERT INTO messages (channel_id, user_id, content, attachment_url, attachment_filename, attachment_mime_type, attachment_size, is_pinned) \
+             VALUES ($1, $2, '', '/uploads/test.bin', 'test.bin', 'application/octet-stream', $3, $4)",
+        )
+        .bind(channel_id)
+        .bind(user_id)
+        .bind(size)
+        .bind(pinned)
+        .execute(&db.pool)
+        .await
+        .expect("failed to insert test message with attachment");
+    }
+
+    #[tokio::test]
+    async fn get_server_usage_counts_messages_pins_and_attachment_bytes() {
+        let db = test_db().await;
+        let admin = create_test_user(&db).await;
+        let server_id = create_test_server_with_admin(&db, admin).await;
+        let channel = create_test_channel(&db, server_id).await;
+
+        insert_plain_message(&db, channel, admin, false).await;
+        insert_plain_message(&db, channel, admin, false).await;
+        insert_plain_message(&db, channel, admin, true).await;
+        insert_message_with_attachment(&db, channel, admin, 1_000, false).await;
+        insert_message_with_attachment(&db, channel, admin, 2_000, true).await;
+
+        let usage = get_server_usage(State(db.clone()), CurrentSession { user_id: admin, session_id: Uuid::new_v4() }, Path(server_id))
+            .await
+            .expect("an admin should be able to read server usage")
+            .0;
+
+        assert_eq!(usage.message_count, 3, "3 non-pinned messages were inserted (2 plain + 1 with an attachment)");
+        assert_eq!(usage.pinned_count, 2, "2 pinned messages were inserted (1 plain + 1 with an attachment)");
+        assert_eq!(usage.message_cap, crate::retention::MESSAGE_CAP_PER_SERVER);
+        assert_eq!(usage.pin_cap, crate::retention::PIN_CAP_PER_SERVER);
+        assert_eq!(usage.attachment_bytes_used, 1_000, "only the non-pinned attachment should count toward the quota");
+        assert_eq!(usage.attachment_quota_bytes, crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES);
+
+        cleanup_test_server(&db, server_id).await;
+        cleanup_test_user(&db, admin).await;
+    }
+
+    #[tokio::test]
+    async fn get_server_usage_is_rejected_for_a_non_admin_member() {
+        let db = test_db().await;
+        let admin = create_test_user(&db).await;
+        let server_id = create_test_server_with_admin(&db, admin).await;
+        let member = create_test_user(&db).await;
+        sqlx::query("INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(server_id)
+            .bind(member)
+            .execute(&db.pool)
+            .await
+            .expect("failed to insert member");
+
+        let result = get_server_usage(State(db.clone()), CurrentSession { user_id: member, session_id: Uuid::new_v4() }, Path(server_id)).await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))), "an ordinary member must not see server usage, got {result:?}");
+
+        cleanup_test_server(&db, server_id).await;
+        cleanup_test_user(&db, admin).await;
+        cleanup_test_user(&db, member).await;
     }
 }

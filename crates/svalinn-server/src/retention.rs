@@ -24,10 +24,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::Utc;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::routes::messages::delete_message_now;
+use crate::errors::AppError;
+use crate::routes::messages::{delete_message_now, server_attachment_total};
 
 /// Non-pinned messages kept per server before older ones become deletion
 /// candidates, subject to the unread exemption below.
@@ -57,6 +59,102 @@ pub const PIN_CAP_PER_SERVER: i64 = 200;
 pub const UNPIN_IMMEDIATE_LOSS_DAYS: i64 = UNREAD_GRACE_DAYS;
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// A server's current standing against every cap this module enforces,
+/// for an owner/admin to see before the hourly sweep or the attachment
+/// quota silently acts -- see `routes::servers::get_server_usage`.
+#[derive(Debug, Serialize)]
+pub struct ServerUsage {
+    /// Non-pinned messages currently stored for this server, and the cap
+    /// the hourly sweep trims them to (`MESSAGE_CAP_PER_SERVER`). Can
+    /// exceed the cap between sweeps, or while messages are protected by
+    /// the unread exemption below.
+    pub message_count: i64,
+    pub message_cap: i64,
+    /// Pinned messages, capped separately (enforced at pin time, not by
+    /// the sweep) -- see `PIN_CAP_PER_SERVER`.
+    pub pinned_count: i64,
+    pub pin_cap: i64,
+    /// Of the messages past `message_cap`, how many are currently being
+    /// kept alive only because some current member hasn't read them yet
+    /// (and they're still within `UNREAD_GRACE_DAYS`) -- i.e. how much of
+    /// `unread_backlog_cap` is actually in use right now.
+    pub unread_backlog_count: i64,
+    pub unread_backlog_cap: i64,
+    /// Non-pinned attachment bytes stored for this server, and the quota
+    /// the sliding-window eviction in `routes::messages::make_room_for_attachment`
+    /// keeps it under.
+    pub attachment_bytes_used: i64,
+    pub attachment_quota_bytes: i64,
+}
+
+/// Computes `ServerUsage` fresh, on demand -- see that struct's fields for
+/// what each number means and which cap it's measured against.
+pub async fn usage_summary(db: &Database, server_id: Uuid) -> Result<ServerUsage, AppError> {
+    let (message_count, pinned_count): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE COALESCE(m.is_pinned, false) = false),
+            COUNT(*) FILTER (WHERE COALESCE(m.is_pinned, false) = true)
+        FROM messages m
+        JOIN channels c ON c.id = m.channel_id
+        WHERE c.server_id = $1
+        "#,
+    )
+    .bind(server_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Mirrors `sweep_once`'s own "past the cap, and still unread by some
+    // current member within the grace period" test, but just counts
+    // rather than collecting full rows -- this is an on-demand read, not
+    // a deletion pass, so nothing here ever touches a message.
+    let unread_backlog_count: i64 = sqlx::query_scalar(
+        r#"
+        WITH ranked AS (
+            SELECT m.id, m.channel_id, m.created_at,
+                   ROW_NUMBER() OVER (ORDER BY m.created_at DESC, m.id DESC) AS rn
+            FROM messages m
+            JOIN channels c ON c.id = m.channel_id
+            WHERE c.server_id = $1 AND COALESCE(m.is_pinned, false) = false
+        ),
+        candidates AS (
+            SELECT id, channel_id, created_at FROM ranked WHERE rn > $2
+        )
+        SELECT COUNT(*)::bigint
+        FROM candidates cand
+        WHERE (NOW() - cand.created_at) < make_interval(days => $3)
+          AND EXISTS (
+                SELECT 1
+                FROM server_members sme
+                LEFT JOIN channel_reads cr ON cr.user_id = sme.user_id AND cr.channel_id = cand.channel_id
+                LEFT JOIN messages lm ON lm.id = cr.last_read_message_id
+                WHERE sme.server_id = $1
+                  AND (cr.id IS NULL OR lm.created_at IS NULL OR lm.created_at < cand.created_at)
+          )
+        "#,
+    )
+    .bind(server_id)
+    .bind(MESSAGE_CAP_PER_SERVER)
+    .bind(UNREAD_GRACE_DAYS as i32)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let attachment_bytes_used = server_attachment_total(db, server_id).await?;
+
+    Ok(ServerUsage {
+        message_count,
+        message_cap: MESSAGE_CAP_PER_SERVER,
+        pinned_count,
+        pin_cap: PIN_CAP_PER_SERVER,
+        unread_backlog_count,
+        unread_backlog_cap: MAX_UNREAD_BACKLOG_PER_SERVER,
+        attachment_bytes_used,
+        attachment_quota_bytes: crate::access::MAX_SERVER_ATTACHMENT_STORAGE_BYTES,
+    })
+}
 
 /// Starts the periodic retention sweep. Fire-and-forget, same pattern as
 /// `sessions::spawn_watchers` and `stats::spawn_snapshot_job`: a failure
@@ -393,19 +491,49 @@ mod tests {
         // Old, unread by nobody-in-particular (no other member exists to
         // even be "unread" for), and squarely beyond the cap -- the only
         // reason this should survive is `is_pinned`.
-        insert_messages_ending(&db, channel, owner, MESSAGE_CAP_PER_SERVER + 10, Utc::now() - chrono::Duration::days(UNREAD_GRACE_DAYS + 5)).await;
-        mark_fully_read(&db, owner, channel).await;
+        //
+        // `sweep_once` sweeps every server in the database, not just this
+        // test's own -- it has to, that's the feature. `cargo test` runs
+        // tests concurrently by default, and several other tests in this
+        // module call `sweep_once` directly too. Inserting the messages and
+        // then pinning the oldest one as two separate, separately-committed
+        // statements left a real window where a concurrently-running
+        // test's own `sweep_once` call could see this channel after the
+        // insert but before the pin landed -- unpinned, already past the
+        // grace period, over the cap -- and delete the very message this
+        // test is about to pin, failing it outright. Doing both inside one
+        // transaction closes that window: under Postgres's default READ
+        // COMMITTED isolation, no other session (including another test's
+        // concurrent sweep) can see any of these rows until this commits,
+        // by which point the oldest one is already pinned.
+        let mut tx = db.pool.begin().await.expect("failed to start transaction");
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, created_at)
+            SELECT $1, $2, 'msg ' || i, $3::timestamptz - (($4 - i) * interval '1 minute')
+            FROM generate_series(1, $4) AS i
+            "#,
+        )
+        .bind(channel)
+        .bind(owner)
+        .bind(Utc::now() - chrono::Duration::days(UNREAD_GRACE_DAYS + 5))
+        .bind(MESSAGE_CAP_PER_SERVER + 10)
+        .execute(&mut *tx)
+        .await
+        .expect("failed to bulk insert test messages");
 
-        let oldest_id: Uuid = sqlx::query_scalar("SELECT id FROM messages WHERE channel_id = $1 ORDER BY created_at ASC LIMIT 1")
-            .bind(channel)
-            .fetch_one(&db.pool)
-            .await
-            .expect("failed to find the oldest message");
-        sqlx::query("UPDATE messages SET is_pinned = true WHERE id = $1")
-            .bind(oldest_id)
-            .execute(&db.pool)
-            .await
-            .expect("failed to pin the oldest message");
+        let oldest_id: Uuid = sqlx::query_scalar(
+            "UPDATE messages SET is_pinned = true \
+             WHERE id = (SELECT id FROM messages WHERE channel_id = $1 ORDER BY created_at ASC LIMIT 1) \
+             RETURNING id",
+        )
+        .bind(channel)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("failed to pin the oldest message");
+        tx.commit().await.expect("failed to commit the insert+pin setup");
+
+        mark_fully_read(&db, owner, channel).await;
 
         sweep_once(&db).await.expect("sweep should succeed");
 
