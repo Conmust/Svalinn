@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::disposable_email;
+use crate::email_delivery;
 use crate::email_privacy;
 use crate::errors::AppError;
 use crate::extractors::auth::{jwt_secret, CurrentUser};
@@ -145,7 +146,7 @@ pub async fn register(
     })?;
 
     let verification_token = issue_verification_token(&db, user.id).await?;
-    let dev_link = send_verification_email(user.id, &payload.email, &verification_token);
+    let dev_link = send_verification_email(user.id, &payload.email, &verification_token).await;
 
     // Only accounts actually created count towards the limit.
     db.limits.record(&REGISTER_PER_IP, &ip);
@@ -386,7 +387,7 @@ pub async fn verify_email(
 /// POST /api/v1/auth/resend-verification
 ///
 /// Issues a fresh verification link for the logged-in caller's own account.
-/// Needed because there's currently no real email provider wired up (see
+/// Needed because email delivery can fail or a link can simply expire (see
 /// `send_verification_email`) -- without this, anyone whose first link
 /// never arrived, or whose 48-hour link expired, would be permanently
 /// unable to join a server (`accept_invite` requires a verified email),
@@ -424,7 +425,7 @@ pub async fn resend_verification(
         .unwrap_or_default();
 
     let token = issue_verification_token(&db, user_id).await?;
-    let dev_verification_link = send_verification_email(user_id, &email, &token);
+    let dev_verification_link = send_verification_email(user_id, &email, &token).await;
 
     Ok(Json(ResendVerificationResponse { dev_verification_link }))
 }
@@ -448,25 +449,40 @@ pub(crate) async fn issue_verification_token(db: &Database, user_id: Uuid) -> Re
     Ok(token)
 }
 
-/// Stub until a real transactional-email provider is chosen and wired up:
-/// logs that a verification link was issued, by user id only -- deliberately
-/// never the email address itself, since a log line is also a plaintext
-/// storage location and the whole point of this feature is to not have one.
-/// In development, also returns the link itself so a local client/tester
-/// can use it without needing a real inbox; `None` everywhere else.
-pub(crate) fn send_verification_email(user_id: Uuid, _email: &str, token: &str) -> Option<String> {
+/// Sends (via `email_delivery::send`, Resend's API) or, in development,
+/// just hands back a verification link -- logs that a link was issued, by
+/// user id only, deliberately never the email address itself, since a log
+/// line is also a plaintext storage location and the whole point of this
+/// feature is to not have one. In development, returns the link itself so
+/// a local client/tester can use it without needing a real inbox or a
+/// Resend account; `None` everywhere else, whether or not sending actually
+/// succeeded -- a flaky email provider should never be the reason
+/// registration itself fails (the failure is still logged, by user id
+/// only, for an operator to notice and `resend-verification` lets the user
+/// retry).
+pub(crate) async fn send_verification_email(user_id: Uuid, email: &str, token: &str) -> Option<String> {
     let base = std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "http://localhost:3001".into());
     let link = format!("{base}/api/v1/auth/verify-email?token={token}");
     println!(
-        "✉️  Verification link issued for user {} (TODO: wire up a real email provider to send it)",
+        "✉️  Verification link issued for user {}",
         crate::email_privacy::log_ref(user_id)
     );
 
     if std::env::var("APP_ENV").as_deref() == Ok("development") {
-        Some(link)
-    } else {
-        None
+        return Some(link);
     }
+
+    let subject = "Verify your Svalinn email address";
+    let html = format!(
+        "<p>Click the link below to verify your email address for Svalinn:</p><p><a href=\"{link}\">{link}</a></p><p>This link expires in 48 hours. If you didn't create a Svalinn account, you can ignore this email.</p>"
+    );
+    if let Err(e) = email_delivery::send(email, subject, &html).await {
+        eprintln!(
+            "❌ Failed to send verification email for user {}: {e}",
+            crate::email_privacy::log_ref(user_id)
+        );
+    }
+    None
 }
 
 /// POST /api/v1/auth/forgot-password  `{ "email": "..." }`
@@ -507,7 +523,7 @@ pub async fn forgot_password(
         if db.limits.check(&FORGOT_PASSWORD_PER_ACCOUNT, &email_hash).is_ok() {
             db.limits.record(&FORGOT_PASSWORD_PER_ACCOUNT, &email_hash);
             let token = issue_password_reset_token(&db, user_id).await?;
-            dev_reset_link = send_password_reset_email(user_id, &payload.email, &token);
+            dev_reset_link = send_password_reset_email(user_id, &payload.email, &token).await;
         }
     }
 
@@ -595,25 +611,38 @@ pub(crate) async fn issue_password_reset_token(db: &Database, user_id: Uuid) -> 
     Ok(token)
 }
 
-/// Stub until a real transactional-email provider is chosen and wired up --
-/// see `send_verification_email`'s doc comment, which this mirrors exactly,
-/// down to never logging the address itself. The link points at
+/// Sends (via `email_delivery::send`, Resend's API) or, in development,
+/// just hands back a password-reset link -- see `send_verification_email`'s
+/// doc comment, which this mirrors exactly, down to never logging the
+/// address itself and never letting a flaky email provider affect the
+/// caller's result (`forgot_password` always returns the same response
+/// regardless -- see its own doc comment on why). The link points at
 /// `reset_password_page`, a small server-rendered page (no desktop app
 /// needed) where the new password is actually typed in; in development,
-/// also returned directly for local testing without a real inbox.
-pub(crate) fn send_password_reset_email(user_id: Uuid, _email: &str, token: &str) -> Option<String> {
+/// returned directly for local testing without a real inbox.
+pub(crate) async fn send_password_reset_email(user_id: Uuid, email: &str, token: &str) -> Option<String> {
     let base = std::env::var("PUBLIC_API_URL").unwrap_or_else(|_| "http://localhost:3001".into());
     let link = format!("{base}/api/v1/auth/reset-password-page?token={token}");
     println!(
-        "✉️  Password reset link issued for user {} (TODO: wire up a real email provider to send it)",
+        "✉️  Password reset link issued for user {}",
         crate::email_privacy::log_ref(user_id)
     );
 
     if std::env::var("APP_ENV").as_deref() == Ok("development") {
-        Some(link)
-    } else {
-        None
+        return Some(link);
     }
+
+    let subject = "Reset your Svalinn password";
+    let html = format!(
+        "<p>Click the link below to reset your Svalinn password:</p><p><a href=\"{link}\">{link}</a></p><p>This link expires soon and can only be used once. If you didn't request this, you can ignore this email.</p>"
+    );
+    if let Err(e) = email_delivery::send(email, subject, &html).await {
+        eprintln!(
+            "❌ Failed to send password-reset email for user {}: {e}",
+            crate::email_privacy::log_ref(user_id)
+        );
+    }
+    None
 }
 
 /// GET /api/v1/auth/reset-password-page?token=...

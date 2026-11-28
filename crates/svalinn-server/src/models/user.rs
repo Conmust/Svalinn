@@ -112,10 +112,11 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub user: PublicUser,
     /// The verification link, present only when `APP_ENV=development` and
-    /// only right after registration -- there's no real email provider
-    /// wired up yet (see `routes::auth::send_verification_email`), so this
-    /// is how a local dev/test client gets at it without one. Never set in
-    /// any other environment.
+    /// only right after registration -- in development, this link is
+    /// returned directly instead of actually emailed (see
+    /// `routes::auth::send_verification_email`), so this is how a local
+    /// dev/test client gets at it without a real inbox. Never set in any
+    /// other environment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dev_verification_link: Option<String>,
 }
