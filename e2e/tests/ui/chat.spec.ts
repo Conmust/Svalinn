@@ -189,6 +189,25 @@ test('revealing a pinned message lets a member who joins later read it; hiding i
   expect(pageErrors(latePage)).toEqual([]);
 });
 
+// Not E2EE, and deliberately carries no message content -- just "this
+// member is typing in this channel right now" (see
+// `routes/ws.rs::handle_typing` and `lib/typing.ts`). There's no explicit
+// "stopped typing" event; the indicator clears the moment the real message
+// arrives (`typingTracker.clear` in `ChatArea.svelte`), which this test
+// exercises rather than waiting out the multi-second idle timeout.
+test('a typing indicator appears for other members and clears once the message arrives', async ({ browser }) => {
+  const { ownerPage, memberPage } = await twoMembers(browser);
+
+  await ownerPage.getByPlaceholder('Type a message...').fill('working on it');
+  await expect(memberPage.getByText('is typing...')).toBeVisible();
+  // The typer's own view never shows their own indicator.
+  await expect(ownerPage.getByText('is typing...')).toHaveCount(0);
+
+  await ownerPage.getByRole('button', { name: 'Send' }).click();
+  await expect(memberPage.getByText('working on it')).toBeVisible();
+  await expect(memberPage.getByText('is typing...')).toHaveCount(0);
+});
+
 test('older messages load when scrolling up, keeping your place', async ({ browser }) => {
   const owner = await register('hist');
   const { server, channel } = await createServer(owner);

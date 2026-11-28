@@ -26,6 +26,7 @@
   import { fileUrl } from '../lib/api';
   import { withTimeout, TimeoutError } from '../lib/timeout';
   import { startCall } from '../lib/calls';
+  import { notifyTypingInConversation, TypingTracker } from '../lib/typing';
 
   // --- DM-specific error boundary -----------------------------------------
   //
@@ -534,7 +535,25 @@
     if (data.conversation_id !== conversationId) return;
     addMessage(data);
     scrollToBottom();
+    typingTracker.clear(data.user_id);
   }
+
+  // --- "X is typing..." -- see `lib/typing.ts` for the full design (not
+  // E2EE, no message content, no explicit "stopped" event). A DM only
+  // ever has one other participant, so this is simpler than the channel
+  // version in `ChatArea.svelte`: no member list to resolve a username
+  // against, `participantUsername` is already a known prop.
+  let otherIsTyping = false;
+  const typingTracker = new TypingTracker(() => {
+    otherIsTyping = typingTracker.ids().length > 0;
+  });
+
+  function onTyping(data: { conversation_id: string; user_id: string }) {
+    if (data.conversation_id !== conversationId || data.user_id !== participantId) return;
+    typingTracker.see(data.user_id);
+  }
+
+  $: if (conversationId) typingTracker.reset();
 
   // The sender gets their message both from the POST response and from the
   // WebSocket broadcast, so skip ids we already have.
@@ -546,10 +565,13 @@
   onMount(() => {
     wsClient.connect();
     wsClient.on('new_direct_message', onNewDirectMessage);
+    wsClient.on('typing', onTyping);
   });
 
   onDestroy(() => {
     wsClient.off('new_direct_message', onNewDirectMessage);
+    wsClient.off('typing', onTyping);
+    typingTracker.destroy();
     for (const url of createdObjectUrls) URL.revokeObjectURL(url);
   });
 
@@ -1046,6 +1068,11 @@
 
   <!-- Input Area -->
   <div class="border-t-2 border-[#00ff00] p-4">
+    {#if otherIsTyping}
+      <div class="mb-1 text-xs text-[#00aa00] italic animate-pulse" aria-live="polite">
+        {participantUsername} is typing...
+      </div>
+    {/if}
     {#if panelError}
       <div class="text-xs text-[#ffaa00] mb-2 terminal-glow">{'>'} {panelError}</div>
     {:else if participantDevicesLoadFailed}
@@ -1091,6 +1118,7 @@
         class="flex-1 min-w-0 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)] disabled:opacity-50"
         placeholder={canSend ? 'Type a message...' : 'Encrypted messaging unavailable'}
         disabled={sending || !canSend}
+        on:input={() => newMessage.trim() && notifyTypingInConversation(conversationId)}
       />
       <button
         type="submit"
