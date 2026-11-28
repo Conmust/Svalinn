@@ -630,13 +630,13 @@ Color is used sparingly. Frost blue is reserved for active states, unread indica
 - Anonymous signup stats dashboard
 - Anonymous patron payments via blind RSA tokens
 - CI: unit tests, type-check/build, full e2e suite, CodeQL
+- Self-hosting documentation (Docker Compose stack, reverse proxy, backups, upgrades, hardening — see [docs/self-hosting.md](docs/self-hosting.md))
 
 ### Next — Community Foundations
 
 - Local message cache for offline/fast-start
 - Better moderation tooling (audit logs)
 - Screen sharing
-- Self-hosting documentation
 - Desktop packaging and published release builds for Windows/macOS/Linux
 - Published, methodologically documented performance benchmarks
 
@@ -680,10 +680,10 @@ The core promise remains:
 
 ## Self-Hosting
 
-Self-hosting is already possible in practice — the server is a normal Rust/Postgres service with a documented `.env` and migration flow (see "Run a Server for Other People" above) — but polished, dedicated self-hosting documentation is still a planned piece of work:
+The server is a normal Rust/Postgres service with a documented `.env` and migration flow (see "Run a Server for Other People" above). For running it for a community, with a full Docker Compose stack, a reverse proxy in front of it, and backup/upgrade/hardening guidance, see **[docs/self-hosting.md](docs/self-hosting.md)**:
 
 - Docker Compose deployment guide
-- Reverse proxy examples
+- Reverse proxy examples (Caddy, nginx)
 - Backup/restore guide
 - Upgrade guide
 - Security hardening checklist
