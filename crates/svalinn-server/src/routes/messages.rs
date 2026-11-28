@@ -218,7 +218,45 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, created_at, role })
 }
 
-async fn server_attachment_total(db: &Database, server_id: Uuid) -> Result<i64, AppError> {
+/// Enforces this channel's slowmode (`channels.slowmode_seconds`, set via
+/// `routes::channels::set_channel_slowmode`), if it has one. A member
+/// holding `manage_messages` on the channel -- a moderator -- is exempt,
+/// same as Discord: slowmode is meant to throttle ordinary chatter, not to
+/// get in a moderator's way while they're actively handling the channel.
+///
+/// Uses the same in-memory `RateLimiter` as login/invite throttling
+/// (`db.limits`), keyed per (channel, user) with a one-off `Rule` built
+/// from this channel's own configured window rather than one of the fixed
+/// `rate_limit` constants -- `limit: 1` is exactly "at most one send per
+/// window", which is what slowmode means. Like the rest of that limiter,
+/// this resets if the server restarts and isn't shared between replicas;
+/// an acceptable looseness for a chat-pacing nicety, not a security control.
+async fn enforce_slowmode(db: &Database, channel_id: Uuid, user_id: Uuid) -> Result<(), AppError> {
+    let slowmode_seconds: i32 = sqlx::query_scalar("SELECT slowmode_seconds FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if slowmode_seconds <= 0 {
+        return Ok(());
+    }
+
+    if crate::permissions::resolve_channel(db, channel_id, user_id)
+        .await?
+        .has(crate::permissions::Permission::MANAGE_MESSAGES)
+    {
+        return Ok(());
+    }
+
+    let rule = crate::rate_limit::Rule {
+        name: "channel-slowmode",
+        limit: 1,
+        window: std::time::Duration::from_secs(slowmode_seconds as u64),
+    };
+    db.limits.hit(&rule, &format!("{channel_id}:{user_id}"))
+}
+
+pub(crate) async fn server_attachment_total(db: &Database, server_id: Uuid) -> Result<i64, AppError> {
     sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(m.attachment_size), 0)::bigint
@@ -694,6 +732,7 @@ pub async fn create_message(
     let server_id = channel_server_id(&db, channel_id).await?;
     require_member(&db, server_id, user_id).await?;
     crate::permissions::require_channel_permission(&db, channel_id, user_id, crate::permissions::Permission::SEND_MESSAGES).await?;
+    enforce_slowmode(&db, channel_id, user_id).await?;
 
     // Computed here, before the transaction below, same timing as the
     // `require_channel_permission` check just above (and the exact same
@@ -3061,5 +3100,217 @@ mod tests {
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
+    }
+
+    // ---------- Channel slowmode ----------
+
+    async fn set_slowmode(db: &Database, channel_id: Uuid, seconds: i32) {
+        sqlx::query("UPDATE channels SET slowmode_seconds = $1 WHERE id = $2")
+            .bind(seconds)
+            .bind(channel_id)
+            .execute(&db.pool)
+            .await
+            .expect("failed to set slowmode directly");
+    }
+
+    #[tokio::test]
+    async fn second_message_within_the_slowmode_window_is_rejected() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        set_slowmode(&db, channel, 30).await;
+
+        // A plain member, not `owner` -- the server's own owner always
+        // bypasses every permission check (`is_unconditional_owner`), so
+        // using them here would test nothing.
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+        let member_device = register_test_device(&db, member, 60).await;
+        send_test_message(&db, server, channel, member, member_device, &[]).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: member, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(member_device)],
+                sender_device_id: member_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::TooManyRequests { .. })),
+            "a second send inside a 30s slowmode window should be rate limited, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    #[tokio::test]
+    async fn slowmode_is_scoped_per_user_not_per_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        set_slowmode(&db, channel, 30).await;
+
+        let member_a = create_test_user(&db).await;
+        let member_b = create_test_user(&db).await;
+        add_server_member(&db, server, member_a).await;
+        add_server_member(&db, server, member_b).await;
+
+        let device_a = register_test_device(&db, member_a, 61).await;
+        let device_b = register_test_device(&db, member_b, 62).await;
+
+        // Both members already have devices registered by this point, so
+        // the completeness check requires both in `encrypted_for`.
+        send_test_message(&db, server, channel, member_a, device_a, &[device_b]).await;
+
+        // `member_b` hasn't sent anything yet in this channel, so their own
+        // first send must not be blocked by `member_a`'s cooldown.
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: member_b, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(device_a), fake_recipient(device_b)],
+                sender_device_id: device_b,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "slowmode must be keyed per (channel, user), not shared across members: {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member_a).await;
+        cleanup_test_user(&db, member_b).await;
+    }
+
+    #[tokio::test]
+    async fn a_moderator_is_exempt_from_slowmode() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        set_slowmode(&db, channel, 30).await;
+
+        let moderator = create_test_user(&db).await;
+        add_server_moderator(&db, server, moderator).await;
+        let moderator_device = register_test_device(&db, moderator, 63).await;
+
+        send_test_message(&db, server, channel, moderator, moderator_device, &[]).await;
+
+        // The legacy "moderator" rank carries MANAGE_MESSAGES via
+        // `permissions::legacy_fallback_bits`, so back-to-back sends from a
+        // moderator must never trip the cooldown ordinary members face.
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: moderator, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(moderator_device)],
+                sender_device_id: moderator_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "a moderator (manage_messages) should be exempt from slowmode: {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, moderator).await;
+    }
+
+    #[tokio::test]
+    async fn a_send_is_allowed_again_once_the_slowmode_window_elapses() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        set_slowmode(&db, channel, 1).await;
+
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+        let member_device = register_test_device(&db, member, 64).await;
+        send_test_message(&db, server, channel, member, member_device, &[]).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: member, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(member_device)],
+                sender_device_id: member_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "once the window has elapsed, sending again should succeed: {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    #[tokio::test]
+    async fn slowmode_off_never_rate_limits_sends() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        // slowmode_seconds defaults to 0 -- left unset deliberately.
+
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+        let member_device = register_test_device(&db, member, 65).await;
+        send_test_message(&db, server, channel, member, member_device, &[]).await;
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: member, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(member_device)],
+                sender_device_id: member_device,
+                mentioned_user_ids: vec![],
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "with slowmode off, back-to-back sends must never be rate limited: {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
     }
 }
