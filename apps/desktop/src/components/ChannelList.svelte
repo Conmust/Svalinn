@@ -25,6 +25,7 @@
     channel_type: string;
     created_at: string;
     has_unread: boolean;
+    slowmode_seconds: number;
   }
 
   let channels: Channel[] = [];
@@ -43,6 +44,10 @@
   let deleting: Channel | null = null;
   let channelActionError = '';
   let managingPermissions: Channel | null = null;
+  let managingSlowmode: Channel | null = null;
+  let slowmodeValue = 0;
+  let slowmodeCustomValue = '';
+  let slowmodeError = '';
 
   // Per-channel overwrites need manage_channels or manage_roles -- same
   // server-wide resolved permissions the overwrite endpoints themselves
@@ -101,6 +106,36 @@
     }
   }
 
+  function startSlowmode(channel: Channel) {
+    managingSlowmode = channel;
+    slowmodeValue = channel.slowmode_seconds;
+    slowmodeCustomValue = '';
+    slowmodeError = '';
+  }
+
+  const MAX_SLOWMODE_SECONDS = 21_600; // 6 hours -- matches the server's own cap.
+
+  async function applySlowmode(seconds: number) {
+    if (!managingSlowmode) return;
+    if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_SLOWMODE_SECONDS) {
+      slowmodeError = `Must be between 0 and ${MAX_SLOWMODE_SECONDS} seconds.`;
+      return;
+    }
+    const channel = managingSlowmode;
+    const res = await apiFetch(`${apiBase()}/api/v1/channels/${channel.id}/slowmode`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seconds }),
+    });
+    if (res.ok) {
+      const { slowmode_seconds } = await res.json();
+      channels = channels.map(c => (c.id === channel.id ? { ...c, slowmode_seconds } : c));
+      managingSlowmode = null;
+    } else {
+      slowmodeError = (await res.json().catch(() => ({}))).error || 'Could not update slowmode';
+    }
+  }
+
   async function confirmDelete() {
     if (!deleting) return;
     const channel = deleting;
@@ -123,8 +158,12 @@
     if (data.server_id !== activeServer || channels.some(c => c.id === data.id)) return;
     channels = [...channels, { ...data, has_unread: false }];
   }
-  function onChannelUpdated(data: { id: string; name: string }) {
-    channels = channels.map(c => (c.id === data.id ? { ...c, name: data.name } : c));
+  // Merge whatever fields this particular update carries (rename sends
+  // just `name`, slowmode sends just `slowmode_seconds`) rather than
+  // assuming `name` is always present -- an update missing it would
+  // otherwise blank out the channel's name in the list.
+  function onChannelUpdated(data: Partial<Channel> & { id: string }) {
+    channels = channels.map(c => (c.id === data.id ? { ...c, ...data } : c));
   }
   function onChannelDeleted(data: { id: string }) {
     removeChannel(data.id);
@@ -324,7 +363,7 @@
         <div class="relative group mb-1">
         <button
           type="button"
-          class="w-full text-left px-3 py-2 rounded border-l-2 transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)] border-[#00ff00]' : 'border-transparent hover:bg-[rgba(0,255,0,0.1)] ' + (channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')} {canManageChannels && canManageOverwrites ? 'pr-20' : canManageChannels || canManageOverwrites ? 'pr-14' : ''}"
+          class="w-full text-left px-3 py-2 rounded border-l-2 transition-all flex items-center gap-2 {channel.id === activeChannel ? 'bg-[rgba(0,255,0,0.15)] border-[#00ff00]' : 'border-transparent hover:bg-[rgba(0,255,0,0.1)] ' + (channel.has_unread ? 'bg-[rgba(0,255,0,0.05)]' : '')} {canManageChannels && canManageOverwrites ? 'pr-24' : canManageChannels ? 'pr-20' : canManageOverwrites ? 'pr-10' : ''}"
           aria-current={channel.id === activeChannel ? 'page' : undefined}
           on:click={() => handleChannelClick(channel)}
         >
@@ -360,6 +399,7 @@
               <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Channel permissions" aria-label="Permissions for {channel.name}" on:click={() => (managingPermissions = channel)}>🔒</button>
             {/if}
             {#if canManageChannels}
+              <button type="button" class="px-1.5 text-xs {channel.slowmode_seconds > 0 ? 'text-[#ffaa00]' : 'text-[#00aa00]'} hover:text-[#00ff00]" title={channel.slowmode_seconds > 0 ? `Slowmode: ${channel.slowmode_seconds}s` : 'Slowmode'} aria-label="Slowmode for {channel.name}" on:click={() => startSlowmode(channel)}>⏱</button>
               <button type="button" class="px-1.5 text-xs text-[#00aa00] hover:text-[#00ff00]" title="Rename channel" aria-label="Rename {channel.name}" on:click={() => startRename(channel)}>✎</button>
               <button type="button" class="px-1.5 text-xs text-red-500 hover:text-red-400" title="Delete channel" aria-label="Delete {channel.name}" on:click={() => { deleting = channel; channelActionError = ''; }}>✕</button>
             {/if}
@@ -470,6 +510,37 @@
         <div class="flex gap-2">
           <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={() => (deleting = null)}>Cancel</button>
           <button type="button" class="flex-1 py-2 border-2 border-red-500 text-red-500 font-bold text-sm hover:bg-red-500 hover:text-black" on:click={confirmDelete}>Delete channel</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if managingSlowmode}
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80" role="dialog" aria-modal="true" aria-labelledby="slowmode-title">
+      <div class="w-[400px] max-w-[90vw] bg-black border-2 border-[#00ff00] p-6 space-y-4">
+        <h3 id="slowmode-title" class="text-sm font-bold text-[#00ff00] uppercase tracking-widest">{'>'} Slowmode for #{managingSlowmode.name}</h3>
+        <p class="text-xs text-[#00aa00]">Ordinary members must wait this long between messages in this channel. Moderators (anyone with Manage Messages here) are never limited by it.</p>
+        <div class="flex gap-2">
+          <button type="button" class="flex-1 py-2 border text-sm {slowmodeValue === 0 ? 'border-[#00ff00] bg-[#00ff00] text-black font-bold' : 'border-[#00aa00] text-[#00aa00]'}" on:click={() => (slowmodeValue = 0)}>Off</button>
+          <button type="button" class="flex-1 py-2 border text-sm {slowmodeValue === 15 ? 'border-[#00ff00] bg-[#00ff00] text-black font-bold' : 'border-[#00aa00] text-[#00aa00]'}" on:click={() => (slowmodeValue = 15)}>15s</button>
+          <button type="button" class="flex-1 py-2 border text-sm {slowmodeValue === 30 ? 'border-[#00ff00] bg-[#00ff00] text-black font-bold' : 'border-[#00aa00] text-[#00aa00]'}" on:click={() => (slowmodeValue = 30)}>30s</button>
+        </div>
+        <div class="flex gap-2 items-center">
+          <input
+            type="number"
+            min="0"
+            max={MAX_SLOWMODE_SECONDS}
+            placeholder="Custom seconds"
+            bind:value={slowmodeCustomValue}
+            on:input={() => { const n = parseInt(slowmodeCustomValue, 10); if (!isNaN(n)) slowmodeValue = n; }}
+            class="flex-1 bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none text-sm"
+          />
+          <span class="text-xs text-[#00aa00]">seconds</span>
+        </div>
+        {#if slowmodeError}<div class="text-xs text-red-500">{'>'} {slowmodeError}</div>{/if}
+        <div class="flex gap-2">
+          <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] text-sm" on:click={() => (managingSlowmode = null)}>Cancel</button>
+          <button type="button" class="flex-1 py-2 bg-[#00ff00] text-black font-bold text-sm" on:click={() => applySlowmode(slowmodeValue)}>Save</button>
         </div>
       </div>
     </div>

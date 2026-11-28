@@ -20,7 +20,7 @@
 
   const dispatch = createEventDispatcher();
 
-  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' | 'roles' = 'overview';
+  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' | 'roles' | 'usage' = 'overview';
 
   // Your rank here: 4 owner, 3 admin, 2 moderator, 1 member.
   let myRank = 1;
@@ -50,8 +50,22 @@
     created_at: string;
   }
 
+  interface ServerUsage {
+    message_count: number;
+    message_cap: number;
+    pinned_count: number;
+    pin_cap: number;
+    unread_backlog_count: number;
+    unread_backlog_cap: number;
+    attachment_bytes_used: number;
+    attachment_quota_bytes: number;
+  }
+
   let invites: Invite[] = [];
   let bans: Ban[] = [];
+  let usage: ServerUsage | null = null;
+  let usageError = '';
+  let loadingUsage = false;
   let inviteExpiryHours = '24';   // '' = never
   let inviteMaxUses = '';         // '' = unlimited
   let tabError = '';
@@ -150,6 +164,41 @@
     else tabError = await errorFrom(res, 'Failed to lift ban');
   }
 
+  async function loadUsage() {
+    usageError = '';
+    loadingUsage = true;
+    try {
+      const res = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/usage`);
+      if (res.ok) usage = await res.json();
+      else usageError = await errorFrom(res, 'Failed to load usage');
+    } finally {
+      loadingUsage = false;
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let value = bytes / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    return `${value.toFixed(1)} ${units[unit]}`;
+  }
+
+  /** Green under 75% of a cap, amber from there to the cap, red at or past it --
+   * same rough "getting close" / "at the line" split as the slowmode and pin-cap
+   * warnings elsewhere in the app, just expressed as a color instead of text. */
+  function usageColor(used: number, cap: number): string {
+    if (cap <= 0) return '#00ff00';
+    const fraction = used / cap;
+    if (fraction >= 1) return '#ff0000';
+    if (fraction >= 0.75) return '#ffaa00';
+    return '#00ff00';
+  }
+
   async function leaveServer() {
     tabError = '';
     const res = await apiFetch(`${apiBase()}/api/v1/servers/${serverId}/members/me`, { method: 'DELETE' });
@@ -178,6 +227,7 @@
     if (tab === 'invites') loadInvites();
     if (tab === 'bans') loadBans();
     if (tab === 'roles') loadRoles();
+    if (tab === 'usage') loadUsage();
   }
   let emojis: CustomEmoji[] = [];
   let loading = false;
@@ -476,6 +526,14 @@
           Roles
         </button>
       {/if}
+      {#if canEditServer}
+        <button
+          class="flex-1 py-3 text-sm font-semibold {activeTab === 'usage' ? 'text-[#00ff00] border-b-2 border-[#00ff00] bg-[rgba(0,255,0,0.05)]' : 'text-[#00aa00] hover:text-[#00ff00]'}"
+          on:click={() => switchTab('usage')}
+        >
+          Usage
+        </button>
+      {/if}
     </div>
 
     <!-- Content -->
@@ -750,6 +808,60 @@
               </li>
             {/each}
           </ul>
+        {/if}
+      {:else if activeTab === 'usage'}
+        {#if usageError}
+          <div class="mb-4 text-xs text-red-500">{'>'} {usageError}</div>
+        {/if}
+        {#if loadingUsage && !usage}
+          <div class="text-[#00aa00] text-xs">{'>'} Loading...</div>
+        {:else if usage}
+          <div class="space-y-5">
+            <div>
+              <div class="flex justify-between text-xs mb-1">
+                <span class="text-[#00aa00]">Messages</span>
+                <span style="color: {usageColor(usage.message_count, usage.message_cap)}">{usage.message_count.toLocaleString()} / {usage.message_cap.toLocaleString()}</span>
+              </div>
+              <div class="h-2 bg-[#0a0e0a] border border-[#00aa00]/30">
+                <div class="h-full" style="width: {Math.min(100, (usage.message_count / usage.message_cap) * 100)}%; background-color: {usageColor(usage.message_count, usage.message_cap)}"></div>
+              </div>
+              <p class="mt-1 text-[11px] text-[#00aa00]">The oldest unpinned, fully-read messages are swept once this is exceeded.</p>
+            </div>
+
+            <div>
+              <div class="flex justify-between text-xs mb-1">
+                <span class="text-[#00aa00]">Pinned messages</span>
+                <span style="color: {usageColor(usage.pinned_count, usage.pin_cap)}">{usage.pinned_count} / {usage.pin_cap}</span>
+              </div>
+              <div class="h-2 bg-[#0a0e0a] border border-[#00aa00]/30">
+                <div class="h-full" style="width: {Math.min(100, (usage.pinned_count / usage.pin_cap) * 100)}%; background-color: {usageColor(usage.pinned_count, usage.pin_cap)}"></div>
+              </div>
+            </div>
+
+            <div>
+              <div class="flex justify-between text-xs mb-1">
+                <span class="text-[#00aa00]">Unread backlog</span>
+                <span style="color: {usageColor(usage.unread_backlog_count, usage.unread_backlog_cap)}">{usage.unread_backlog_count} / {usage.unread_backlog_cap}</span>
+              </div>
+              <div class="h-2 bg-[#0a0e0a] border border-[#00aa00]/30">
+                <div class="h-full" style="width: {Math.min(100, (usage.unread_backlog_count / usage.unread_backlog_cap) * 100)}%; background-color: {usageColor(usage.unread_backlog_count, usage.unread_backlog_cap)}"></div>
+              </div>
+              <p class="mt-1 text-[11px] text-[#00aa00]">Messages still unread by someone, within the retention window. Past this, the oldest are swept regardless.</p>
+            </div>
+
+            <div>
+              <div class="flex justify-between text-xs mb-1">
+                <span class="text-[#00aa00]">Attachment storage</span>
+                <span style="color: {usageColor(usage.attachment_bytes_used, usage.attachment_quota_bytes)}">{formatBytes(usage.attachment_bytes_used)} / {formatBytes(usage.attachment_quota_bytes)}</span>
+              </div>
+              <div class="h-2 bg-[#0a0e0a] border border-[#00aa00]/30">
+                <div class="h-full" style="width: {Math.min(100, (usage.attachment_bytes_used / usage.attachment_quota_bytes) * 100)}%; background-color: {usageColor(usage.attachment_bytes_used, usage.attachment_quota_bytes)}"></div>
+              </div>
+              <p class="mt-1 text-[11px] text-[#00aa00]">The oldest unpinned attachment is automatically removed to make room for a new one once this is full.</p>
+            </div>
+
+            <button type="button" class="text-xs text-[#00aa00] hover:text-[#00ff00] underline" on:click={loadUsage}>Refresh</button>
+          </div>
         {/if}
       {/if}
     </div>
