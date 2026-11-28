@@ -32,6 +32,7 @@
   import { fetchServerMembers, type Member } from '../lib/members';
   import { extractMentionedUsernames } from '../lib/mentions';
   import { notifyTypingInChannel, TypingTracker } from '../lib/typing';
+  import { notifyNewMessage } from '../lib/notifications';
 
   // --- Encryption error boundary -------------------------------------------
   // Mirrors `DMChatArea.svelte`'s identically-named helper: a broken
@@ -726,11 +727,43 @@
 
   // Named handlers so onDestroy removes only this component's listeners
   // (ChannelList listens to the same events).
+  // Message ids we're waiting to notify about once their content is
+  // available. A plaintext message can notify immediately; a ratchet-
+  // encrypted one has to wait for `ensureRatchetMessageDecrypted` to finish
+  // (see the reactive block below) since `data.content` is null for those
+  // until decrypted -- the server never has the plaintext to begin with.
+  let pendingNotifyIds = new Set<string>();
+
   function onNewMessage(data: Message) {
     if (data.channel_id !== channelId) return;
     addMessage(data);
     scrollToBottom();
     typingTracker.clear(data.user_id); // their message just arrived -- they're done typing it
+    if (data.user_id === currentUser?.id) return; // never notify on our own messages
+    const name = data.nickname || data.username;
+    if (data.content) {
+      void notifyNewMessage(name, data.content);
+    } else if (data.is_encrypted) {
+      pendingNotifyIds.add(data.id);
+    }
+  }
+
+  // Fires the deferred notification for a just-arrived encrypted message
+  // once its ratchet decryption completes. Keyed off `ratchetDecryptState`
+  // so it reruns whenever a decrypt finishes; `pendingNotifyIds` only ever
+  // contains ids from `onNewMessage` above, never from history backfill or
+  // the pinned-messages panel, so this never fires for old messages.
+  $: {
+    for (const id of [...pendingNotifyIds]) {
+      const state = ratchetDecryptState[id];
+      if (state?.status === 'done') {
+        pendingNotifyIds.delete(id);
+        if (state.text) {
+          const msg = rawMessages.find(m => m.id === id);
+          if (msg) void notifyNewMessage(msg.nickname || msg.username, state.text);
+        }
+      }
+    }
   }
 
   function onMessageDeleted(data: { message_id: string }) {

@@ -27,6 +27,7 @@
   import { withTimeout, TimeoutError } from '../lib/timeout';
   import { startCall } from '../lib/calls';
   import { notifyTypingInConversation, TypingTracker } from '../lib/typing';
+  import { notifyNewMessage } from '../lib/notifications';
 
   // --- DM-specific error boundary -----------------------------------------
   //
@@ -531,11 +532,32 @@
     }
   }
 
+  // Mirrors `ChatArea.svelte`'s `pendingNotifyIds` -- see its comment for
+  // why a fan-out-encrypted message has to wait for decryption before it
+  // has anything to notify with.
+  let pendingNotifyIds = new Set<string>();
+
   function onNewDirectMessage(data: ConversationMessage) {
     if (data.conversation_id !== conversationId) return;
     addMessage(data);
     scrollToBottom();
     typingTracker.clear(data.user_id);
+    if (data.user_id !== participantId) return; // our own message (e.g. from another device)
+    if (data.content) {
+      void notifyNewMessage(data.username, data.content);
+    } else if (data.is_encrypted) {
+      pendingNotifyIds.add(data.id);
+    }
+  }
+
+  $: {
+    for (const id of [...pendingNotifyIds]) {
+      const state = ratchetDecryptState[id];
+      if (state?.status === 'done') {
+        pendingNotifyIds.delete(id);
+        if (state.text) void notifyNewMessage(participantUsername, state.text);
+      }
+    }
   }
 
   // --- "X is typing..." -- see `lib/typing.ts` for the full design (not
