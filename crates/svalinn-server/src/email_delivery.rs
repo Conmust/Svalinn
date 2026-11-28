@@ -10,6 +10,15 @@
 //! directly instead of calling [`send`], so a local tester never needs a
 //! real inbox or a Resend account.
 //!
+//! `APP_ENV=test` (used by the e2e suite, see `e2e/support/config.ts`) is
+//! exempted the same way, but for a different reason: that suite
+//! deliberately runs the server production-like (no dev link in the
+//! response) specifically to exercise the real `send` code path, without
+//! wiring up a real Resend account for CI. Left unconfigured there, [`send`]
+//! returns [`EmailError::NotConfigured`], which callers already swallow the
+//! same way they'd swallow any other delivery failure -- so the request
+//! still succeeds with no dev link, exactly as the suite expects.
+//!
 //! [`send`] never logs `to`, `subject` or `html_body`, on success or on
 //! failure -- only the bare outcome. A log line is also a plaintext
 //! storage location, the same reasoning `email_privacy`'s doc comment
@@ -25,10 +34,11 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 const RESEND_ENDPOINT: &str = "https://api.resend.com/emails";
 
 /// Same pattern as `email_privacy::init_keys`: refuse to start without
-/// `RESEND_API_KEY`/`EMAIL_FROM` outside development, where [`send`] is
-/// never actually called. If both are set, initializes for real even in
-/// development, so a developer who wants to test the full delivery path
-/// locally (e.g. against a Resend test domain) can.
+/// `RESEND_API_KEY`/`EMAIL_FROM` outside development and test, where
+/// [`send`] either is never called (development) or is expected to fail
+/// and be swallowed (test). If both are set, initializes for real even in
+/// development or test, so a developer who wants to test the full delivery
+/// path locally (e.g. against a Resend test domain) can.
 pub fn init(app_env: &str) -> Result<Option<String>, String> {
     let api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
     let from = std::env::var("EMAIL_FROM").unwrap_or_default();
@@ -37,6 +47,11 @@ pub fn init(app_env: &str) -> Result<Option<String>, String> {
         if app_env == "development" {
             return Ok(Some(
                 "RESEND_API_KEY/EMAIL_FROM not set -- verification and password-reset links will only be logged and returned directly in API responses (fine for local development).".into(),
+            ));
+        }
+        if app_env == "test" {
+            return Ok(Some(
+                "RESEND_API_KEY/EMAIL_FROM not set -- verification and password-reset emails will fail to send and that failure will be swallowed, same as a misconfigured production deploy (fine for the test suite).".into(),
             ));
         }
         if api_key.trim().is_empty() {
