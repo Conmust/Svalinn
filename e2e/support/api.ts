@@ -148,7 +148,8 @@ export async function postMessage(
   user: User,
   channelId: string,
   content: string,
-  file?: { name: string; type: string; data: Uint8Array | string }
+  file?: { name: string; type: string; data: Uint8Array | string },
+  mentionedUserIds?: string[]
 ): Promise<Res> {
   const device = await ensureDevice(user);
   const devicesRes = await call<Array<{ device_id: string; public_key: string }>>(
@@ -158,6 +159,7 @@ export async function postMessage(
   const devices = devicesRes.body;
 
   const body: Record<string, unknown> = { sender_device_id: device.id };
+  if (mentionedUserIds) body.mentioned_user_ids = mentionedUserIds;
 
   if (file) {
     const fileBytes = typeof file.data === 'string' ? new TextEncoder().encode(file.data) : file.data;

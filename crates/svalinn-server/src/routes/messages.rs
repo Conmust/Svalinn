@@ -83,6 +83,15 @@ pub struct Message {
     /// response path, every recipient device's entry.
     #[sqlx(skip)]
     pub recipients: Vec<MessageRecipientPayload>,
+    /// Who this message `@mentions`, resolved and sent by the author's own
+    /// client at send time (see `message_mentions` migration's doc
+    /// comment for why the server can't derive this itself). Every id here
+    /// was validated, at send time, to be a current viewer of the channel
+    /// this message is in -- but a mentioned member could since have lost
+    /// access (left, been kicked, lost the role granting VIEW_CHANNEL), so
+    /// this is "who was mentioned", not "who can currently see that they
+    /// were".
+    pub mentioned_user_ids: Vec<Uuid>,
 }
 
 /// Columns for `Message`. `$1` must be the requesting user's id.
@@ -114,7 +123,12 @@ const MESSAGE_COLUMNS: &str = r#"
             WHERE message_id = m.id
             GROUP BY emoji
         ) r
-    ), '[]'::json) AS reactions
+    ), '[]'::json) AS reactions,
+    COALESCE((
+        SELECT array_agg(mm.mentioned_user_id)
+        FROM message_mentions mm
+        WHERE mm.message_id = m.id
+    ), ARRAY[]::uuid[]) AS mentioned_user_ids
 "#;
 
 async fn fetch_message(db: &Database, message_id: Uuid, viewer_id: Uuid) -> Result<Message, AppError> {
@@ -241,6 +255,11 @@ async fn broadcast(db: &Database, event_type: &str, payload: serde_json::Value, 
 const MAX_CONTENT_CHARS: usize = 4000;
 /// Messages per page when loading history.
 const PAGE_SIZE: i64 = 50;
+/// A generous cap, not a realistic expectation -- nobody @mentions this
+/// many people in one message, but with no limit a hostile client could
+/// submit an arbitrarily long list and force an arbitrarily large INSERT
+/// batch per message.
+const MAX_MENTIONS_PER_MESSAGE: usize = 100;
 const MAX_PAGE_SIZE: i64 = 100;
 
 #[derive(Deserialize)]
@@ -503,6 +522,14 @@ pub struct SendChannelMessageRequest {
     /// `message_recipients` row -- recipients need the sender's public
     /// key to decrypt, not their own.
     pub sender_device_id: Uuid,
+    /// Who this message `@mentions`, resolved by the sending client from
+    /// its own plaintext before encrypting it -- the server never sees
+    /// that plaintext, so it can't detect mentions itself. Every id here
+    /// must be a current viewer of this channel (checked below); anything
+    /// else is rejected rather than silently dropped, same as every other
+    /// validated field in this request.
+    #[serde(default)]
+    pub mentioned_user_ids: Vec<Uuid>,
 }
 
 /// POST /api/v1/channels/:channel_id/messages
@@ -653,6 +680,24 @@ pub async fn create_message(
         }
     }
 
+    if payload.mentioned_user_ids.len() > MAX_MENTIONS_PER_MESSAGE {
+        return Err(AppError::BadRequest(format!(
+            "mentioned_user_ids can have at most {MAX_MENTIONS_PER_MESSAGE} entries"
+        )));
+    }
+    let mut mentioned_user_ids: Vec<Uuid> = payload.mentioned_user_ids.clone();
+    mentioned_user_ids.sort_unstable();
+    mentioned_user_ids.dedup();
+    // Mentioning someone who can't currently view this channel would
+    // notify someone about a message they have no access to -- reject the
+    // whole send rather than silently dropping the bad id, same policy as
+    // every other validated list in this request.
+    if let Some(bad) = mentioned_user_ids.iter().find(|id| !viewer_ids.contains(id)) {
+        return Err(AppError::BadRequest(format!(
+            "mentioned_user_ids contains {bad}, who isn't a current member who can view this channel"
+        )));
+    }
+
     let mut tx = db.pool.begin().await.map_err(|e| AppError::Database(e.to_string()))?;
     let member_ids = viewer_ids;
 
@@ -737,6 +782,15 @@ pub async fn create_message(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
+    for mentioned_id in &mentioned_user_ids {
+        sqlx::query("INSERT INTO message_mentions (message_id, mentioned_user_id) VALUES ($1, $2)")
+            .bind(msg_id)
+            .bind(mentioned_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
@@ -1235,6 +1289,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(device)],
                 sender_device_id: device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1297,6 +1352,7 @@ mod tests {
                     attachment_key_ratchet_header_json: Some(ratchet_header.into()),
                 }],
                 sender_device_id: device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1353,6 +1409,7 @@ mod tests {
                     attachment_key_ratchet_header_json: Some(r#"{"dh":"x","pn":0,"n":0}"#.into()),
                 }],
                 sender_device_id: device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await;
@@ -1397,6 +1454,7 @@ mod tests {
                     attachment_key_ratchet_header_json: None,
                 }],
                 sender_device_id: device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await;
@@ -1432,6 +1490,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(owner_device)],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await;
@@ -1469,6 +1528,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(owner_device), fake_recipient(outsider_device)],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await;
@@ -1512,6 +1572,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(owner_device)],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1570,6 +1631,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(device)],
                 sender_device_id: device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1656,6 +1718,7 @@ mod tests {
                 // send succeeds without their device present at all.
                 encrypted_for: vec![fake_recipient(owner_device), fake_recipient(viewer_device)],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1728,6 +1791,7 @@ mod tests {
                     fake_recipient(blocked_device),
                 ],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await;
@@ -1751,6 +1815,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for: vec![fake_recipient(owner_device), fake_recipient(viewer_device)],
                 sender_device_id: owner_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -1811,6 +1876,7 @@ mod tests {
                 attachment_nonce: None,
                 encrypted_for,
                 sender_device_id: sender_device,
+                mentioned_user_ids: vec![],
             }),
         )
         .await
@@ -2251,5 +2317,166 @@ mod tests {
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, blocked).await;
+    }
+
+    /// Mentioning a current viewer of the channel is recorded and comes
+    /// back on both the send response and a later fetch of the same
+    /// message -- the two read paths `MESSAGE_COLUMNS` backs.
+    #[tokio::test]
+    async fn mentioning_a_current_viewer_is_recorded_and_returned() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 70).await;
+
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+        let member_device = register_test_device(&db, member, 71).await;
+
+        let encrypted_for = vec![fake_recipient(owner_device), fake_recipient(member_device)];
+        let sent = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for,
+                sender_device_id: owner_device,
+                mentioned_user_ids: vec![member],
+            }),
+        )
+        .await
+        .expect("sending with a valid mention should succeed")
+        .0;
+        assert_eq!(sent.mentioned_user_ids, vec![member]);
+
+        let fetched = fetch_message(&db, sent.id, owner).await.expect("fetching the message should succeed");
+        assert_eq!(fetched.mentioned_user_ids, vec![member], "a later fetch must still report the mention");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    /// Mentioning someone who can't currently view the channel -- denied
+    /// `VIEW_CHANNEL` via an overwrite here, same as a non-member would be
+    /// -- is rejected outright rather than silently dropped or notifying
+    /// someone about a message they have no access to.
+    #[tokio::test]
+    async fn mentioning_someone_denied_view_channel_is_rejected() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 72).await;
+
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+        deny_view_channel(&db, channel, blocked).await;
+
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device)],
+                sender_device_id: owner_device,
+                mentioned_user_ids: vec![blocked],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "mentioning a member denied VIEW_CHANNEL must be rejected, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, blocked).await;
+    }
+
+    /// A duplicated id in `mentioned_user_ids` is deduped rather than
+    /// rejected or double-recorded (the table's primary key would reject a
+    /// literal duplicate INSERT outright, so this also confirms the
+    /// dedup actually runs before the insert loop, not just incidentally
+    /// surviving it).
+    #[tokio::test]
+    async fn duplicate_mentions_are_deduped() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 73).await;
+
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+
+        let sent = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device)],
+                sender_device_id: owner_device,
+                mentioned_user_ids: vec![member, member, member],
+            }),
+        )
+        .await
+        .expect("a duplicated mention should still succeed")
+        .0;
+        assert_eq!(sent.mentioned_user_ids, vec![member]);
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    /// `MAX_MENTIONS_PER_MESSAGE` is enforced, so a hostile client can't
+    /// force an arbitrarily large `message_mentions` insert batch by
+    /// padding this list.
+    #[tokio::test]
+    async fn too_many_mentions_is_rejected() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 74).await;
+
+        let too_many: Vec<Uuid> = (0..=MAX_MENTIONS_PER_MESSAGE).map(|_| Uuid::new_v4()).collect();
+        let result = create_message(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Json(SendChannelMessageRequest {
+                attachment_url: None,
+                attachment_filename: None,
+                attachment_size: None,
+                attachment_mime_type: None,
+                attachment_nonce: None,
+                encrypted_for: vec![fake_recipient(owner_device)],
+                sender_device_id: owner_device,
+                mentioned_user_ids: too_many,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "over the cap must be rejected, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
     }
 }

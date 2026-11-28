@@ -140,6 +140,45 @@ test('pinning with a reveal lets a member who joins later read it; unpinning cle
   expect((await call(lateJoiner, 'GET', `/channels/${channel.id}/pinned`)).body).toEqual([]);
 });
 
+// @mentions: the server never sees channel message plaintext (it's
+// per-device fan-out encrypted), so it can't detect a "@username" itself --
+// the client resolves mentions from the plaintext before encrypting and
+// sends the resulting user ids as explicit unencrypted metadata alongside
+// the ciphertext. These tests exercise that metadata path end-to-end
+// through the real HTTP API, mirroring the Rust unit tests in
+// `routes/messages.rs` but confirming the whole stack is wired correctly.
+test('a message can mention a current member, who sees it in the returned message and on fetch', async () => {
+  const owner = await register('men');
+  const member = await register('men');
+  const { channel } = await createServer(owner);
+  await join(owner, channel.server_id, member);
+
+  const posted = (await postMessage(owner, channel.id, `hey @${member.user.username}`, undefined, [member.user.id])).body;
+  expect(posted.mentioned_user_ids).toEqual([member.user.id]);
+
+  const fetched = (await call(member, 'GET', `/channels/${channel.id}/messages`)).body;
+  expect(fetched.find((m: any) => m.id === posted.id).mentioned_user_ids).toEqual([member.user.id]);
+});
+
+test('mentioning someone who cannot view the channel is rejected', async () => {
+  const owner = await register('men');
+  const outsider = await register('men');
+  const { channel } = await createServer(owner);
+
+  const res = await postMessage(owner, channel.id, 'hey @stranger', undefined, [outsider.user.id]);
+  expect(res.status).toBe(400);
+});
+
+test('duplicate mentions in the same message are deduped', async () => {
+  const owner = await register('men');
+  const member = await register('men');
+  const { channel } = await createServer(owner);
+  await join(owner, channel.server_id, member);
+
+  const posted = (await postMessage(owner, channel.id, `@${member.user.username} @${member.user.username}`, undefined, [member.user.id, member.user.id])).body;
+  expect(posted.mentioned_user_ids).toEqual([member.user.id]);
+});
+
 test('presence follows open connections and keeps a chosen status', async () => {
   const watcher = await register('watch');
   const bob = await register('bob');
