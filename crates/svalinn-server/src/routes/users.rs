@@ -2,6 +2,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -449,7 +450,7 @@ pub async fn get_user_profile(
 }
 // ---------- Account settings ----------
 
-use crate::rate_limit::REAUTH_FAILURES_PER_USER;
+use crate::rate_limit::{REAUTH_FAILURES_PER_USER, TOTP_ENABLE_PER_USER};
 
 #[derive(Serialize)]
 pub struct Account {
@@ -458,6 +459,7 @@ pub struct Account {
     pub email: String,
     pub email_verified: bool,
     pub is_site_owner: bool,
+    pub totp_enabled: bool,
 }
 
 /// GET /api/v1/users/me/account — private details for the account settings screen.
@@ -483,7 +485,14 @@ pub async fn get_account(
         .and_then(|e| email_privacy::decrypt(e).ok())
         .unwrap_or_default();
 
-    Ok(Json(Account { id: user_id, username, email, email_verified, is_site_owner }))
+    let totp_enabled: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM totp_secrets WHERE user_id = $1 AND enabled_at IS NOT NULL)")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(Account { id: user_id, username, email, email_verified, is_site_owner, totp_enabled }))
 }
 
 /// Checks the user's current password before a sensitive change. Wrong
@@ -613,6 +622,264 @@ pub async fn change_password(
     tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "other_sessions_ended": ended })))
+}
+
+// ---------- Two-factor authentication (TOTP) ----------
+
+#[derive(Serialize)]
+pub struct TotpSetupResponse {
+    /// Base32, for anyone typing the secret in by hand instead of scanning.
+    pub secret: String,
+    /// What the QR code in the client encodes.
+    pub otpauth_url: String,
+}
+
+/// POST /api/v1/users/me/2fa/setup — starts (or restarts) setup. Doesn't
+/// require the current password: nothing about the account changes here,
+/// since the secret stays unconfirmed (`enabled_at` NULL) until a valid
+/// code is submitted to `enable_totp` -- which itself proves whoever's
+/// calling has the authenticator, a stronger check than a password re-ask
+/// would add here.
+pub async fn setup_totp(State(db): State<Database>, CurrentUser(user_id): CurrentUser) -> Result<Json<TotpSetupResponse>, AppError> {
+    let already_enabled: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM totp_secrets WHERE user_id = $1 AND enabled_at IS NOT NULL)")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if already_enabled {
+        return Err(AppError::BadRequest(
+            "Two-factor authentication is already enabled. Disable it first to set up a new authenticator.".into(),
+        ));
+    }
+
+    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let secret = crate::totp::generate_secret();
+    let encrypted = email_privacy::encrypt_bytes(&secret);
+
+    // Calling this again before confirming just replaces whatever pending
+    // (unconfirmed) secret was already there -- nothing is enabled until
+    // `enable_totp` succeeds, so restarting setup is always safe.
+    sqlx::query(
+        "INSERT INTO totp_secrets (user_id, secret_encrypted, created_at, enabled_at, last_used_step)
+         VALUES ($1, $2, NOW(), NULL, NULL)
+         ON CONFLICT (user_id) DO UPDATE SET
+            secret_encrypted = EXCLUDED.secret_encrypted, created_at = NOW(), enabled_at = NULL, last_used_step = NULL",
+    )
+    .bind(user_id)
+    .bind(&encrypted)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(TotpSetupResponse {
+        secret: crate::totp::to_base32(&secret),
+        otpauth_url: crate::totp::otpauth_uri(&secret, &username, "Svalinn"),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct TotpCodeRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TotpBackupCodesResponse {
+    /// Plaintext, and only ever sent once -- from here on only each code's
+    /// hash exists server-side (see migration 0050's doc comment on
+    /// totp_backup_codes).
+    pub backup_codes: Vec<String>,
+}
+
+/// POST /api/v1/users/me/2fa/enable — confirms setup with a real code from
+/// the authenticator and turns 2FA on, returning a fresh set of backup
+/// codes in the same response.
+pub async fn enable_totp(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<TotpCodeRequest>,
+) -> Result<Json<TotpBackupCodesResponse>, AppError> {
+    let key = user_id.to_string();
+    db.limits.check(&TOTP_ENABLE_PER_USER, &key)?;
+
+    let row: Option<(String, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT secret_encrypted, enabled_at FROM totp_secrets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some((secret_encrypted, enabled_at)) = row else {
+        return Err(AppError::BadRequest("Start two-factor setup first".into()));
+    };
+    if enabled_at.is_some() {
+        return Err(AppError::BadRequest("Two-factor authentication is already enabled".into()));
+    }
+
+    let secret = email_privacy::decrypt_bytes(&secret_encrypted)
+        .map_err(|_| AppError::Internal("Could not read the pending 2FA secret".into()))?;
+
+    let now = Utc::now().timestamp() as u64;
+    let Some(step) = crate::totp::verify(&secret, &payload.code, now, None) else {
+        db.limits.record(&TOTP_ENABLE_PER_USER, &key);
+        return Err(AppError::BadRequest("That code is incorrect".into()));
+    };
+    db.limits.reset(&TOTP_ENABLE_PER_USER, &key);
+
+    sqlx::query("UPDATE totp_secrets SET enabled_at = NOW(), last_used_step = $1 WHERE user_id = $2")
+        .bind(step)
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let backup_codes = generate_and_store_backup_codes(&db, user_id).await?;
+    Ok(Json(TotpBackupCodesResponse { backup_codes }))
+}
+
+/// 8 codes, each 5 random bytes formatted as two hex groups ("A1B2C-D3E4F"):
+/// easy to read and type once, 40 bits each -- plenty against the handful
+/// of guesses `routes::auth::totp_login`'s rate limit allows per pending
+/// login. Replaces any codes already on file, so re-running this (manual
+/// regeneration, or re-enabling after a disable) invalidates the old set.
+async fn generate_and_store_backup_codes(db: &Database, user_id: Uuid) -> Result<Vec<String>, AppError> {
+    sqlx::query("DELETE FROM totp_backup_codes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut codes = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let mut bytes = [0u8; 5];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+        let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let display = format!("{}-{}", &hex[..5], &hex[5..]);
+
+        sqlx::query("INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(crate::routes::auth::hash_token(&normalize_backup_code(&display)))
+            .execute(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        codes.push(display);
+    }
+    Ok(codes)
+}
+
+/// Strips everything but letters/digits and upcases, so "a1b2c-d3e4f",
+/// "A1B2CD3E4F" and "A1B2C-D3E4F" all hash the same way -- a backup code is
+/// meant to be typed once under stress (locked out, no authenticator to
+/// hand), so being forgiving about dashes/case/stray whitespace costs
+/// nothing and avoids a wrong-format rejection on an otherwise-correct code.
+fn normalize_backup_code(code: &str) -> String {
+    code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase()
+}
+
+#[derive(Deserialize)]
+pub struct CurrentPasswordRequest {
+    pub current_password: String,
+}
+
+/// POST /api/v1/users/me/2fa/disable — removes the secret and every backup
+/// code. Requires the current password (unlike `setup_totp`): this is a
+/// security *downgrade* happening from an already-authenticated session, the
+/// same situation `change_password`/`change_email` re-ask for.
+pub async fn disable_totp(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<CurrentPasswordRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    verify_current_password(&db, user_id, &payload.current_password).await?;
+
+    sqlx::query("DELETE FROM totp_secrets WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    sqlx::query("DELETE FROM totp_backup_codes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "disabled": true })))
+}
+
+/// POST /api/v1/users/me/2fa/backup-codes/regenerate — invalidates every
+/// existing backup code and issues a fresh set. Requires the current
+/// password, same reasoning as `disable_totp`.
+pub async fn regenerate_backup_codes(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Json(payload): Json<CurrentPasswordRequest>,
+) -> Result<Json<TotpBackupCodesResponse>, AppError> {
+    verify_current_password(&db, user_id, &payload.current_password).await?;
+
+    let enabled: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM totp_secrets WHERE user_id = $1 AND enabled_at IS NOT NULL)")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if !enabled {
+        return Err(AppError::BadRequest("Two-factor authentication is not enabled".into()));
+    }
+
+    let backup_codes = generate_and_store_backup_codes(&db, user_id).await?;
+    Ok(Json(TotpBackupCodesResponse { backup_codes }))
+}
+
+/// Checks a 2FA code against the account's TOTP secret, falling back to its
+/// unused backup codes. `true` means the code was valid *and* has already
+/// been consumed -- a TOTP step is recorded as `last_used_step` and a
+/// backup code is marked used in the same breath, so neither can be replayed
+/// by a caller that calls this twice with the same code. Shared by
+/// `routes::auth::totp_login` (finishing a login) -- account settings has
+/// no need for it, since `enable_totp` checks a fresh, not-yet-enabled
+/// secret directly.
+pub(crate) async fn verify_totp_or_backup_code(db: &Database, user_id: Uuid, code: &str) -> Result<bool, AppError> {
+    let row: Option<(String, Option<i64>)> =
+        sqlx::query_as("SELECT secret_encrypted, last_used_step FROM totp_secrets WHERE user_id = $1 AND enabled_at IS NOT NULL")
+            .bind(user_id)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some((secret_encrypted, last_used_step)) = row {
+        if let Ok(secret) = email_privacy::decrypt_bytes(&secret_encrypted) {
+            let now = Utc::now().timestamp() as u64;
+            if let Some(step) = crate::totp::verify(&secret, code, now, last_used_step) {
+                sqlx::query("UPDATE totp_secrets SET last_used_step = $1 WHERE user_id = $2")
+                    .bind(step)
+                    .bind(user_id)
+                    .execute(&db.pool)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                return Ok(true);
+            }
+        }
+    }
+
+    // Not a valid (or not-yet-used) TOTP code -- try it as a backup code.
+    let normalized = normalize_backup_code(code);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let result = sqlx::query(
+        "UPDATE totp_backup_codes SET used_at = NOW() WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(crate::routes::auth::hash_token(&normalized))
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // ---------- Passphrase-based key recovery backup ----------
@@ -1604,5 +1871,186 @@ mod tests {
         assert!(matches!(result, Err(AppError::NotFound(_))));
 
         cleanup_test_user(&db, owner).await;
+    }
+
+    /// Both secrets are read once per test binary (OnceLock), the same as
+    /// auth.rs's own copy of this helper -- needed because this module's
+    /// tests decrypt a TOTP secret, which goes through `email_privacy`.
+    fn ensure_test_secrets() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            dotenvy::dotenv().ok();
+            let _ = crate::extractors::auth::init_jwt_secret();
+            crate::email_privacy::init_keys("development")
+                .expect("test .env must set EMAIL_ENCRYPTION_KEY/EMAIL_BLIND_INDEX_PEPPER");
+        });
+    }
+
+    /// Like `create_test_user`, but with a real Argon2 hash of `password`
+    /// rather than the dummy placeholder -- needed for anything that goes
+    /// through `verify_current_password` (2FA disable/regenerate).
+    async fn create_test_user_with_password(db: &Database, password: &str) -> Uuid {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let unique = Uuid::new_v4();
+        let hash = argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &SaltString::generate(&mut rand::thread_rng()))
+            .expect("hashing a test password should not fail")
+            .to_string();
+        sqlx::query_scalar(
+            "INSERT INTO users (username, email, password_hash, display_name) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(format!("test_{unique}"))
+        .bind(format!("test_{unique}@example.invalid"))
+        .bind(hash)
+        .bind(format!("Test User {unique}"))
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert test user")
+    }
+
+    fn decode_secret(base32_secret: &str) -> Vec<u8> {
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, base32_secret).expect("setup_totp should return valid base32")
+    }
+
+    fn now() -> u64 {
+        Utc::now().timestamp() as u64
+    }
+
+    #[tokio::test]
+    async fn setup_then_enable_turns_on_totp_and_issues_working_backup_codes() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        let setup = setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        let secret = decode_secret(&setup.0.secret);
+        assert!(setup.0.otpauth_url.contains(&setup.0.secret));
+
+        let code = crate::totp::current_code(&secret, now());
+        let enabled = enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code }))
+            .await
+            .expect("enable should succeed with a correct code");
+        assert_eq!(enabled.0.backup_codes.len(), 8);
+
+        let account = get_account(State(db.clone()), CurrentUser(user)).await.expect("get_account should succeed");
+        assert!(account.0.totp_enabled);
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn enable_rejects_a_wrong_code_and_requires_setup_first() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        match enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code: "000000".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest with no setup started, got {other:?}"),
+        }
+
+        setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        match enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code: "000000".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for a wrong code, got {other:?}"),
+        }
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn disable_requires_the_current_password_and_actually_turns_totp_off() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        let setup = setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        let secret = decode_secret(&setup.0.secret);
+        let code = crate::totp::current_code(&secret, now());
+        enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code })).await.expect("enable should succeed");
+
+        match disable_totp(State(db.clone()), CurrentUser(user), Json(CurrentPasswordRequest { current_password: "wrong".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for the wrong password, got {other:?}"),
+        }
+        // Still enabled after the failed attempt.
+        assert!(get_account(State(db.clone()), CurrentUser(user)).await.unwrap().0.totp_enabled);
+
+        disable_totp(State(db.clone()), CurrentUser(user), Json(CurrentPasswordRequest { current_password: "password123".into() }))
+            .await
+            .expect("disable should succeed with the right password");
+        assert!(!get_account(State(db.clone()), CurrentUser(user)).await.unwrap().0.totp_enabled);
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn a_backup_code_works_once_and_then_stops_working() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        let setup = setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        let secret = decode_secret(&setup.0.secret);
+        let code = crate::totp::current_code(&secret, now());
+        let enabled = enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code })).await.expect("enable should succeed");
+        let backup_code = enabled.0.backup_codes[0].clone();
+
+        assert!(verify_totp_or_backup_code(&db, user, &backup_code).await.expect("should not error"));
+        assert!(!verify_totp_or_backup_code(&db, user, &backup_code).await.expect("should not error")); // already used
+
+        // Accepted with different case and no dashes too -- see
+        // `normalize_backup_code`'s doc comment.
+        let second_code = enabled.0.backup_codes[1].replace('-', "").to_lowercase();
+        assert!(verify_totp_or_backup_code(&db, user, &second_code).await.expect("should not error"));
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn regenerate_backup_codes_invalidates_the_old_set() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        let setup = setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        let secret = decode_secret(&setup.0.secret);
+        let code = crate::totp::current_code(&secret, now());
+        let enabled = enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code })).await.expect("enable should succeed");
+        let old_code = enabled.0.backup_codes[0].clone();
+
+        let regenerated = regenerate_backup_codes(
+            State(db.clone()),
+            CurrentUser(user),
+            Json(CurrentPasswordRequest { current_password: "password123".into() }),
+        )
+        .await
+        .expect("regenerate should succeed");
+        assert_eq!(regenerated.0.backup_codes.len(), 8);
+        assert_ne!(regenerated.0.backup_codes, enabled.0.backup_codes);
+
+        assert!(!verify_totp_or_backup_code(&db, user, &old_code).await.expect("should not error"));
+        assert!(verify_totp_or_backup_code(&db, user, &regenerated.0.backup_codes[0]).await.expect("should not error"));
+
+        cleanup_test_user(&db, user).await;
+    }
+
+    #[tokio::test]
+    async fn a_totp_code_cannot_be_replayed() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let user = create_test_user_with_password(&db, "password123").await;
+
+        let setup = setup_totp(State(db.clone()), CurrentUser(user)).await.expect("setup should succeed");
+        let secret = decode_secret(&setup.0.secret);
+        let code = crate::totp::current_code(&secret, now());
+        enable_totp(State(db.clone()), CurrentUser(user), Json(TotpCodeRequest { code: code.clone() })).await.expect("enable should succeed");
+
+        // The code that just enabled 2FA was already consumed as part of
+        // enabling it -- so even without a fresh `verify_totp_or_backup_code`
+        // call for the test to make, trying the identical code again must fail.
+        assert!(!verify_totp_or_backup_code(&db, user, &code).await.expect("should not error"));
+
+        cleanup_test_user(&db, user).await;
     }
 }

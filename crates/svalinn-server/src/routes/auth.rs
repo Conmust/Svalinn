@@ -152,11 +152,38 @@ pub async fn register(
     start_session(&db, user, dev_link).await
 }
 
+/// What `login` hands back: either a finished session (no 2FA on the
+/// account), or a short-lived pending-login token that `totp_login` needs
+/// to finish the job. Kept as an enum (rather than always returning the
+/// same JSON shape with optional fields) so a test -- or any other caller
+/// in this module -- can match on it directly instead of picking fields
+/// out of a `serde_json::Value`.
+#[derive(Debug)]
+pub enum LoginOutcome {
+    Authenticated(AuthResponse),
+    RequiresTotp { pending_token: String },
+}
+
+impl axum::response::IntoResponse for LoginOutcome {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            LoginOutcome::Authenticated(r) => Json(r).into_response(),
+            // `requires_2fa` is redundant with the HTTP status/shape, but
+            // spelling it out means a client can branch on one obvious
+            // boolean rather than on "does this response have a `token`
+            // field or a `pending_token` field".
+            LoginOutcome::RequiresTotp { pending_token } => {
+                Json(serde_json::json!({ "requires_2fa": true, "pending_token": pending_token })).into_response()
+            }
+        }
+    }
+}
+
 pub async fn login(
     State(db): State<Database>,
     ClientIp(ip): ClientIp,
     Json(payload): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
+) -> Result<LoginOutcome, AppError> {
     // Limit password guessing: every attempt counts per IP address, and
     // failed attempts count both per (account, IP) -- the real brute-force
     // throttle -- and per account alone, as a looser backstop against a
@@ -216,6 +243,98 @@ pub async fn login(
         return Err(AppError::Forbidden(AccessDenied::Banned(reason).message()));
     }
 
+    let totp_enabled: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM totp_secrets WHERE user_id = $1 AND enabled_at IS NOT NULL)")
+            .bind(user.id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if totp_enabled {
+        let pending_token = issue_pending_login_token(&db, user.id).await?;
+        return Ok(LoginOutcome::RequiresTotp { pending_token });
+    }
+
+    Ok(LoginOutcome::Authenticated(start_session(&db, user, None).await?.0))
+}
+
+/// How long a pending-login token (issued once the password checks out on a
+/// 2FA-enabled account) stays usable. Short: the password has already been
+/// typed, the authenticator app is presumably already open, and a short
+/// window limits how long a stolen or intercepted pending token is useful.
+const PENDING_LOGIN_TTL_MINUTES: i64 = 10;
+
+async fn issue_pending_login_token(db: &Database, user_id: Uuid) -> Result<String, AppError> {
+    let token = new_refresh_token();
+    let expires_at = Utc::now() + Duration::minutes(PENDING_LOGIN_TTL_MINUTES);
+    sqlx::query("INSERT INTO totp_pending_logins (token_hash, user_id, expires_at) VALUES ($1, $2, $3)")
+        .bind(hash_token(&token))
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(token)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TotpLoginRequest {
+    pub pending_token: String,
+    /// A 6-digit authenticator code, or one of the account's backup codes
+    /// (see `routes::users::enable_totp`) -- either is accepted here, since
+    /// from the login screen's point of view they're just two forms of "the
+    /// second factor".
+    pub code: String,
+}
+
+/// POST /api/v1/auth/2fa/login -- the second step of logging into a
+/// 2FA-enabled account, started by `login` returning `RequiresTotp`.
+pub async fn totp_login(
+    State(db): State<Database>,
+    Json(payload): Json<TotpLoginRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    let token_hash = hash_token(&payload.pending_token);
+
+    // Rate limited per pending token (not per account): each token already
+    // required a correct password and expires on its own shortly, so this
+    // only needs to stop someone who has gotten hold of one token from
+    // grinding through the 6-digit space before it dies -- see this rule's
+    // own doc comment in rate_limit.rs.
+    db.limits.check(&crate::rate_limit::TOTP_LOGIN_PER_PENDING_TOKEN, &token_hash)?;
+
+    let row: Option<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> =
+        sqlx::query_as("SELECT user_id, expires_at, used_at FROM totp_pending_logins WHERE token_hash = $1")
+            .bind(&token_hash)
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(db_err)?;
+    let Some((user_id, expires_at, used_at)) = row else {
+        return Err(AppError::BadRequest("That login attempt is invalid or has expired. Log in again.".into()));
+    };
+    if used_at.is_some() || expires_at <= Utc::now() {
+        return Err(AppError::BadRequest("That login attempt is invalid or has expired. Log in again.".into()));
+    }
+
+    db.limits.record(&crate::rate_limit::TOTP_LOGIN_PER_PENDING_TOKEN, &token_hash);
+
+    if !crate::routes::users::verify_totp_or_backup_code(&db, user_id, &payload.code).await? {
+        return Err(AppError::BadRequest("That code is incorrect".into()));
+    }
+
+    // The pending token itself is single-use regardless of which factor
+    // (TOTP vs. backup code) satisfied it -- a stolen pending token plus one
+    // successful guess shouldn't get a second bite with a different code.
+    sqlx::query("UPDATE totp_pending_logins SET used_at = NOW() WHERE token_hash = $1")
+        .bind(&token_hash)
+        .execute(&db.pool)
+        .await
+        .map_err(db_err)?;
+
+    let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(db_err)?;
     start_session(&db, user, None).await
 }
 
@@ -807,7 +926,7 @@ fn session_ended(message: &str) -> AppError {
 }
 
 /// 256 random bits, hex encoded.
-fn new_refresh_token() -> String {
+pub(crate) fn new_refresh_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     to_hex(&bytes)
@@ -815,11 +934,11 @@ fn new_refresh_token() -> String {
 
 /// Tokens are stored as SHA-256 hashes, so a database leak doesn't hand out
 /// working tokens. A fast hash is fine here: the tokens are random, not passwords.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     to_hex(&Sha256::digest(token.as_bytes()))
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -1244,6 +1363,144 @@ mod tests {
             .await
             .expect("forgot-password must still return success once the account is rate limited");
         assert!(fourth.0.dev_reset_link.is_none());
+
+        cleanup_user(&db, &username).await;
+    }
+
+    /// Registers, then fully enables 2FA through the real setup/enable
+    /// handlers (not a direct SQL insert) -- returns the user id and the
+    /// decoded secret, so a test can compute a valid code whenever it needs
+    /// one.
+    async fn register_with_totp_enabled(db: &Database, username: &str, password: &str) -> (Uuid, Vec<u8>) {
+        let email = format!("{username}-{}@Example.Invalid", Uuid::new_v4());
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.into(), email, password: password.into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let user_id = reg.0.user.id;
+
+        let setup = crate::routes::users::setup_totp(State(db.clone()), CurrentUser(user_id))
+            .await
+            .expect("2FA setup should succeed");
+        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &setup.0.secret).unwrap();
+        let code = crate::totp::current_code(&secret, Utc::now().timestamp() as u64);
+        crate::routes::users::enable_totp(State(db.clone()), CurrentUser(user_id), Json(crate::routes::users::TotpCodeRequest { code }))
+            .await
+            .expect("enabling 2FA should succeed");
+
+        (user_id, secret)
+    }
+
+    #[tokio::test]
+    async fn login_on_a_2fa_account_stops_short_of_a_session_until_the_code_is_verified() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let (user_id, secret) = register_with_totp_enabled(&db, &username, "password123").await;
+
+        let email: String = sqlx::query_scalar("SELECT email_encrypted FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .and_then(|e: Option<String>| Ok(email_privacy::decrypt(&e.unwrap()).unwrap()))
+            .unwrap();
+
+        let outcome = login(State(db.clone()), test_ip(), Json(LoginRequest { email: email.clone(), password: "password123".into() }))
+            .await
+            .expect("login (first factor) should succeed");
+        let pending_token = match outcome {
+            LoginOutcome::RequiresTotp { pending_token } => pending_token,
+            other => panic!("expected RequiresTotp for a 2FA-enabled account, got {other:?}"),
+        };
+
+        // Wrong code: the pending token survives for a retry.
+        match totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token: pending_token.clone(), code: "000000".into() })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for a wrong code, got {other:?}"),
+        }
+
+        // One step on from "now": `register_with_totp_enabled` already
+        // consumed *this* step's code confirming setup moments ago, and
+        // replay protection means that exact code can't be reused here --
+        // same as a real authenticator app's code going stale the instant
+        // it's used once.
+        let next_step_time = Utc::now().timestamp() as u64 + 30;
+        let code = crate::totp::current_code(&secret, next_step_time);
+        let authed = totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token: pending_token.clone(), code }))
+            .await
+            .expect("totp_login should succeed with the right code");
+        assert_eq!(authed.0.user.id, user_id);
+
+        // The pending token is single-use: it's gone even though it hasn't expired.
+        let code_again = crate::totp::current_code(&secret, next_step_time + 30);
+        match totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token, code: code_again })).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for a reused pending token, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn totp_login_accepts_a_backup_code_in_place_of_a_totp_code() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("{username}-{}@Example.Invalid", Uuid::new_v4());
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email: email.clone(), password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let user_id = reg.0.user.id;
+
+        let setup = crate::routes::users::setup_totp(State(db.clone()), CurrentUser(user_id)).await.unwrap();
+        let secret = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &setup.0.secret).unwrap();
+        let code = crate::totp::current_code(&secret, Utc::now().timestamp() as u64);
+        let enabled = crate::routes::users::enable_totp(State(db.clone()), CurrentUser(user_id), Json(crate::routes::users::TotpCodeRequest { code }))
+            .await
+            .unwrap();
+        let backup_code = enabled.0.backup_codes[0].clone();
+
+        let outcome = login(State(db.clone()), test_ip(), Json(LoginRequest { email, password: "password123".into() })).await.unwrap();
+        let LoginOutcome::RequiresTotp { pending_token } = outcome else { panic!("expected RequiresTotp") };
+
+        totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token, code: backup_code }))
+            .await
+            .expect("totp_login should accept a valid backup code");
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn totp_login_is_rate_limited_per_pending_token() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let (user_id, _secret) = register_with_totp_enabled(&db, &username, "password123").await;
+        let email: String = sqlx::query_scalar("SELECT email_encrypted FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&db.pool)
+            .await
+            .and_then(|e: Option<String>| Ok(email_privacy::decrypt(&e.unwrap()).unwrap()))
+            .unwrap();
+
+        let outcome = login(State(db.clone()), test_ip(), Json(LoginRequest { email, password: "password123".into() })).await.unwrap();
+        let LoginOutcome::RequiresTotp { pending_token } = outcome else { panic!("expected RequiresTotp") };
+
+        // TOTP_LOGIN_PER_PENDING_TOKEN allows 5 attempts before locking.
+        for _ in 0..5 {
+            let _ = totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token: pending_token.clone(), code: "000000".into() })).await;
+        }
+        match totp_login(State(db.clone()), Json(TotpLoginRequest { pending_token, code: "000000".into() })).await {
+            Err(AppError::TooManyRequests { .. }) => {}
+            other => panic!("expected a TooManyRequests once the per-pending-token limit is exceeded, got {other:?}"),
+        }
 
         cleanup_user(&db, &username).await;
     }

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
   import { apiFetch, apiBase } from '../lib/api';
-  import { getCurrentUser, updateUserInStorage, resendVerificationEmail } from '../lib/auth';
+  import { getCurrentUser, updateUserInStorage, resendVerificationEmail, setupTotp, enableTotp, disableTotp, regenerateBackupCodes } from '../lib/auth';
+  import QRCode from 'qrcode';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
   import { clearMessageHistoryCache } from '../lib/message-history';
   import { hasNotificationPermission, notificationsSupported, requestNotificationPermission } from '../lib/notifications';
@@ -452,6 +453,7 @@
       email = account.email;
       isSiteOwner = account.is_site_owner;
       emailVerified = account.email_verified;
+      totpEnabled = account.totp_enabled;
     }
     // /me/account doesn't carry patron_tier -- /me (get_current_user) does.
     const meRes = await apiFetch(`${apiBase()}/api/v1/users/me`);
@@ -578,7 +580,122 @@
     }
   }
 
-  const input = 'w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]';
+  // Two-factor authentication (TOTP). `totpStage` walks setup forward:
+  // idle (nothing in progress) -> setup (QR shown, waiting on a code) ->
+  // backup-codes (just enabled, showing the one-time recovery codes).
+  // Disabling and regenerating backup codes don't need a stage of their
+  // own -- they're single password-gated forms shown while `totpEnabled`.
+  let totpEnabled = false;
+  let totpStage: 'idle' | 'setup' | 'backup-codes' = 'idle';
+  let totpSecret = '';
+  let totpQrDataUrl = '';
+  let totpCode = '';
+  let totpBackupCodes: string[] = [];
+  let totpBusy = false;
+  let totpError = '';
+
+  let totpDisablePassword = '';
+  let totpDisableBusy = false;
+  let totpDisableError = '';
+
+  let regenPassword = '';
+  let regenBusy = false;
+  let regenError = '';
+  let regenCodes: string[] = [];
+
+  async function startTotpSetup() {
+    totpError = '';
+    totpBusy = true;
+    try {
+      const { secret, otpauthUrl } = await setupTotp();
+      totpSecret = secret;
+      totpQrDataUrl = await QRCode.toDataURL(otpauthUrl);
+      totpCode = '';
+      totpStage = 'setup';
+    } catch (err: any) {
+      totpError = err.message || 'Could not start two-factor setup';
+    } finally {
+      totpBusy = false;
+    }
+  }
+
+  async function confirmTotpSetup(e: Event) {
+    e.preventDefault();
+    totpError = '';
+    totpBusy = true;
+    try {
+      const { backupCodes } = await enableTotp(totpCode);
+      totpBackupCodes = backupCodes;
+      totpEnabled = true;
+      totpStage = 'backup-codes';
+    } catch (err: any) {
+      totpError = err.message || 'That code is incorrect';
+    } finally {
+      totpBusy = false;
+    }
+  }
+
+  function cancelTotpSetup() {
+    totpStage = 'idle';
+    totpSecret = '';
+    totpQrDataUrl = '';
+    totpCode = '';
+    totpError = '';
+  }
+
+  function finishTotpSetup() {
+    totpStage = 'idle';
+    totpSecret = '';
+    totpQrDataUrl = '';
+    totpCode = '';
+    totpBackupCodes = [];
+  }
+
+  async function handleDisableTotp(e: Event) {
+    e.preventDefault();
+    totpDisableError = '';
+    totpDisableBusy = true;
+    try {
+      await disableTotp(totpDisablePassword);
+      totpEnabled = false;
+      totpDisablePassword = '';
+      regenCodes = [];
+    } catch (err: any) {
+      totpDisableError = err.message || 'Could not disable two-factor authentication';
+    } finally {
+      totpDisableBusy = false;
+    }
+  }
+
+  async function handleRegenerateBackupCodes(e: Event) {
+    e.preventDefault();
+    regenError = '';
+    regenBusy = true;
+    try {
+      const { backupCodes } = await regenerateBackupCodes(regenPassword);
+      regenCodes = backupCodes;
+      regenPassword = '';
+    } catch (err: any) {
+      regenError = err.message || 'Could not regenerate backup codes';
+    } finally {
+      regenBusy = false;
+    }
+  }
+
+  function downloadBackupCodes(codes: string[]) {
+    const blob = new Blob(
+      [`Svalinn two-factor backup codes\n\nEach code works once. Keep them somewhere safe.\n\n${codes.join('\n')}\n`],
+      { type: 'text/plain' },
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'svalinn-backup-codes.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const input ='w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-sm focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]';
   const label = 'block text-xs text-[#00aa00] uppercase tracking-wider mb-1';
   const submit = 'w-full py-2 bg-black border-2 border-[#00ff00] text-[#00ff00] font-semibold uppercase tracking-wider text-sm hover:bg-[#00ff00] hover:text-black transition-all disabled:opacity-50';
 </script>
@@ -800,6 +917,146 @@
         {#if passwordMessage}<div class="text-xs text-[#00ff00]">{'>'} {passwordMessage}</div>{/if}
         <button type="submit" class={submit} disabled={passwordBusy}>{passwordBusy ? 'Saving...' : 'Change password'}</button>
       </form>
+
+      <section class="space-y-3">
+        <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Two-factor authentication</h4>
+
+        {#if totpStage === 'setup'}
+          <p class="text-[11px] text-[#00aa00]">
+            Scan this with an authenticator app (Google Authenticator, 1Password, Authy, etc.), or enter the code
+            below by hand. Then type the 6-digit code it shows to confirm.
+          </p>
+          {#if totpQrDataUrl}
+            <img src={totpQrDataUrl} alt="Two-factor setup QR code" class="mx-auto bg-white p-2 w-40 h-40" />
+          {/if}
+          <div>
+            <span class={label}>Manual entry code</span>
+            <code class="block w-full bg-[#0a0e0a] border border-[#00ff00] px-3 py-2 text-[#00ff00] text-xs break-all select-all">{totpSecret}</code>
+          </div>
+          <form on:submit={confirmTotpSetup} class="space-y-3">
+            <div>
+              <label for="account-totp-confirm" class={label}>6-digit code</label>
+              <input
+                id="account-totp-confirm"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]{'{'}6{'}'}"
+                maxlength="6"
+                bind:value={totpCode}
+                class={input}
+                required
+                autocomplete="one-time-code"
+              />
+            </div>
+            {#if totpError}<div class="text-xs text-red-500">{'>'} {totpError}</div>{/if}
+            <div class="flex gap-2">
+              <button type="submit" class={submit} disabled={totpBusy}>{totpBusy ? 'Verifying...' : 'Confirm and enable'}</button>
+              <button
+                type="button"
+                class="px-3 py-2 border border-[#00aa00] text-[#00aa00] text-xs uppercase tracking-wider hover:border-[#00ff00] hover:text-[#00ff00]"
+                on:click={cancelTotpSetup}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        {:else if totpStage === 'backup-codes'}
+          <p class="text-[11px] text-[#ffaa00]">
+            Two-factor authentication is on. Save these backup codes somewhere safe -- each one lets you back into
+            your account once if you lose access to your authenticator, and they're only shown this one time.
+          </p>
+          <div class="grid grid-cols-2 gap-1 bg-[#0a0e0a] border border-[#00ff00] p-3">
+            {#each totpBackupCodes as code}
+              <code class="text-[#00ff00] text-xs select-all">{code}</code>
+            {/each}
+          </div>
+          <div class="flex gap-2">
+            <button
+              type="button"
+              class="px-3 py-2 border border-[#00aa00] text-[#00aa00] text-xs uppercase tracking-wider hover:border-[#00ff00] hover:text-[#00ff00]"
+              on:click={() => downloadBackupCodes(totpBackupCodes)}
+            >
+              Download
+            </button>
+            <button type="button" class={submit} on:click={finishTotpSetup}>I've saved these</button>
+          </div>
+        {:else if totpEnabled}
+          <p class="text-[11px] text-[#00ff00]">{'>'} Two-factor authentication is on.</p>
+
+          <form on:submit={handleRegenerateBackupCodes} class="space-y-2">
+            <p class="text-[11px] text-[#00aa00]">
+              Regenerating backup codes invalidates every code issued before -- only the new set will work.
+            </p>
+            <div>
+              <label for="account-totp-regen-password" class={label}>Current password</label>
+              <input
+                id="account-totp-regen-password"
+                type="password"
+                bind:value={regenPassword}
+                class={input}
+                required
+                autocomplete="current-password"
+              />
+            </div>
+            {#if regenError}<div class="text-xs text-red-500">{'>'} {regenError}</div>{/if}
+            <button
+              type="submit"
+              class="px-3 py-2 border border-[#00aa00] text-[#00aa00] text-xs uppercase tracking-wider hover:border-[#00ff00] hover:text-[#00ff00]"
+              disabled={regenBusy}
+            >
+              {regenBusy ? 'Regenerating...' : 'Regenerate backup codes'}
+            </button>
+          </form>
+
+          {#if regenCodes.length > 0}
+            <div class="space-y-2">
+              <p class="text-[11px] text-[#ffaa00]">New backup codes -- save these now, they won't be shown again.</p>
+              <div class="grid grid-cols-2 gap-1 bg-[#0a0e0a] border border-[#00ff00] p-3">
+                {#each regenCodes as code}
+                  <code class="text-[#00ff00] text-xs select-all">{code}</code>
+                {/each}
+              </div>
+              <button
+                type="button"
+                class="px-3 py-2 border border-[#00aa00] text-[#00aa00] text-xs uppercase tracking-wider hover:border-[#00ff00] hover:text-[#00ff00]"
+                on:click={() => downloadBackupCodes(regenCodes)}
+              >
+                Download
+              </button>
+            </div>
+          {/if}
+
+          <form on:submit={handleDisableTotp} class="space-y-2">
+            <div>
+              <label for="account-totp-disable-password" class={label}>Current password</label>
+              <input
+                id="account-totp-disable-password"
+                type="password"
+                bind:value={totpDisablePassword}
+                class={input}
+                required
+                autocomplete="current-password"
+              />
+            </div>
+            {#if totpDisableError}<div class="text-xs text-red-500">{'>'} {totpDisableError}</div>{/if}
+            <button
+              type="submit"
+              class="px-3 py-2 border border-red-700 text-red-500 text-xs uppercase tracking-wider hover:border-red-500"
+              disabled={totpDisableBusy}
+            >
+              {totpDisableBusy ? 'Disabling...' : 'Disable two-factor authentication'}
+            </button>
+          </form>
+        {:else}
+          <p class="text-[11px] text-[#00aa00]">
+            Add a 6-digit code from an authenticator app to your login, on top of your password.
+          </p>
+          {#if totpError}<div class="text-xs text-red-500">{'>'} {totpError}</div>{/if}
+          <button type="button" class={submit} on:click={startTotpSetup} disabled={totpBusy}>
+            {totpBusy ? 'Starting...' : 'Enable two-factor authentication'}
+          </button>
+        {/if}
+      </section>
 
       <section class="space-y-3">
         <h4 class="text-sm font-bold text-[#00ff00] uppercase tracking-wider">Encrypted messaging devices</h4>
