@@ -93,7 +93,12 @@ const MESSAGE_COLUMNS: &str = r#"
     m.is_encrypted, m.nonce,
     COALESCE(m.is_locked, false) AS is_locked,
     COALESCE(m.is_pinned, false) AS is_pinned,
-    m.pin_plaintext_content,
+    -- Masked at read time, not just cleared at write time: this is the
+    -- backstop that makes "revealed only while pinned" hold even if some
+    -- future write path (or a bug in this one) ever leaves the column set
+    -- on an unpinned row -- see `reveal_pin_plaintext`'s doc comment for
+    -- the concurrency race this also independently closes.
+    CASE WHEN COALESCE(m.is_pinned, false) THEN m.pin_plaintext_content ELSE NULL END AS pin_plaintext_content,
     m.created_at,
     EXISTS(
         SELECT 1 FROM hidden_messages h WHERE h.message_id = m.id AND h.user_id = $1
@@ -405,6 +410,12 @@ pub struct PinnedQuery {
 /// `message_recipients` entry -- that field existing at all means it was
 /// deliberately exposed to everyone who can view this channel, pinned
 /// members list included.
+///
+/// Capped at 200 rather than paginated like `get_channel_messages`: a
+/// channel realistically has a handful of pinned messages, so this is a
+/// sanity bound against an unbounded result (nothing stops a moderator
+/// from pinning far more than that today) rather than a real limit anyone
+/// should hit.
 pub async fn get_pinned_messages(
     State(db): State<Database>,
     CurrentSession { user_id, session_id }: CurrentSession,
@@ -424,6 +435,7 @@ pub async fn get_pinned_messages(
         LEFT JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = m.user_id
         WHERE m.channel_id = $2 AND COALESCE(m.is_pinned, false)
         ORDER BY m.created_at ASC, m.id ASC
+        LIMIT 200
         "#
     ))
     .bind(user_id)
@@ -958,8 +970,16 @@ async fn reveal_pin_plaintext(db: &Database, user_id: Uuid, message_id: Uuid, pl
         )));
     }
 
-    sqlx::query(
-        "UPDATE messages SET pin_plaintext_content = $1, pin_plaintext_revealed_by = $2, pin_plaintext_revealed_at = NOW() WHERE id = $3",
+    // `AND is_pinned` closes a real race, not just a redundant check: the
+    // `ctx.is_pinned` read above and this write aren't one transaction, so
+    // a concurrent unpin can land in between them. Without this guard,
+    // this UPDATE would still fire after that unpin committed and quietly
+    // resurrect a plaintext copy of an unpinned message -- the one thing
+    // this feature promises never happens (see this fn's and
+    // `unpin_message`'s doc comments). Checking `rows_affected` turns that
+    // race into a clean, reportable error instead of a silent no-op.
+    let result = sqlx::query(
+        "UPDATE messages SET pin_plaintext_content = $1, pin_plaintext_revealed_by = $2, pin_plaintext_revealed_at = NOW() WHERE id = $3 AND is_pinned",
     )
     .bind(plaintext)
     .bind(user_id)
@@ -967,6 +987,9 @@ async fn reveal_pin_plaintext(db: &Database, user_id: Uuid, message_id: Uuid, pl
     .execute(&db.pool)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::BadRequest("The message was unpinned while this was being revealed; pin it again first.".into()));
+    }
 
     let payload = serde_json::json!({ "id": message_id, "is_pinned": true, "pin_plaintext_content": plaintext });
     broadcast(db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
@@ -2075,6 +2098,119 @@ mod tests {
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, member).await;
+    }
+
+    /// The database itself refuses a row with a plaintext reveal on an
+    /// unpinned message -- the backstop (`pin_plaintext_only_while_pinned`)
+    /// behind the application-level guards, for whatever future write path
+    /// forgets them. This never goes through any handler: a raw UPDATE is
+    /// the most direct way to confirm the constraint itself, not just the
+    /// application code that's supposed to respect it.
+    #[tokio::test]
+    async fn the_database_rejects_a_plaintext_reveal_on_an_unpinned_message() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 66).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+        // Deliberately never pinned.
+
+        let result = sqlx::query("UPDATE messages SET pin_plaintext_content = $1 WHERE id = $2")
+            .bind("sneaking in")
+            .bind(message_id)
+            .execute(&db.pool)
+            .await;
+        assert!(result.is_err(), "the CHECK constraint should reject this write, but it succeeded");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Even if a stale plaintext reveal somehow ended up on an unpinned
+    /// row (the two guards above are meant to make that impossible, but
+    /// this is the read-time backstop for if they're ever bypassed, e.g.
+    /// by a future migration or a direct DB fix-up), every read path masks
+    /// it back to `None` rather than exposing it. Postgres has no way to
+    /// bypass a single CHECK constraint for one statement, so this test
+    /// drops and re-adds it around the write -- the only way to construct
+    /// the otherwise-impossible state needed to exercise the mask.
+    #[tokio::test]
+    async fn an_unpinned_messages_stale_reveal_is_masked_on_every_read_path() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 67).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        // All three statements run in one transaction so the ACCESS
+        // EXCLUSIVE lock the first ALTER TABLE takes on `messages` is held
+        // for the whole sequence, not just that one statement. Without
+        // this, another test running concurrently against the same shared
+        // database (cargo test runs tests in parallel threads) could write
+        // -- or read, expecting the constraint to be enforced -- in the
+        // window between the DROP and the re-ADD, which is exactly how an
+        // earlier version of this test flaked another test into a
+        // spurious failure.
+        //
+        // The re-add uses `NOT VALID`: a plain `ADD CONSTRAINT` re-checks
+        // every existing row, which would fail on the very row this test
+        // just wrote to deliberately violate the invariant (that row has
+        // to stay in that state for the assertions below). `NOT VALID`
+        // enforces the constraint for all writes from here on without
+        // re-validating current data -- exactly what's needed to restore
+        // protection going forward while still exercising the read-time
+        // mask against this one pre-existing bad row.
+        let mut tx = db.pool.begin().await.expect("beginning the transaction should succeed");
+        sqlx::query("ALTER TABLE messages DROP CONSTRAINT pin_plaintext_only_while_pinned")
+            .execute(&mut *tx)
+            .await
+            .expect("dropping the constraint for this test should succeed");
+        sqlx::query("UPDATE messages SET pin_plaintext_content = $1 WHERE id = $2")
+            .bind("should never be visible")
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .expect("the raw write should succeed with the constraint dropped");
+        sqlx::query(
+            "ALTER TABLE messages ADD CONSTRAINT pin_plaintext_only_while_pinned CHECK (pin_plaintext_content IS NULL OR COALESCE(is_pinned, false)) NOT VALID",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("restoring the constraint should succeed");
+        tx.commit().await.expect("committing the transaction should succeed");
+
+        let fetched = fetch_message(&db, message_id, owner).await.expect("fetching the message should succeed");
+        assert!(!fetched.is_pinned);
+        assert!(fetched.pin_plaintext_content.is_none(), "an unpinned message's stale reveal must be masked, not exposed, on read");
+
+        let channel_history = get_channel_messages(
+            State(db.clone()),
+            CurrentSession { user_id: owner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(HistoryQuery { before: None, limit: None, device_id: None }),
+        )
+        .await
+        .expect("fetching channel history should succeed")
+        .0;
+        assert!(
+            channel_history.iter().all(|m| m.pin_plaintext_content.is_none()),
+            "channel history must never surface a stale reveal on an unpinned message either"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        // The bad row is gone now (cascaded away with the server/channel
+        // above), so this re-validates the constraint against all
+        // remaining data, returning it to a fully validated state rather
+        // than leaving it marked NOT VALID for the rest of this database's
+        // life. Enforcement for new writes was never affected either way;
+        // this only restores the catalog's bookkeeping.
+        sqlx::query("ALTER TABLE messages VALIDATE CONSTRAINT pin_plaintext_only_while_pinned")
+            .execute(&db.pool)
+            .await
+            .expect("re-validating the constraint after cleanup should succeed");
     }
 
     /// `get_pinned_messages` must apply the same `VIEW_CHANNEL` scoping as

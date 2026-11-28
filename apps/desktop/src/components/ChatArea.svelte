@@ -195,7 +195,14 @@
         // the "joined after it was sent" situation this feature exists
         // for. It never overrides a message this device actually has the
         // key for, even if that one decrypt attempt happened to fail.
-        if (message.pin_plaintext_content && (displayed.content === DECRYPT_FAILED_PLACEHOLDER || displayed.content === SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER)) {
+        // `is_pinned` is checked here too, defensively, even though the
+        // server is supposed to clear `pin_plaintext_content` the moment a
+        // message is unpinned (and masks it at read time besides): this
+        // client has no way to verify that server-side invariant actually
+        // held, and showing a stale reveal for an unpinned message would
+        // be exactly the exposure this feature is built to avoid outside
+        // of "currently pinned".
+        if (message.is_pinned && message.pin_plaintext_content && (displayed.content === DECRYPT_FAILED_PLACEHOLDER || displayed.content === SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER)) {
           displayed = { ...displayed, content: message.pin_plaintext_content, revealed_fallback: true };
         }
       }
