@@ -172,6 +172,10 @@ struct MessageContext {
     is_locked: bool,
     is_encrypted: bool,
     is_pinned: bool,
+    /// Needed by `unpin_message` to decide whether an already-pinned
+    /// message is old enough that unpinning it means immediate deletion
+    /// (see `retention::UNPIN_IMMEDIATE_LOSS_DAYS`).
+    created_at: chrono::DateTime<chrono::Utc>,
     role: String,
 }
 
@@ -193,9 +197,9 @@ struct MessageContext {
 /// bypasses it the same way `resolve_channel` always lets them bypass
 /// everything.
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, Uuid, bool, bool, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, Uuid, Uuid, bool, bool, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
-        SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted, COALESCE(m.is_pinned, false)
+        SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted, COALESCE(m.is_pinned, false), m.created_at
         FROM messages m JOIN channels c ON m.channel_id = c.id
         WHERE m.id = $1 AND c.server_id IS NOT NULL
         "#,
@@ -205,12 +209,12 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned) =
+    let (author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, created_at) =
         row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
     let role = require_member(db, server_id, user_id).await?;
     crate::permissions::require_channel_permission(db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
 
-    Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, role })
+    Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, created_at, role })
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -827,6 +831,17 @@ pub async fn delete_message(
         return Err(AppError::Forbidden("This message is locked. Unlock it before deleting.".into()));
     }
 
+    delete_message_now(&db, message_id, ctx.server_id, ctx.channel_id).await?;
+
+    Ok(Json(()))
+}
+
+/// Deletes a message row and its attachment file (if any), and broadcasts
+/// `message_deleted` to whoever can currently view the channel. Shared by
+/// the plain DELETE endpoint above, the retention sweep (`retention.rs`,
+/// which has no HTTP request to hang a handler off), and
+/// `unpin_message`'s immediate-loss path for an already-expired pin.
+pub(crate) async fn delete_message_now(db: &Database, message_id: Uuid, server_id: Uuid, channel_id: Uuid) -> Result<(), AppError> {
     let attachment_url: Option<String> = sqlx::query_scalar(
         "DELETE FROM messages WHERE id = $1 RETURNING attachment_url",
     )
@@ -839,9 +854,9 @@ pub async fn delete_message(
         let _ = tokio::fs::remove_file(url.trim_start_matches('/')).await; // already gone is fine
     }
 
-    broadcast(&db, "message_deleted", serde_json::json!({ "message_id": message_id }), ctx.server_id, ctx.channel_id).await;
+    broadcast(db, "message_deleted", serde_json::json!({ "message_id": message_id }), server_id, channel_id).await;
 
-    Ok(Json(()))
+    Ok(())
 }
 
 /// POST/DELETE /api/v1/messages/:message_id/lock
@@ -923,7 +938,7 @@ pub async fn pin_message(
     Ok(Json(response))
 }
 
-/// DELETE /api/v1/messages/:message_id/pin
+/// DELETE /api/v1/messages/:message_id/pin?confirm=true
 ///
 /// Unpinning also clears any revealed plaintext copy (see
 /// `set_pin_visibility`): the whole point of that copy is to help a new
@@ -931,18 +946,80 @@ pub async fn pin_message(
 /// it to keep living, readable by the server, once the message is no
 /// longer pinned. Re-pinning later means revealing it again, deliberately
 /// -- no silent carry-over.
+///
+/// A pin is the one thing that holds a message outside the retention
+/// sweep's reach (`retention.rs`) once it's older than the sweep's own
+/// `UNREAD_GRACE_DAYS`/cap window would otherwise allow -- so unpinning a
+/// message that old doesn't return it to ordinary standing, it makes it
+/// immediately eligible for (and here, immediately subject to) deletion.
+/// Rather than silently losing that, this first responds with a
+/// confirmation request (`requires_confirmation: true`) unless the caller
+/// already passed `?confirm=true`; only once confirmed does it unpin *and*
+/// delete the message in the same step.
 pub async fn unpin_message(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Path(message_id): Path<Uuid>,
+    Query(params): Query<UnpinQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let ctx = message_context(&db, message_id, user_id).await?;
+    require_moderator(&ctx)?;
+
+    if ctx.is_pinned && chrono::Utc::now() - ctx.created_at >= chrono::Duration::days(crate::retention::UNPIN_IMMEDIATE_LOSS_DAYS) {
+        if !params.confirm {
+            return Ok(Json(serde_json::json!({
+                "id": message_id,
+                "requires_confirmation": true,
+                "warning": format!(
+                    "This message is older than the {}-day retention window. Unpinning it will delete it immediately, and that can't be undone.",
+                    crate::retention::UNPIN_IMMEDIATE_LOSS_DAYS
+                ),
+            })));
+        }
+        delete_message_now(&db, message_id, ctx.server_id, ctx.channel_id).await?;
+        return Ok(Json(serde_json::json!({ "id": message_id, "deleted": true })));
+    }
+
     let response = set_pinned(&db, user_id, message_id, false).await?;
     Ok(Json(response))
+}
+
+#[derive(Deserialize, Default)]
+pub struct UnpinQuery {
+    /// Set to actually go through with unpinning (and, for an already-
+    /// expired pin, deleting) a message after being warned. Defaults to
+    /// `false` so the first call against an old pin always just warns.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 async fn set_pinned(db: &Database, user_id: Uuid, message_id: Uuid, pinned: bool) -> Result<serde_json::Value, AppError> {
     let ctx = message_context(db, message_id, user_id).await?;
     require_moderator(&ctx)?;
+
+    // Only check the cap when this would be a *new* pin -- re-pinning an
+    // already-pinned message (or unpinning) must never be blocked by a
+    // count that already includes the message itself.
+    if pinned && !ctx.is_pinned {
+        let pinned_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM messages m
+            JOIN channels c ON c.id = m.channel_id
+            WHERE c.server_id = $1 AND COALESCE(m.is_pinned, false) = true
+            "#,
+        )
+        .bind(ctx.server_id)
+        .fetch_one(&db.pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if pinned_count >= crate::retention::PIN_CAP_PER_SERVER {
+            return Err(AppError::BadRequest(format!(
+                "This server already has {} pinned messages, its limit. Unpin something before pinning another.",
+                crate::retention::PIN_CAP_PER_SERVER
+            )));
+        }
+    }
 
     let row: (Option<String>,) = sqlx::query_as(
         r#"
@@ -2052,7 +2129,7 @@ mod tests {
         .await
         .expect("pin with reveal should succeed");
 
-        let _ = unpin_message(State(db.clone()), CurrentUser(owner), Path(message_id))
+        let _ = unpin_message(State(db.clone()), CurrentUser(owner), Path(message_id), Query(UnpinQuery::default()))
             .await
             .expect("unpinning should succeed");
 
@@ -2475,6 +2552,183 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AppError::BadRequest(_))), "over the cap must be rejected, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// `retention::PIN_CAP_PER_SERVER` is per *server*, summed across all of
+    /// its channels, not per channel -- so seeding the cap into a single
+    /// channel is enough to prove the check isn't scoped too narrowly.
+    #[tokio::test]
+    async fn pin_message_is_rejected_once_the_server_hits_its_pin_cap() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, is_pinned, pinned_by)
+            SELECT $1, $2, 'pinned ' || i, true, $2
+            FROM generate_series(1, $3) AS i
+            "#,
+        )
+        .bind(channel)
+        .bind(owner)
+        .bind(crate::retention::PIN_CAP_PER_SERVER)
+        .execute(&db.pool)
+        .await
+        .expect("failed to seed pinned messages");
+
+        let owner_device = register_test_device(&db, owner, 90).await;
+        let target = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let result = pin_message(State(db.clone()), CurrentUser(owner), Path(target), Bytes::new()).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "pinning past the server's pin cap must be rejected, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// The pin-cap count must exclude the message being pinned itself, or
+    /// re-pinning (or pin_message's reveal-in-one-step path acting on an
+    /// already-pinned message) would start failing the instant a server
+    /// hits its cap even though no *new* pin is being created.
+    #[tokio::test]
+    async fn pin_message_allows_repinning_an_already_pinned_message_at_the_cap() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 91).await;
+
+        let target = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+        let _ = pin_message(State(db.clone()), CurrentUser(owner), Path(target), Bytes::new())
+            .await
+            .expect("the first pin, under the cap, should succeed");
+
+        sqlx::query(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, is_pinned, pinned_by)
+            SELECT $1, $2, 'pinned ' || i, true, $2
+            FROM generate_series(1, $3) AS i
+            "#,
+        )
+        .bind(channel)
+        .bind(owner)
+        .bind(crate::retention::PIN_CAP_PER_SERVER - 1)
+        .execute(&db.pool)
+        .await
+        .expect("failed to seed pinned messages");
+
+        let result = pin_message(State(db.clone()), CurrentUser(owner), Path(target), Bytes::new()).await;
+        assert!(
+            result.is_ok(),
+            "re-pinning an already-pinned message must not be blocked by a cap that already counts it, got {result:?}"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn unpin_message_on_a_recent_pin_just_unpins() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 92).await;
+        let target = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let _ = pin_message(State(db.clone()), CurrentUser(owner), Path(target), Bytes::new())
+            .await
+            .expect("pin should succeed");
+
+        let response = unpin_message(State(db.clone()), CurrentUser(owner), Path(target), Query(UnpinQuery::default()))
+            .await
+            .expect("unpinning a fresh pin should succeed outright, with no confirmation step")
+            .0;
+        assert_eq!(response["is_pinned"], serde_json::json!(false));
+
+        let still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1)")
+            .bind(target)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to check survival");
+        assert!(still_exists, "unpinning a message nowhere near the retention window must not delete it");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    async fn insert_expired_pinned_message(db: &Database, channel: Uuid, owner: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO messages (channel_id, user_id, content, is_pinned, pinned_by, created_at)
+            VALUES ($1, $2, 'old pin', true, $2, NOW() - INTERVAL '31 days')
+            RETURNING id
+            "#,
+        )
+        .bind(channel)
+        .bind(owner)
+        .fetch_one(&db.pool)
+        .await
+        .expect("failed to insert an already-expired pinned message")
+    }
+
+    /// A pin is what's been keeping this message alive past where the
+    /// retention sweep would otherwise have taken it (see `retention.rs`);
+    /// unpinning it needs a confirmation step before anything changes.
+    #[tokio::test]
+    async fn unpin_message_warns_before_deleting_an_expired_pin() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let target = insert_expired_pinned_message(&db, channel, owner).await;
+
+        let response = unpin_message(State(db.clone()), CurrentUser(owner), Path(target), Query(UnpinQuery::default()))
+            .await
+            .expect("the warning call itself should succeed")
+            .0;
+        assert_eq!(response["requires_confirmation"], serde_json::json!(true));
+        assert!(response["warning"].is_string());
+
+        let still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1)")
+            .bind(target)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to check survival");
+        assert!(still_exists, "an unconfirmed unpin must not delete or unpin anything yet");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    #[tokio::test]
+    async fn unpin_message_with_confirm_deletes_an_expired_pin_immediately() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let target = insert_expired_pinned_message(&db, channel, owner).await;
+
+        let response = unpin_message(State(db.clone()), CurrentUser(owner), Path(target), Query(UnpinQuery { confirm: true }))
+            .await
+            .expect("a confirmed unpin of an expired pin should succeed")
+            .0;
+        assert_eq!(response["deleted"], serde_json::json!(true));
+
+        let still_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1)")
+            .bind(target)
+            .fetch_one(&db.pool)
+            .await
+            .expect("failed to check survival");
+        assert!(!still_exists, "confirming the warning must delete the message immediately, not just unpin it");
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
