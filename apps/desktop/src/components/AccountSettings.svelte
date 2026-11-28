@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
   import { apiFetch, apiBase } from '../lib/api';
-  import { getCurrentUser, updateUserInStorage } from '../lib/auth';
+  import { getCurrentUser, updateUserInStorage, resendVerificationEmail } from '../lib/auth';
   import { fetchMyDevices, removeDevice, renameDevice, type MyDevice } from '../lib/devices';
   import { clearMessageHistoryCache } from '../lib/message-history';
   import { hasNotificationPermission, notificationsSupported, requestNotificationPermission } from '../lib/notifications';
@@ -28,6 +28,7 @@
   let username = '';
   let email = '';
   let isSiteOwner = false;
+  let emailVerified = true; // optimistic default until `/me/account` loads, so no flash of a "verify" banner
 
   // Profile picture
   let avatarUrl: string | null = null;
@@ -450,6 +451,7 @@
       username = account.username;
       email = account.email;
       isSiteOwner = account.is_site_owner;
+      emailVerified = account.email_verified;
     }
     // /me/account doesn't carry patron_tier -- /me (get_current_user) does.
     const meRes = await apiFetch(`${apiBase()}/api/v1/users/me`);
@@ -470,6 +472,35 @@
     return err.error || fallback;
   }
 
+  // Email verification -- resending the link. `email_verified` itself
+  // comes from `/me/account` above; this just lets an unverified account
+  // get a fresh link (the original one may have expired, or -- since
+  // there's no real email provider wired up yet -- never gone anywhere to
+  // begin with). Without this there would be no way back in: joining a
+  // server requires a verified email with no other path to one.
+  let resendBusy = false;
+  let resendError = '';
+  let resendMessage = '';
+
+  async function handleResendVerification() {
+    resendBusy = true;
+    resendError = '';
+    resendMessage = '';
+    try {
+      await resendVerificationEmail();
+      // In dev this already auto-verified (see `resendVerificationEmail`'s
+      // own dev-link convenience); re-check so the status above updates
+      // immediately instead of waiting for a reload.
+      const res = await apiFetch(`${apiBase()}/api/v1/users/me/account`);
+      if (res.ok) emailVerified = (await res.json()).email_verified;
+      resendMessage = emailVerified ? 'Verified.' : 'Verification email sent. Check your inbox.';
+    } catch (err: any) {
+      resendError = err.message || 'Failed to resend the verification email';
+    } finally {
+      resendBusy = false;
+    }
+  }
+
   async function changeEmail(e: Event) {
     e.preventDefault();
     emailMessage = emailError = '';
@@ -481,11 +512,32 @@
         body: JSON.stringify({ email: newEmail, current_password: emailPassword }),
       });
       if (res.ok) {
-        email = (await res.json()).email;
+        const data = await res.json();
+        email = data.email;
         const user = getCurrentUser();
         if (user) updateUserInStorage({ ...user, email });
         newEmail = emailPassword = '';
-        emailMessage = 'Email updated. Use it the next time you log in.';
+        // Changing email resets verification server-side (a new email
+        // hasn't been proven to belong to this account yet) -- reflect that
+        // immediately rather than leaving the stale "Verified" state
+        // showing until the next full page load.
+        if (data.email_verification_required) {
+          emailVerified = false;
+          emailMessage = 'Email updated. Verify it below before you can join new servers.';
+          // Dev-only convenience, same as `register()`/`resendVerificationEmail()`:
+          // no real email provider is wired up, so follow the link ourselves
+          // so local testing doesn't need a real inbox.
+          if (data.dev_verification_link) {
+            try {
+              await fetch(data.dev_verification_link);
+              emailVerified = true;
+            } catch {
+              // Best-effort only -- the email change itself already succeeded.
+            }
+          }
+        } else {
+          emailMessage = 'Email updated. Use it the next time you log in.';
+        }
       } else {
         emailError = await errorFrom(res, 'Could not change email');
       }
@@ -549,7 +601,10 @@
         />
         <div class="flex-1 min-w-0">
           <div class="text-lg font-bold text-[#00ff00]">{username}</div>
-          <div class="text-xs text-[#00aa00]">{email}</div>
+          <div class="text-xs text-[#00aa00]">
+            {email}
+            {#if !emailVerified}<span class="text-[#ffaa00]"> · unverified</span>{/if}
+          </div>
           {#if isSiteOwner}
             <div class="inline-block mt-2 px-2 py-0.5 text-[10px] uppercase tracking-widest border border-[#ffaa00] text-[#ffaa00]">Site owner</div>
           {/if}
@@ -688,6 +743,26 @@
             {/each}
           </div>
           {#if emblemError}<div class="text-xs text-red-500">{'>'} {emblemError}</div>{/if}
+        </section>
+      {/if}
+
+      {#if !emailVerified}
+        <section class="space-y-3">
+          <h4 class="text-sm font-bold text-[#ffaa00] uppercase tracking-wider">Email not verified</h4>
+          <p class="text-[11px] text-[#00aa00]">
+            You can't join a server until your email is verified. If the original link expired, or never
+            arrived, request a new one.
+          </p>
+          {#if resendError}<div class="text-xs text-red-500">{'>'} {resendError}</div>{/if}
+          {#if resendMessage}<div class="text-xs text-[#00ff00]">{'>'} {resendMessage}</div>{/if}
+          <button
+            type="button"
+            class="text-xs text-[#00ff00] underline disabled:opacity-50"
+            disabled={resendBusy}
+            on:click={handleResendVerification}
+          >
+            {resendBusy ? 'Sending...' : 'Resend verification email'}
+          </button>
         </section>
       {/if}
 

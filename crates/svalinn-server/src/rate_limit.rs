@@ -50,6 +50,12 @@ pub const INVITES_PER_USER: Rule = Rule { name: "invite-user", limit: 20, window
 /// Wrong current passwords when changing email or password, per user.
 pub const REAUTH_FAILURES_PER_USER: Rule = Rule { name: "reauth-user", limit: 5, window: Duration::from_secs(15 * 60) };
 
+/// Verification-email resend requests, per user (`routes::auth::resend_verification`).
+/// Tight: each one issues a new token and a (future) real email send, and an
+/// already-logged-in caller has no other reason to hit this a lot.
+pub const RESEND_VERIFICATION_PER_USER: Rule =
+    Rule { name: "resend-verification-user", limit: 3, window: Duration::from_secs(15 * 60) };
+
 /// Prekey-bundle fetches from one caller against one SPECIFIC target
 /// device (`routes::ratchet::fetch_prekey_bundle`). That endpoint is
 /// deliberately open to any authenticated caller for any device id (a

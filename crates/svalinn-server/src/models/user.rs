@@ -126,6 +126,14 @@ pub struct VerifyEmailRequest {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ResendVerificationResponse {
+    /// Same `dev_verification_link` convenience as `AuthResponse` -- see its
+    /// doc comment. Only ever set under `APP_ENV=development`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_verification_link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub token: String,
     pub expires_in: i64,
