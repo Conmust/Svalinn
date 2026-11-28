@@ -8,6 +8,7 @@
   import { voiceRosters, loadVoiceRosters } from '../lib/voiceChannel';
   import { myServerPermissions } from '../lib/roles';
   import { autofocus } from '../lib/actions';
+  import { mergeChannelUpdate, validateSlowmodeSeconds, MAX_SLOWMODE_SECONDS } from '../lib/servers';
   import ServerSettings from './ServerSettings.svelte';
   import ChannelOverwrites from './ChannelOverwrites.svelte';
   import Avatar from './Avatar.svelte';
@@ -113,12 +114,11 @@
     slowmodeError = '';
   }
 
-  const MAX_SLOWMODE_SECONDS = 21_600; // 6 hours -- matches the server's own cap.
-
   async function applySlowmode(seconds: number) {
     if (!managingSlowmode) return;
-    if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_SLOWMODE_SECONDS) {
-      slowmodeError = `Must be between 0 and ${MAX_SLOWMODE_SECONDS} seconds.`;
+    const error = validateSlowmodeSeconds(seconds);
+    if (error) {
+      slowmodeError = error;
       return;
     }
     const channel = managingSlowmode;
@@ -163,7 +163,7 @@
   // assuming `name` is always present -- an update missing it would
   // otherwise blank out the channel's name in the list.
   function onChannelUpdated(data: Partial<Channel> & { id: string }) {
-    channels = channels.map(c => (c.id === data.id ? { ...c, ...data } : c));
+    channels = mergeChannelUpdate(channels, data);
   }
   function onChannelDeleted(data: { id: string }) {
     removeChannel(data.id);

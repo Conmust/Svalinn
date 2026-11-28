@@ -17,6 +17,72 @@ export interface Channel {
   created_at: string;
 }
 
+export interface ServerUsage {
+  message_count: number;
+  message_cap: number;
+  pinned_count: number;
+  pin_cap: number;
+  unread_backlog_count: number;
+  unread_backlog_cap: number;
+  attachment_bytes_used: number;
+  attachment_quota_bytes: number;
+}
+
+/** Channel slowmode is capped server-side at 6 hours (see migration
+ * 0052_channel_slowmode.sql's CHECK constraint and `MAX_SLOWMODE_SECONDS`
+ * in routes/channels.rs) -- kept in sync here so the client can reject an
+ * out-of-range value before round-tripping to the server at all. */
+export const MAX_SLOWMODE_SECONDS = 21_600;
+
+/** `null` when `seconds` is a valid slowmode value, otherwise the message
+ * to show the person instead of submitting it. */
+export function validateSlowmodeSeconds(seconds: number): string | null {
+  if (!Number.isInteger(seconds) || seconds < 0 || seconds > MAX_SLOWMODE_SECONDS) {
+    return `Must be between 0 and ${MAX_SLOWMODE_SECONDS} seconds.`;
+  }
+  return null;
+}
+
+/** Merges a partial update (from a `channel_updated` broadcast, say) into
+ * whichever entry in `channels` it names, leaving every other field of
+ * that entry untouched. Generic over the exact channel shape so a
+ * narrower broadcast payload (e.g. just `{id, slowmode_seconds}`, with no
+ * `name`) never blanks out fields it simply didn't mention -- which a
+ * merge that assumed a fixed field (like `name`) used to do. */
+export function mergeChannelUpdate<T extends { id: string }>(
+  channels: T[],
+  update: Partial<T> & { id: string }
+): T[] {
+  return channels.map(c => (c.id === update.id ? { ...c, ...update } : c));
+}
+
+/** Formats a byte count as a human-readable size (B/KB/MB/GB/TB), rounded
+ * to one decimal place from KB upward. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/** Green under 75% of a cap, amber from there up to the cap, red at or
+ * past it -- used to color a usage bar (messages, pins, unread backlog,
+ * attachment storage) by how close it is to its limit. A non-positive
+ * cap (shouldn't happen, but better than dividing by zero) reads as
+ * "fine" rather than a false alarm. */
+export function usageColor(used: number, cap: number): string {
+  if (cap <= 0) return '#00ff00';
+  const fraction = used / cap;
+  if (fraction >= 1) return '#ff0000';
+  if (fraction >= 0.75) return '#ffaa00';
+  return '#00ff00';
+}
+
 // Fetch all servers the current user is a member of
 export async function fetchUserServers(): Promise<Server[]> {
   const response = await apiFetch(`${apiBase()}/api/v1/servers`, {

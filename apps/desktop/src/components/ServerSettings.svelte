@@ -12,6 +12,7 @@
     PERMISSION_INFO,
     type Role,
   } from '../lib/roles';
+  import { formatBytes, usageColor, type ServerUsage } from '../lib/servers';
 
   export let serverId: string;
   export let serverName: string = '';
@@ -48,17 +49,6 @@
     reason: string | null;
     banned_by: string | null;
     created_at: string;
-  }
-
-  interface ServerUsage {
-    message_count: number;
-    message_cap: number;
-    pinned_count: number;
-    pin_cap: number;
-    unread_backlog_count: number;
-    unread_backlog_cap: number;
-    attachment_bytes_used: number;
-    attachment_quota_bytes: number;
   }
 
   let invites: Invite[] = [];
@@ -174,29 +164,6 @@
     } finally {
       loadingUsage = false;
     }
-  }
-
-  function formatBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    const units = ['KB', 'MB', 'GB', 'TB'];
-    let value = bytes / 1024;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit += 1;
-    }
-    return `${value.toFixed(1)} ${units[unit]}`;
-  }
-
-  /** Green under 75% of a cap, amber from there to the cap, red at or past it --
-   * same rough "getting close" / "at the line" split as the slowmode and pin-cap
-   * warnings elsewhere in the app, just expressed as a color instead of text. */
-  function usageColor(used: number, cap: number): string {
-    if (cap <= 0) return '#00ff00';
-    const fraction = used / cap;
-    if (fraction >= 1) return '#ff0000';
-    if (fraction >= 0.75) return '#ffaa00';
-    return '#00ff00';
   }
 
   async function leaveServer() {
