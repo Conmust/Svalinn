@@ -110,6 +110,54 @@ test('reactions, pins and locks from the message toolbar', async ({ browser }) =
   await expect(memberRow.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled();
 });
 
+// Channel messages are per-device end-to-end encrypted with no history
+// backfill, so a member who joins after a message was sent has no key for
+// it -- including a pinned rule or announcement. This drives the whole
+// reveal/hide flow through the real UI: pinning, revealing (with its
+// confirmation dialog), a late joiner reading the revealed copy instead of
+// the usual "wasn't there yet" placeholder, and hiding the reveal again.
+test('revealing a pinned message lets a member who joins later read it; hiding it reverts that', async ({ browser }) => {
+  const owner = await register('pinown');
+  const { server } = await createServer(owner);
+  const ownerPage = await openAs(browser, owner);
+  await openChannel(ownerPage, server.name);
+  await sendMessage(ownerPage, 'Server rules: be kind.');
+
+  const ownerRow = messageRow(ownerPage, 'Server rules: be kind.');
+  await ownerRow.hover();
+  await ownerRow.getByRole('button', { name: 'Pin', exact: true }).click();
+  await ownerRow.hover();
+  await ownerRow.getByRole('button', { name: 'Reveal', exact: true }).click();
+  await ownerPage.getByRole('button', { name: /Reveal it/ }).click();
+  await expect(ownerRow.getByText('Revealed by a moderator')).toBeVisible();
+
+  // Joins the server only now -- after the message was sent and pinned --
+  // so this device never received a `message_recipients` entry for it.
+  const lateJoiner = await register('pinlate');
+  await join(owner, server.id, lateJoiner);
+  const latePage = await openAs(browser, lateJoiner);
+  await openChannel(latePage, server.name);
+
+  // Found by the sender's name, not the message content -- the content
+  // itself is exactly what's about to change below.
+  const lateRow = messageRow(latePage, owner.user.username);
+  await expect(lateRow).toContainText('Server rules: be kind.');
+  await expect(lateRow.getByText('Revealed by a moderator')).toBeVisible();
+  // No "Reveal"/"Unreveal" toggle for a plain member -- only a moderator sees it.
+  await lateRow.hover();
+  await expect(lateRow.getByRole('button', { name: 'Unreveal', exact: true })).toHaveCount(0);
+
+  // Unrevealing it reverts the late joiner to the usual placeholder, live
+  // over the websocket -- no reload needed.
+  await ownerRow.hover();
+  await ownerRow.getByRole('button', { name: 'Unreveal', exact: true }).click();
+  await expect(lateRow).toContainText("Sent before this device was added");
+  await expect(lateRow.getByText('Revealed by a moderator')).toHaveCount(0);
+
+  expect(pageErrors(ownerPage)).toEqual([]);
+  expect(pageErrors(latePage)).toEqual([]);
+});
+
 test('older messages load when scrolling up, keeping your place', async ({ browser }) => {
   const owner = await register('hist');
   const { server, channel } = await createServer(owner);

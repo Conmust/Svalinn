@@ -19,6 +19,7 @@
     userClicked: string;
     toggleReaction: { messageId: string; emoji: string };
     pin: Message;
+    pinVisibility: Message;
     lock: Message;
     hide: Message;
     unhide: Message;
@@ -139,6 +140,12 @@
     {#if message.is_pinned || message.is_locked}
       <div class="flex gap-2 mb-1 text-[10px] uppercase tracking-wider text-[#00aa00]">
         {#if message.is_pinned}<span title="Pinned">📌 Pinned</span>{/if}
+        {#if message.is_pinned && message.pin_plaintext_content}
+          <span
+            class="text-[#ffaa00]"
+            title="A moderator made this pinned message's content readable on the server, so anyone who can view this channel can read it -- not just devices it was originally encrypted for."
+          >⚠ Revealed by a moderator</span>
+        {/if}
         {#if message.is_locked}<span title="Locked: can't be deleted until a moderator unlocks it">🔒 Locked</span>{/if}
       </div>
     {/if}
@@ -158,7 +165,10 @@
         · Esc to <button type="button" class="underline hover:text-[#00ff00]" on:click={() => (editing = false)}>cancel</button>
       </div>
     {:else if message.content}
-      <div class="text-sm text-[#00ff00] whitespace-pre-wrap break-words">
+      <div
+        class="text-sm whitespace-pre-wrap break-words {message.revealed_fallback ? 'text-[#ffaa00]' : 'text-[#00ff00]'}"
+        title={message.revealed_fallback ? "This device has no decryption key for this message -- showing the moderator-revealed copy instead" : undefined}
+      >
         {message.content}{#if message.is_edited && !showHeader}<span class="ml-1 text-[10px] text-[#00aa00] italic">(edited)</span>{/if}
       </div>
     {/if}
@@ -238,6 +248,18 @@
         <button type="button" class={toolButton} title={message.is_pinned ? 'Unpin' : 'Pin'} on:click={() => dispatch('pin', message)}>
           {message.is_pinned ? 'Unpin' : 'Pin'}
         </button>
+        {#if message.is_pinned && message.is_encrypted}
+          <button
+            type="button"
+            class={toolButton}
+            title={message.pin_plaintext_content
+              ? "Unreveal: go back to encrypted-only, so a member who joins later can't read this"
+              : 'Reveal: store a readable copy on the server so a member who joins later can still read this pinned message'}
+            on:click={() => dispatch('pinVisibility', message)}
+          >
+            {message.pin_plaintext_content ? 'Unreveal' : 'Reveal'}
+          </button>
+        {/if}
         <button type="button" class={toolButton} title={message.is_locked ? 'Unlock: allow deleting again' : 'Lock: prevent deleting'} on:click={() => dispatch('lock', message)}>
           {message.is_locked ? 'Unlock' : 'Lock'}
         </button>

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     Json,
 };
@@ -61,6 +62,16 @@ pub struct Message {
     pub nonce: Option<String>,
     pub is_locked: bool,
     pub is_pinned: bool,
+    /// A readable copy of this message's content, stored only when a
+    /// moderator explicitly chose to reveal it while pinned (see
+    /// `set_pin_visibility`) -- lets a member who joined after this
+    /// message was sent, and so never got a `message_recipients` row for
+    /// it, still read a pinned announcement/rule. `None` for every
+    /// ordinary message, and for a pinned one nobody has revealed.
+    /// Deliberately a *plaintext* column: the whole point is that the
+    /// server (and therefore any viewer) can read it without per-device
+    /// decryption, which the client must make unmistakably clear in its UI.
+    pub pin_plaintext_content: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Whether the *requesting* user has hidden this message.
     pub is_hidden: bool,
@@ -82,6 +93,7 @@ const MESSAGE_COLUMNS: &str = r#"
     m.is_encrypted, m.nonce,
     COALESCE(m.is_locked, false) AS is_locked,
     COALESCE(m.is_pinned, false) AS is_pinned,
+    m.pin_plaintext_content,
     m.created_at,
     EXISTS(
         SELECT 1 FROM hidden_messages h WHERE h.message_id = m.id AND h.user_id = $1
@@ -140,6 +152,7 @@ struct MessageContext {
     channel_id: Uuid,
     is_locked: bool,
     is_encrypted: bool,
+    is_pinned: bool,
     role: String,
 }
 
@@ -161,9 +174,9 @@ struct MessageContext {
 /// bypasses it the same way `resolve_channel` always lets them bypass
 /// everything.
 async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Result<MessageContext, AppError> {
-    let row: Option<(Uuid, Uuid, Uuid, bool, bool)> = sqlx::query_as(
+    let row: Option<(Uuid, Uuid, Uuid, bool, bool, bool)> = sqlx::query_as(
         r#"
-        SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted
+        SELECT m.user_id, c.server_id, c.id, COALESCE(m.is_locked, false), m.is_encrypted, COALESCE(m.is_pinned, false)
         FROM messages m JOIN channels c ON m.channel_id = c.id
         WHERE m.id = $1 AND c.server_id IS NOT NULL
         "#,
@@ -173,12 +186,12 @@ async fn message_context(db: &Database, message_id: Uuid, user_id: Uuid) -> Resu
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let (author_id, server_id, channel_id, is_locked, is_encrypted) =
+    let (author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned) =
         row.ok_or_else(|| AppError::NotFound("Message not found".into()))?;
     let role = require_member(db, server_id, user_id).await?;
     crate::permissions::require_channel_permission(db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
 
-    Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, role })
+    Ok(MessageContext { author_id, server_id, channel_id, is_locked, is_encrypted, is_pinned, role })
 }
 
 fn require_moderator(ctx: &MessageContext) -> Result<(), AppError> {
@@ -371,6 +384,77 @@ pub async fn get_channel_messages(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     for m in &mut messages {
+        sign_opt(&mut m.attachment_url, user_id, session_id);
+        sign_opt(&mut m.avatar_url, user_id, session_id);
+    }
+    Ok(Json(messages))
+}
+
+#[derive(Deserialize)]
+pub struct PinnedQuery {
+    /// Same meaning as `HistoryQuery::device_id` above.
+    pub device_id: Option<Uuid>,
+}
+
+/// GET /api/v1/channels/:channel_id/pinned
+///
+/// Every currently-pinned message in the channel, oldest first. Unlike
+/// `get_channel_messages`, every caller sees `pin_plaintext_content` for a
+/// message where a moderator chose to reveal it (see
+/// `set_pin_visibility`) regardless of whether this device has its own
+/// `message_recipients` entry -- that field existing at all means it was
+/// deliberately exposed to everyone who can view this channel, pinned
+/// members list included.
+pub async fn get_pinned_messages(
+    State(db): State<Database>,
+    CurrentSession { user_id, session_id }: CurrentSession,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<PinnedQuery>,
+) -> Result<Json<Vec<Message>>, AppError> {
+    let server_id = channel_server_id(&db, channel_id).await?;
+    require_member(&db, server_id, user_id).await?;
+    crate::permissions::require_channel_permission(&db, channel_id, user_id, crate::permissions::Permission::VIEW_CHANNEL).await?;
+
+    let mut messages: Vec<Message> = sqlx::query_as(&format!(
+        r#"
+        SELECT {MESSAGE_COLUMNS}
+        FROM messages m
+        JOIN users u ON m.user_id = u.id
+        JOIN channels c ON c.id = m.channel_id
+        LEFT JOIN server_members sm ON sm.server_id = c.server_id AND sm.user_id = m.user_id
+        WHERE m.channel_id = $2 AND COALESCE(m.is_pinned, false)
+        ORDER BY m.created_at ASC, m.id ASC
+        "#
+    ))
+    .bind(user_id)
+    .bind(channel_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Same ownership check as `get_channel_messages`/`conversations::get_conversation_messages`:
+    // without confirming `device_id` is actually one of the caller's own
+    // devices, a member could pass another member's id and receive that
+    // device's ciphertext instead of their own.
+    let device_filter = match query.device_id {
+        Some(id) => {
+            let owned: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device_keys WHERE id = $1 AND user_id = $2)")
+                    .bind(id)
+                    .bind(user_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+            if owned { id } else { Uuid::nil() }
+        }
+        None => Uuid::nil(),
+    };
+    let message_ids: Vec<Uuid> = messages.iter().map(|m| m.id).collect();
+    let recipients_by_message = fetch_recipients_for_messages(&db, &message_ids, Some(device_filter)).await?;
+    for m in &mut messages {
+        if let Some(entries) = recipients_by_message.get(&m.id) {
+            m.recipients = entries.clone();
+        }
         sign_opt(&mut m.attachment_url, user_id, session_id);
         sign_opt(&mut m.avatar_url, user_id, session_id);
     }
@@ -730,38 +814,180 @@ async fn set_locked(db: Database, user_id: Uuid, message_id: Uuid, locked: bool)
     Ok(Json(payload))
 }
 
-/// POST/DELETE /api/v1/messages/:message_id/pin
+/// Longest plaintext copy of a message accepted when revealing a pinned
+/// message -- same cap as an ordinary message's content, since this is
+/// meant to hold exactly that message's own text.
+const MAX_PIN_PLAINTEXT_CHARS: usize = MAX_CONTENT_CHARS;
+
+#[derive(Deserialize, Default)]
+pub struct PinMessageRequest {
+    /// When set, pins AND reveals in one step -- the convenience path the
+    /// client's "pin" dialog uses when the pinning moderator chooses to
+    /// also make the message readable for members who join later. See
+    /// `set_pin_visibility`'s doc comment for what this actually means and
+    /// why the server can't verify it against the real ciphertext.
+    #[serde(default)]
+    pub reveal_plaintext: Option<String>,
+}
+
+/// POST /api/v1/messages/:message_id/pin  `{ "reveal_plaintext": "..." }` (body optional)
+///
+/// Takes the body as raw bytes rather than `Json<PinMessageRequest>` so an
+/// older client (or a caller that just wants a plain pin) can send no body
+/// at all, same as before this endpoint accepted one -- `Json<T>` would
+/// reject a body-less request outright for lacking a JSON content type.
+/// An empty body is treated as "no reveal"; a non-empty one must still
+/// parse as `PinMessageRequest`.
 pub async fn pin_message(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Path(message_id): Path<Uuid>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    set_pinned(db, user_id, message_id, true).await
+    let payload: PinMessageRequest = if body.is_empty() {
+        PinMessageRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("Invalid request body: {e}")))?
+    };
+
+    let mut response = set_pinned(&db, user_id, message_id, true).await?;
+    if let Some(plaintext) = payload.reveal_plaintext {
+        response = reveal_pin_plaintext(&db, user_id, message_id, plaintext).await?;
+    }
+    Ok(Json(response))
 }
 
+/// DELETE /api/v1/messages/:message_id/pin
+///
+/// Unpinning also clears any revealed plaintext copy (see
+/// `set_pin_visibility`): the whole point of that copy is to help a new
+/// member find a *currently pinned* announcement, so there's no reason for
+/// it to keep living, readable by the server, once the message is no
+/// longer pinned. Re-pinning later means revealing it again, deliberately
+/// -- no silent carry-over.
 pub async fn unpin_message(
     State(db): State<Database>,
     CurrentUser(user_id): CurrentUser,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    set_pinned(db, user_id, message_id, false).await
+    let response = set_pinned(&db, user_id, message_id, false).await?;
+    Ok(Json(response))
 }
 
-async fn set_pinned(db: Database, user_id: Uuid, message_id: Uuid, pinned: bool) -> Result<Json<serde_json::Value>, AppError> {
-    let ctx = message_context(&db, message_id, user_id).await?;
+async fn set_pinned(db: &Database, user_id: Uuid, message_id: Uuid, pinned: bool) -> Result<serde_json::Value, AppError> {
+    let ctx = message_context(db, message_id, user_id).await?;
     require_moderator(&ctx)?;
 
-    sqlx::query("UPDATE messages SET is_pinned = $1, pinned_by = $2 WHERE id = $3")
-        .bind(pinned)
-        .bind(if pinned { Some(user_id) } else { None })
-        .bind(message_id)
-        .execute(&db.pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    let row: (Option<String>,) = sqlx::query_as(
+        r#"
+        UPDATE messages SET
+            is_pinned = $1,
+            pinned_by = $2,
+            pin_plaintext_content = CASE WHEN $1 THEN pin_plaintext_content ELSE NULL END,
+            pin_plaintext_revealed_by = CASE WHEN $1 THEN pin_plaintext_revealed_by ELSE NULL END,
+            pin_plaintext_revealed_at = CASE WHEN $1 THEN pin_plaintext_revealed_at ELSE NULL END
+        WHERE id = $3
+        RETURNING pin_plaintext_content
+        "#,
+    )
+    .bind(pinned)
+    .bind(if pinned { Some(user_id) } else { None })
+    .bind(message_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let payload = serde_json::json!({ "id": message_id, "is_pinned": pinned });
-    broadcast(&db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
-    Ok(Json(payload))
+    let payload = serde_json::json!({ "id": message_id, "is_pinned": pinned, "pin_plaintext_content": row.0 });
+    broadcast(db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
+    Ok(payload)
+}
+
+/// PUT /api/v1/messages/:message_id/pin-visibility  `{ "plaintext_content": "..." | null }`
+///
+/// Toggles whether a currently-pinned, encrypted message's content is also
+/// stored readable on the server, so a member who joins the channel after
+/// it was sent -- and so never received a `message_recipients` row for it
+/// (channel E2EE has no history-backfill; see `create_message`'s doc
+/// comment) -- can still read a pinned rule or announcement. `null`
+/// revokes a previous reveal, restoring the message to encrypted-only;
+/// a string reveals (or replaces) it.
+///
+/// This is a deliberate, explicit, per-message weakening of end-to-end
+/// encryption, gated the same way pinning itself is (a moderator or
+/// above), and the server has no way to confirm `plaintext_content`
+/// actually matches the real ciphertext -- it trusts the calling client's
+/// own decryption, the same trust a moderator already carries when
+/// locking, pinning or deleting someone else's message. The client MUST
+/// make this trade-off unmistakable before calling this with a non-null
+/// body.
+pub async fn set_pin_visibility(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+    Path(message_id): Path<Uuid>,
+    Json(payload): Json<SetPinVisibilityRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match payload.plaintext_content {
+        Some(plaintext) => Ok(Json(reveal_pin_plaintext(&db, user_id, message_id, plaintext).await?)),
+        None => Ok(Json(hide_pin_plaintext(&db, user_id, message_id).await?)),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetPinVisibilityRequest {
+    pub plaintext_content: Option<String>,
+}
+
+async fn reveal_pin_plaintext(db: &Database, user_id: Uuid, message_id: Uuid, plaintext: String) -> Result<serde_json::Value, AppError> {
+    let ctx = message_context(db, message_id, user_id).await?;
+    require_moderator(&ctx)?;
+    if !ctx.is_encrypted {
+        return Err(AppError::BadRequest(
+            "This message isn't encrypted -- it's already visible to everyone who can view this channel.".into(),
+        ));
+    }
+    if !ctx.is_pinned {
+        return Err(AppError::BadRequest("Pin the message before revealing it.".into()));
+    }
+    let plaintext = plaintext.trim();
+    if plaintext.is_empty() {
+        return Err(AppError::BadRequest("plaintext_content must not be empty".into()));
+    }
+    if plaintext.chars().count() > MAX_PIN_PLAINTEXT_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "plaintext_content can be at most {MAX_PIN_PLAINTEXT_CHARS} characters"
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE messages SET pin_plaintext_content = $1, pin_plaintext_revealed_by = $2, pin_plaintext_revealed_at = NOW() WHERE id = $3",
+    )
+    .bind(plaintext)
+    .bind(user_id)
+    .bind(message_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let payload = serde_json::json!({ "id": message_id, "is_pinned": true, "pin_plaintext_content": plaintext });
+    broadcast(db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
+    Ok(payload)
+}
+
+async fn hide_pin_plaintext(db: &Database, user_id: Uuid, message_id: Uuid) -> Result<serde_json::Value, AppError> {
+    let ctx = message_context(db, message_id, user_id).await?;
+    require_moderator(&ctx)?;
+
+    sqlx::query(
+        "UPDATE messages SET pin_plaintext_content = NULL, pin_plaintext_revealed_by = NULL, pin_plaintext_revealed_at = NULL WHERE id = $1",
+    )
+    .bind(message_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let payload = serde_json::json!({ "id": message_id, "is_pinned": ctx.is_pinned, "pin_plaintext_content": serde_json::Value::Null });
+    broadcast(db, "message_updated", payload.clone(), ctx.server_id, ctx.channel_id).await;
+    Ok(payload)
 }
 
 /// POST/DELETE /api/v1/messages/:message_id/hide
@@ -1659,6 +1885,232 @@ mod tests {
             matches!(result, Err(AppError::Forbidden(_))),
             "a member denied VIEW_CHANNEL must not be able to react to messages in that channel, got {result:?}"
         );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, blocked).await;
+    }
+
+    /// Pinning with `reveal_plaintext` stores it, exposes it on the
+    /// message, and `get_pinned_messages` returns it to a member with no
+    /// `message_recipients` entry for this message at all -- the whole
+    /// point of the feature: a member who joined after the send.
+    #[tokio::test]
+    async fn pin_with_reveal_exposes_plaintext_to_a_member_with_no_decryption_key() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 60).await;
+
+        // `late_joiner` is added to the server AFTER the message is sent --
+        // mirroring a real new member -- so they were never a required
+        // `encrypted_for` recipient and have no row in `message_recipients`.
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+        let late_joiner = create_test_user(&db).await;
+        add_server_member(&db, server, late_joiner).await;
+
+        let response = pin_message(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Bytes::from_static(br#"{"reveal_plaintext":"Server rules: be kind."}"#),
+        )
+        .await
+        .expect("pinning with a reveal should succeed")
+        .0;
+        assert_eq!(response["pin_plaintext_content"], "Server rules: be kind.");
+
+        let pinned = get_pinned_messages(
+            State(db.clone()),
+            CurrentSession { user_id: late_joiner, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(PinnedQuery { device_id: None }),
+        )
+        .await
+        .expect("a member should be able to list this channel's pinned messages")
+        .0;
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned[0].recipients.is_empty(), "the late joiner must have no decryption key for the original ciphertext");
+        assert_eq!(
+            pinned[0].pin_plaintext_content.as_deref(),
+            Some("Server rules: be kind."),
+            "a member who never received this message's key should still see the revealed plaintext"
+        );
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, late_joiner).await;
+    }
+
+    /// Unpinning clears a revealed plaintext copy -- the reveal is scoped
+    /// to "while pinned", not a permanent exception for that message.
+    #[tokio::test]
+    async fn unpinning_clears_a_revealed_plaintext_copy() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 61).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let _ = pin_message(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Bytes::from_static(br#"{"reveal_plaintext":"Welcome!"}"#),
+        )
+        .await
+        .expect("pin with reveal should succeed");
+
+        let _ = unpin_message(State(db.clone()), CurrentUser(owner), Path(message_id))
+            .await
+            .expect("unpinning should succeed");
+
+        let fetched = fetch_message(&db, message_id, owner).await.expect("fetching the message should succeed");
+        assert!(!fetched.is_pinned);
+        assert!(fetched.pin_plaintext_content.is_none(), "unpinning must clear a previously revealed plaintext copy");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// `set_pin_visibility` can reveal (and later hide again) a plaintext
+    /// copy without touching the pin itself -- the "toggle" the client's
+    /// pin-visibility button uses independently of pin/unpin.
+    #[tokio::test]
+    async fn set_pin_visibility_toggles_independently_of_pinning() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 62).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let _ = pin_message(State(db.clone()), CurrentUser(owner), Path(message_id), Bytes::new())
+            .await
+            .expect("plain pin (no reveal) should succeed");
+
+        let _ = set_pin_visibility(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Json(SetPinVisibilityRequest { plaintext_content: Some("Read the pinned notice.".into()) }),
+        )
+        .await
+        .expect("revealing via the toggle should succeed");
+
+        let revealed = fetch_message(&db, message_id, owner).await.expect("fetch should succeed");
+        assert!(revealed.is_pinned, "toggling visibility must not unpin the message");
+        assert_eq!(revealed.pin_plaintext_content.as_deref(), Some("Read the pinned notice."));
+
+        let _ = set_pin_visibility(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Json(SetPinVisibilityRequest { plaintext_content: None }),
+        )
+        .await
+        .expect("hiding via the toggle should succeed");
+
+        let hidden = fetch_message(&db, message_id, owner).await.expect("fetch should succeed");
+        assert!(hidden.is_pinned, "hiding the reveal must not unpin the message");
+        assert!(hidden.pin_plaintext_content.is_none());
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Revealing requires the message to already be pinned, and to
+    /// actually be encrypted -- there's nothing to reveal otherwise.
+    #[tokio::test]
+    async fn set_pin_visibility_rejects_an_unpinned_message() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 63).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let result = set_pin_visibility(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Json(SetPinVisibilityRequest { plaintext_content: Some("too early".into()) }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "revealing an unpinned message must be rejected, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+    }
+
+    /// Only a moderator (or above) can reveal a pinned message's plaintext
+    /// -- same gate as pinning itself.
+    #[tokio::test]
+    async fn set_pin_visibility_is_rejected_for_a_plain_member() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 64).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        let _ = pin_message(State(db.clone()), CurrentUser(owner), Path(message_id), Bytes::new())
+            .await
+            .expect("pin should succeed");
+
+        let member = create_test_user(&db).await;
+        add_server_member(&db, server, member).await;
+
+        let result = set_pin_visibility(
+            State(db.clone()),
+            CurrentUser(member),
+            Path(message_id),
+            Json(SetPinVisibilityRequest { plaintext_content: Some("sneaky".into()) }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))), "a plain member must not be able to reveal a pinned message, got {result:?}");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, member).await;
+    }
+
+    /// `get_pinned_messages` must apply the same `VIEW_CHANNEL` scoping as
+    /// every other message-reading endpoint -- a member denied access to a
+    /// private channel must not be able to list, let alone read, its
+    /// pinned (and possibly plaintext-revealed) messages via this
+    /// side-door.
+    #[tokio::test]
+    async fn get_pinned_messages_is_rejected_for_a_member_denied_view_channel() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+        let owner_device = register_test_device(&db, owner, 65).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+        let _ = pin_message(
+            State(db.clone()),
+            CurrentUser(owner),
+            Path(message_id),
+            Bytes::from_static(br#"{"reveal_plaintext":"private notice"}"#),
+        )
+        .await
+        .expect("pin with reveal should succeed");
+
+        let blocked = create_test_user(&db).await;
+        add_server_member(&db, server, blocked).await;
+        deny_view_channel(&db, channel, blocked).await;
+
+        let result = get_pinned_messages(
+            State(db.clone()),
+            CurrentSession { user_id: blocked, session_id: Uuid::new_v4() },
+            Path(channel),
+            Query(PinnedQuery { device_id: None }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))), "a member denied VIEW_CHANNEL must not list pinned messages, got {result:?}");
 
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;

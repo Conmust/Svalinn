@@ -9,7 +9,7 @@
     type Message,
     type MessageRecipientEntry,
     deleteMessage, hideMessage, unhideMessage, lockMessage, unlockMessage,
-    pinMessage, unpinMessage, addReaction, removeReaction,
+    pinMessage, unpinMessage, setPinVisibility, fetchPinnedMessages, addReaction, removeReaction,
     fetchChannelMessages, sendChannelMessage, SendChannelMessageError,
     uploadFile,
   } from '../lib/messages';
@@ -69,6 +69,21 @@
   let messageInput: HTMLInputElement;
   let myRole = 'member';
   let showPinnedOnly = false;
+  /** The authoritative pinned-message list for the open channel; see
+   * `pinnedCount`'s comment above for why this isn't just a filter over
+   * `messages`. */
+  let pinnedMessages: Message[] | null = null;
+
+  async function loadPinnedMessages(forChannel: string) {
+    try {
+      const list = await fetchPinnedMessages(forChannel);
+      if (forChannel !== channelId) return; // channel switched while this was in flight
+      pinnedMessages = list;
+    } catch (e) {
+      console.error('Failed to load pinned messages:', e);
+      if (forChannel === channelId) pinnedMessages = null;
+    }
+  }
   let pendingDelete: Message | null = null;
 
   /** Set the moment this panel's encryption setup hits an unrecoverable
@@ -172,6 +187,17 @@
             displayed = { ...message, content: decrypted ?? DECRYPT_FAILED_PLACEHOLDER };
           }
         }
+        // A moderator's explicit, server-readable reveal of a pinned
+        // message (see `pin_plaintext_content`'s doc comment in
+        // `lib/messages.ts`) stands in only where this device couldn't
+        // read the real ciphertext at all -- most importantly the
+        // `SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER` case, which is exactly
+        // the "joined after it was sent" situation this feature exists
+        // for. It never overrides a message this device actually has the
+        // key for, even if that one decrypt attempt happened to fail.
+        if (message.pin_plaintext_content && (displayed.content === DECRYPT_FAILED_PLACEHOLDER || displayed.content === SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER)) {
+          displayed = { ...displayed, content: message.pin_plaintext_content, revealed_fallback: true };
+        }
       }
       if (displayed.is_encrypted && displayed.attachment_url && displayed.attachment_nonce) {
         const state = attachmentState[displayed.id];
@@ -256,7 +282,12 @@
   // `DMChatArea.svelte`'s identical block.
   $: {
     if (myDeviceId && channelMemberDevices.length > 0) {
-      for (const m of rawMessages) {
+      // Also covers `pinnedMessages`, not just the currently loaded page
+      // of history -- a pinned message this device genuinely can decrypt
+      // (it has a `recipients` entry) shouldn't get stuck on "Decrypting…"
+      // forever in the pinned panel just because it predates whatever's
+      // paginated into `rawMessages` right now.
+      for (const m of [...rawMessages, ...(pinnedMessages ?? [])]) {
         if (!m.is_encrypted) continue;
         const recipients = Array.isArray(m.recipients) ? m.recipients : [];
         const mine = recipients.find(r => r.device_id === myDeviceId);
@@ -271,7 +302,7 @@
   // already-decrypted `messages` above, which itself depends on
   // `attachmentState` -- scanning that here would be circular).
   $: {
-    for (const m of rawMessages) {
+    for (const m of [...rawMessages, ...(pinnedMessages ?? [])]) {
       if (m.attachment_url && m.is_encrypted && m.attachment_nonce && !attachmentState[m.id]) {
         void ensureAttachmentDecrypted(m);
       }
@@ -379,9 +410,19 @@
   }
 
   $: canModerate = ['owner', 'admin', 'moderator'].includes(myRole);
-  $: pinnedCount = messages.filter(m => m.is_pinned).length;
-  $: if (pinnedCount === 0) showPinnedOnly = false;
-  $: visibleMessages = showPinnedOnly ? messages.filter(m => m.is_pinned) : messages;
+  // Every currently-pinned message, fetched straight from the server
+  // (`get_pinned_messages`) rather than filtered out of `messages` --
+  // filtering `messages` would miss a pinned message older than
+  // whatever page of history happens to be loaded, which is exactly the
+  // case (a member who joined after an old pinned announcement) this
+  // panel most needs to cover. `null` means "not loaded yet for this
+  // channel" (so the toggle button stays hidden rather than flashing
+  // empty); `pinnedMessages ?? []` is used everywhere that treats it as
+  // an array.
+  $: pinnedCount = pinnedMessages?.length ?? 0;
+  $: if (pinnedMessages !== null && pinnedCount === 0) showPinnedOnly = false;
+  $: displayedPinnedMessages = (pinnedMessages ?? []).map(m => toDisplayMessage(m, attachmentState, ratchetDecryptState));
+  $: visibleMessages = showPinnedOnly ? displayedPinnedMessages : messages;
   $: if (serverId) loadRole(serverId);
 
   async function loadRole(id: string) {
@@ -395,6 +436,11 @@
 
   function patchMessage(id: string, changes: Partial<Message>) {
     rawMessages = rawMessages.map(m => (m.id === id ? { ...m, ...changes } : m));
+    if (pinnedMessages) {
+      pinnedMessages = changes.is_pinned === false
+        ? pinnedMessages.filter(m => m.id !== id)
+        : pinnedMessages.map(m => (m.id === id ? { ...m, ...changes } : m));
+    }
   }
 
   // Runs a message action and shows the server's error if it fails.
@@ -420,7 +466,53 @@
     const m = e.detail;
     await (m.is_pinned ? unpinMessage(m.id) : pinMessage(m.id));
     patchMessage(m.id, { is_pinned: !m.is_pinned });
+    // Newly pinning a message that wasn't already in the pinned panel's
+    // list needs a refetch to actually appear there -- `patchMessage`
+    // only updates an entry already present.
+    if (!m.is_pinned && pinnedMessages && !pinnedMessages.some(p => p.id === m.id)) {
+      void loadPinnedMessages(channelId);
+    }
   });
+
+  /** A message pending the reveal confirmation dialog -- see
+   * `confirmReveal` below for why this needs its own ConfirmModal rather
+   * than reusing `pendingDelete`'s. */
+  let pendingReveal: Message | null = null;
+
+  const handlePinVisibility = (e: CustomEvent<Message>) => {
+    const m = e.detail;
+    if (m.pin_plaintext_content) {
+      // Hiding a reveal only narrows exposure back down -- no
+      // confirmation needed, unlike revealing it in the first place.
+      run(async () => {
+        await setPinVisibility(m.id, null);
+        patchMessage(m.id, { pin_plaintext_content: null });
+      });
+    } else {
+      pendingReveal = m;
+    }
+  };
+
+  async function confirmReveal() {
+    const m = pendingReveal;
+    pendingReveal = null;
+    if (!m) return;
+    // This device's own already-decrypted copy of the message -- the
+    // same text on screen right now -- never the raw ciphertext. If this
+    // device hasn't actually decrypted it (shouldn't normally happen,
+    // since the "Reveal" button only shows once content is on screen),
+    // refuse rather than send a placeholder string to the server.
+    const displayed = messages.find(x => x.id === m.id) ?? displayedPinnedMessages.find(x => x.id === m.id);
+    const plaintext = displayed?.content;
+    if (!plaintext || plaintext === DECRYPT_FAILED_PLACEHOLDER || plaintext === SENT_BEFORE_DEVICE_ADDED_PLACEHOLDER || plaintext === RATCHET_DECRYPTING_PLACEHOLDER) {
+      alert("Can't reveal this message yet: it hasn't finished decrypting on this device.");
+      return;
+    }
+    await run(async () => {
+      await setPinVisibility(m.id, plaintext);
+      patchMessage(m.id, { pin_plaintext_content: plaintext });
+    });
+  }
 
   const handleLock = (e: CustomEvent<Message>) => run(async () => {
     const m = e.detail;
@@ -471,6 +563,8 @@
   $: if (channelId) {
     loadMessages();
     loadChannelMemberDevices();
+    pinnedMessages = null;
+    void loadPinnedMessages(channelId);
   }
 
   // Named handlers so onDestroy removes only this component's listeners
@@ -483,10 +577,24 @@
 
   function onMessageDeleted(data: { message_id: string }) {
     rawMessages = rawMessages.filter(m => m.id !== data.message_id);
+    if (pinnedMessages) pinnedMessages = pinnedMessages.filter(m => m.id !== data.message_id);
   }
 
   function onMessageUpdated(data: Message) {
     rawMessages = rawMessages.map(m => m.id === data.id ? { ...m, ...data } : m);
+    if (pinnedMessages) {
+      const isPinnedChange = Object.prototype.hasOwnProperty.call(data, 'is_pinned');
+      if (isPinnedChange && (data as any).is_pinned === false) {
+        pinnedMessages = pinnedMessages.filter(m => m.id !== data.id);
+      } else if (isPinnedChange && !pinnedMessages.some(m => m.id === data.id)) {
+        // Newly pinned somewhere we don't already have it loaded (possibly
+        // by another moderator) -- simplest to just refetch rather than
+        // try to splice in a payload that may only be a partial patch.
+        void loadPinnedMessages(channelId);
+      } else {
+        pinnedMessages = pinnedMessages.map(m => m.id === data.id ? { ...m, ...data } : m);
+      }
+    }
   }
 
   // The sender gets their message both from the POST response and from the
@@ -951,6 +1059,7 @@
             on:userClicked={(e) => handleUserClick(e.detail)}
             on:toggleReaction={handleToggleReaction}
             on:pin={handlePin}
+            on:pinVisibility={handlePinVisibility}
             on:lock={handleLock}
             on:hide={handleHide}
             on:unhide={handleUnhide}
@@ -1012,5 +1121,16 @@
     confirmText="Delete"
     on:confirm={confirmDelete}
     on:cancel={() => (pendingDelete = null)}
+  />
+{/if}
+
+{#if pendingReveal}
+  <ConfirmModal
+    title="Reveal pinned message"
+    variant="warning"
+    message={"This stores a readable copy of this message on the server, so anyone who can view this channel -- including a member who joins later -- can read it, even though it's normally end-to-end encrypted.\n\nThis stays in effect only while the message is pinned; hiding it again or unpinning it removes the readable copy."}
+    confirmText="Reveal it"
+    on:confirm={confirmReveal}
+    on:cancel={() => (pendingReveal = null)}
   />
 {/if}

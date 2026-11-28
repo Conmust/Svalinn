@@ -53,6 +53,18 @@ export interface Message {
   locked_by?: string;
   is_pinned?: boolean;
   pinned_by?: string;
+  /** A readable copy of this message's content, present only when a
+   * moderator chose to reveal it while pinned (see `setPinVisibility`) --
+   * lets a member with no `recipients` entry for this message (e.g. they
+   * joined the channel after it was sent) still read it. `null`/absent
+   * for every ordinary message, and for a pinned one nobody has revealed. */
+  pin_plaintext_content?: string | null;
+  /** Client-only, never sent by the server: set on a message whose
+   * `content` above came from `pin_plaintext_content` because this
+   * device had no other way to read it (see ChatArea's
+   * `toDisplayMessage`), so the UI can mark it as a moderator reveal
+   * rather than this device's own decryption. */
+  revealed_fallback?: boolean;
   attachment_url?: string | null;
   attachment_filename?: string | null;
   attachment_size?: number | null;
@@ -253,16 +265,40 @@ export async function unlockMessage(messageId: string): Promise<void> {
   await request('DELETE', `/api/v1/messages/${messageId}/lock`);
 }
 
-export async function pinMessage(messageId: string): Promise<void> {
-  await request('POST', `/api/v1/messages/${messageId}/pin`);
+/**
+ * Pins a message. `revealPlaintext`, if given, is this device's own
+ * already-decrypted copy of the message's content -- passing it also
+ * stores a server-readable copy (see `setPinVisibility`'s doc comment for
+ * what that trade-off actually means) in the same request, so a member who
+ * joins the channel later can still read a pinned announcement they'd
+ * otherwise have no decryption key for. Omit it to pin without that
+ * trade-off, which is always safe to do for a plaintext (non-encrypted)
+ * message, since it's already readable to everyone regardless.
+ */
+export async function pinMessage(messageId: string, revealPlaintext?: string): Promise<void> {
+  await request('POST', `/api/v1/messages/${messageId}/pin`, { reveal_plaintext: revealPlaintext ?? null });
 }
 
 export async function unpinMessage(messageId: string): Promise<void> {
   await request('DELETE', `/api/v1/messages/${messageId}/pin`);
 }
 
+/**
+ * Toggles whether a currently-pinned, encrypted message also has a
+ * server-readable plaintext copy, independently of pinning/unpinning it.
+ * Pass this device's own decrypted copy of the message to reveal (or
+ * replace) it, or `null` to revoke a previous reveal. See
+ * `pinMessage`'s doc comment and the server's `set_pin_visibility` for
+ * what revealing actually means: the server (and so anyone who can view
+ * the channel) can read `plaintextContent` from that point on, for as
+ * long as the message stays pinned.
+ */
+export async function setPinVisibility(messageId: string, plaintextContent: string | null): Promise<void> {
+  await request('PUT', `/api/v1/messages/${messageId}/pin-visibility`, { plaintext_content: plaintextContent });
+}
+
 export async function fetchPinnedMessages(channelId: string): Promise<Message[]> {
-  const response = await apiFetch(`${apiBase()}/api/v1/messages/${channelId}/pinned`, {
+  const response = await apiFetch(`${apiBase()}/api/v1/channels/${channelId}/pinned`, {
     headers: getAuthHeaders(),
   });
 
