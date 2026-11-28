@@ -31,6 +31,8 @@
   import { getCachedPlaintext, cachePlaintext, deleteCachedPlaintext } from '../lib/message-history';
   import { fetchServerMembers, type Member } from '../lib/members';
   import { extractMentionedUsernames } from '../lib/mentions';
+  import { notifyTypingInChannel, TypingTracker } from '../lib/typing';
+  import { notifyNewMessage } from '../lib/notifications';
 
   // --- Encryption error boundary -------------------------------------------
   // Mirrors `DMChatArea.svelte`'s identically-named helper: a broken
@@ -614,7 +616,25 @@
     searchOpen = false;
     searchQuery = '';
     historyFullyLoadedFor = null;
+    typingTracker.reset();
   }
+
+  // --- "Someone is typing..." -------------------------------------------
+  // See `lib/typing.ts` for the full design (not E2EE, deliberately carries
+  // no message content, no explicit "stopped" event).
+  let typingUserIds: string[] = [];
+  const typingTracker = new TypingTracker(() => {
+    typingUserIds = typingTracker.ids();
+  });
+
+  function onTyping(data: { channel_id: string; user_id: string }) {
+    if (data.channel_id !== channelId || data.user_id === currentUser?.id) return;
+    typingTracker.see(data.user_id);
+  }
+
+  $: typingDisplayNames = typingUserIds
+    .map(id => serverMembers.find(m => m.id === id)?.username)
+    .filter((u): u is string => !!u);
 
   // --- In-channel search ----------------------------------------------
   // Channel messages are mandatory end-to-end encrypted, so there's no
@@ -707,10 +727,43 @@
 
   // Named handlers so onDestroy removes only this component's listeners
   // (ChannelList listens to the same events).
+  // Message ids we're waiting to notify about once their content is
+  // available. A plaintext message can notify immediately; a ratchet-
+  // encrypted one has to wait for `ensureRatchetMessageDecrypted` to finish
+  // (see the reactive block below) since `data.content` is null for those
+  // until decrypted -- the server never has the plaintext to begin with.
+  let pendingNotifyIds = new Set<string>();
+
   function onNewMessage(data: Message) {
     if (data.channel_id !== channelId) return;
     addMessage(data);
     scrollToBottom();
+    typingTracker.clear(data.user_id); // their message just arrived -- they're done typing it
+    if (data.user_id === currentUser?.id) return; // never notify on our own messages
+    const name = data.nickname || data.username;
+    if (data.content) {
+      void notifyNewMessage(name, data.content);
+    } else if (data.is_encrypted) {
+      pendingNotifyIds.add(data.id);
+    }
+  }
+
+  // Fires the deferred notification for a just-arrived encrypted message
+  // once its ratchet decryption completes. Keyed off `ratchetDecryptState`
+  // so it reruns whenever a decrypt finishes; `pendingNotifyIds` only ever
+  // contains ids from `onNewMessage` above, never from history backfill or
+  // the pinned-messages panel, so this never fires for old messages.
+  $: {
+    for (const id of [...pendingNotifyIds]) {
+      const state = ratchetDecryptState[id];
+      if (state?.status === 'done') {
+        pendingNotifyIds.delete(id);
+        if (state.text) {
+          const msg = rawMessages.find(m => m.id === id);
+          if (msg) void notifyNewMessage(msg.nickname || msg.username, state.text);
+        }
+      }
+    }
   }
 
   function onMessageDeleted(data: { message_id: string }) {
@@ -753,6 +806,7 @@
     wsClient.on('message_deleted', onMessageDeleted);
     wsClient.on('message_updated', onMessageUpdated);
     wsClient.on('member_updated', onMemberUpdated);
+    wsClient.on('typing', onTyping);
   });
 
   onDestroy(() => {
@@ -760,6 +814,8 @@
     wsClient.off('message_deleted', onMessageDeleted);
     wsClient.off('message_updated', onMessageUpdated);
     wsClient.off('member_updated', onMemberUpdated);
+    wsClient.off('typing', onTyping);
+    typingTracker.destroy();
     for (const url of createdObjectUrls) URL.revokeObjectURL(url);
   });
 
@@ -1262,6 +1318,17 @@
 
   <!-- Input Area -->
   <div class="border-t-2 border-[#00ff00] p-4">
+    {#if typingDisplayNames.length > 0}
+      <div class="mb-1 text-xs text-[#00aa00] italic animate-pulse" aria-live="polite">
+        {#if typingDisplayNames.length === 1}
+          {typingDisplayNames[0]} is typing...
+        {:else if typingDisplayNames.length === 2}
+          {typingDisplayNames[0]} and {typingDisplayNames[1]} are typing...
+        {:else}
+          Several people are typing...
+        {/if}
+      </div>
+    {/if}
     {#if attachmentFile}
       <div class="mb-2 flex items-center gap-2 text-xs text-[#00aa00] bg-[#0a0e0a] p-2 rounded border border-[#00ff00]">
         <span class="truncate flex-1">📎 {attachmentFile.name}</span>
@@ -1289,6 +1356,7 @@
         class="flex-1 min-w-0 bg-[#0a0e0a] border border-[#00ff00] px-4 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
         placeholder={canSend ? 'Type a message...' : 'Encrypted messaging unavailable'}
         disabled={sending || !canSend}
+        on:input={() => newMessage.trim() && notifyTypingInChannel(channelId)}
       />
 
       <!-- Send Button -->

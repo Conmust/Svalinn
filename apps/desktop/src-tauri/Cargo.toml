@@ -19,6 +19,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Native OS notifications for new messages/mentions (see
+# `lib/notifications.ts`). Works on both desktop and mobile, unlike
+# single-instance below, so it's registered unconditionally in lib.rs.
+tauri-plugin-notification = "2"
 
 # The process-tree RAM/CPU gauge is a desktop-only feature; it's meaningless
 # on mobile (no equivalent OS process tree to walk) and sysinfo's "system"

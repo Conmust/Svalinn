@@ -34,6 +34,12 @@ pub fn run() {
         }
     }));
 
+    // Native OS notifications for new messages/mentions (see
+    // `lib/notifications.ts`). Unlike single-instance above, this is
+    // meaningful on both desktop and mobile, so it's registered
+    // unconditionally rather than behind `#[cfg(desktop)]`.
+    let builder = builder.plugin(tauri_plugin_notification::init());
+
     #[cfg(desktop)]
     let builder = builder
         .manage(gauge::GaugeState::new())
