@@ -1007,7 +1007,26 @@ pub async fn delete_message(
         return Err(AppError::Forbidden("This message is locked. Unlock it before deleting.".into()));
     }
 
+    let was_moderator_action = ctx.author_id != user_id;
     delete_message_now(&db, message_id, ctx.server_id, ctx.channel_id).await?;
+
+    // Only a moderator removing someone else's message is a moderation
+    // action worth a durable record -- deleting your own message is
+    // ordinary usage, and logging every one of those would bury the
+    // genuinely actionable entries in noise.
+    if was_moderator_action {
+        crate::audit_log::record(
+            &db,
+            ctx.server_id,
+            user_id,
+            crate::audit_log::MESSAGE_DELETED,
+            Some(ctx.author_id),
+            Some(ctx.channel_id),
+            None,
+            serde_json::json!({ "message_id": message_id }),
+        )
+        .await;
+    }
 
     Ok(Json(()))
 }
@@ -2190,6 +2209,64 @@ mod tests {
         cleanup_test_server(&db, server).await;
         cleanup_test_user(&db, owner).await;
         cleanup_test_user(&db, moderator).await;
+    }
+
+    #[tokio::test]
+    async fn moderator_deleting_someone_elses_message_is_recorded_in_the_audit_log() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let moderator = create_test_user(&db).await;
+        add_server_moderator(&db, server, moderator).await;
+
+        let owner_device = register_test_device(&db, owner, 60).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        delete_message(State(db.clone()), CurrentUser(moderator), Path(message_id))
+            .await
+            .expect("a moderator should be able to delete someone else's message");
+
+        let entry: (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT action, actor_id, target_user_id FROM moderation_audit_log WHERE server_id = $1",
+        )
+        .bind(server)
+        .fetch_one(&db.pool)
+        .await
+        .expect("a moderator deleting someone else's message should write exactly one audit log entry");
+        assert_eq!(entry.0, crate::audit_log::MESSAGE_DELETED);
+        assert_eq!(entry.1, Some(moderator), "the actor should be the moderator, not the message's author");
+        assert_eq!(entry.2, Some(owner), "the target should be the message's author");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
+        cleanup_test_user(&db, moderator).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_your_own_message_is_not_recorded_in_the_audit_log() {
+        let db = test_db().await;
+        let owner = create_test_user(&db).await;
+        let server = create_test_server(&db, owner).await;
+        let channel = create_test_channel(&db, server).await;
+
+        let owner_device = register_test_device(&db, owner, 61).await;
+        let message_id = send_test_message(&db, server, channel, owner, owner_device, &[]).await;
+
+        delete_message(State(db.clone()), CurrentUser(owner), Path(message_id))
+            .await
+            .expect("the author should be able to delete their own message");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM moderation_audit_log WHERE server_id = $1")
+            .bind(server)
+            .fetch_one(&db.pool)
+            .await
+            .expect("counting audit log entries should succeed");
+        assert_eq!(count, 0, "deleting your own message is ordinary usage, not a moderation action");
+
+        cleanup_test_server(&db, server).await;
+        cleanup_test_user(&db, owner).await;
     }
 
     /// Same gap, cheaper to trigger: an ordinary member (no special role at

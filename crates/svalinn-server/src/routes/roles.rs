@@ -391,6 +391,17 @@ pub async fn assign_role(
         serde_json::json!({ "server_id": server_id, "user_id": target, "role_id": role_id }),
         server_id,
     ));
+    crate::audit_log::record(
+        &db,
+        server_id,
+        actor,
+        crate::audit_log::CUSTOM_ROLE_ASSIGNED,
+        Some(target),
+        None,
+        None,
+        serde_json::json!({ "role_id": role_id }),
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -417,6 +428,17 @@ pub async fn unassign_role(
         serde_json::json!({ "server_id": server_id, "user_id": target, "role_id": role_id }),
         server_id,
     ));
+    crate::audit_log::record(
+        &db,
+        server_id,
+        actor,
+        crate::audit_log::CUSTOM_ROLE_UNASSIGNED,
+        Some(target),
+        None,
+        None,
+        serde_json::json!({ "role_id": role_id }),
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

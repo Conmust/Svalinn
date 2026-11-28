@@ -1,4 +1,5 @@
 mod access;
+mod audit_log;
 mod badges;
 mod blind_tokens;
 mod db;
@@ -170,6 +171,7 @@ async fn main() {
             get(routes::members::list_bans).post(routes::members::ban_member),
         )
         .route("/api/v1/servers/:server_id/bans/:user_id", delete(routes::members::unban_member))
+        .route("/api/v1/servers/:server_id/audit-log", get(routes::moderation::get_audit_log))
 
         // --- Invite Routes ---
         .route(

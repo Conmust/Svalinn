@@ -13,6 +13,7 @@
     type Role,
   } from '../lib/roles';
   import { formatBytes, usageColor, type ServerUsage } from '../lib/servers';
+  import { fetchAuditLog, describeAuditAction, type AuditLogEntry } from '../lib/moderation';
 
   export let serverId: string;
   export let serverName: string = '';
@@ -21,7 +22,7 @@
 
   const dispatch = createEventDispatcher();
 
-  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' | 'roles' | 'usage' = 'overview';
+  let activeTab: 'overview' | 'emojis' | 'invites' | 'bans' | 'audit-log' | 'roles' | 'usage' = 'overview';
 
   // Your rank here: 4 owner, 3 admin, 2 moderator, 1 member.
   let myRank = 1;
@@ -53,6 +54,9 @@
 
   let invites: Invite[] = [];
   let bans: Ban[] = [];
+  let auditLog: AuditLogEntry[] = [];
+  let auditLogHasMore = false;
+  let loadingAuditLog = false;
   let usage: ServerUsage | null = null;
   let usageError = '';
   let loadingUsage = false;
@@ -154,6 +158,35 @@
     else tabError = await errorFrom(res, 'Failed to lift ban');
   }
 
+  const AUDIT_LOG_PAGE_SIZE = 50;
+
+  async function loadAuditLog() {
+    tabError = '';
+    loadingAuditLog = true;
+    try {
+      auditLog = await fetchAuditLog(serverId, { limit: AUDIT_LOG_PAGE_SIZE });
+      auditLogHasMore = auditLog.length === AUDIT_LOG_PAGE_SIZE;
+    } catch (err: any) {
+      tabError = err.message || 'Failed to load the audit log';
+    } finally {
+      loadingAuditLog = false;
+    }
+  }
+
+  async function loadMoreAuditLog() {
+    if (auditLog.length === 0) return;
+    loadingAuditLog = true;
+    try {
+      const older = await fetchAuditLog(serverId, { before: auditLog[auditLog.length - 1].id, limit: AUDIT_LOG_PAGE_SIZE });
+      auditLog = [...auditLog, ...older];
+      auditLogHasMore = older.length === AUDIT_LOG_PAGE_SIZE;
+    } catch (err: any) {
+      tabError = err.message || 'Failed to load more of the audit log';
+    } finally {
+      loadingAuditLog = false;
+    }
+  }
+
   async function loadUsage() {
     usageError = '';
     loadingUsage = true;
@@ -193,6 +226,7 @@
     if (tab === 'emojis') loadEmojis();
     if (tab === 'invites') loadInvites();
     if (tab === 'bans') loadBans();
+    if (tab === 'audit-log') loadAuditLog();
     if (tab === 'roles') loadRoles();
     if (tab === 'usage') loadUsage();
   }
@@ -484,6 +518,12 @@
         >
           Bans
         </button>
+        <button
+          class="flex-1 py-3 text-sm font-semibold {activeTab === 'audit-log' ? 'text-[#00ff00] border-b-2 border-[#00ff00] bg-[rgba(0,255,0,0.05)]' : 'text-[#00aa00] hover:text-[#00ff00]'}"
+          on:click={() => switchTab('audit-log')}
+        >
+          Audit Log
+        </button>
       {/if}
       {#if canManageRoles}
         <button
@@ -688,6 +728,34 @@
               </li>
             {/each}
           </ul>
+        {/if}
+      {:else if activeTab === 'audit-log'}
+        {#if tabError}
+          <div class="mb-4 text-xs text-red-500">{'>'} {tabError}</div>
+        {/if}
+        {#if auditLog.length === 0 && !loadingAuditLog}
+          <div class="text-[#00aa00] text-xs">{'>'} No moderation actions recorded yet. Kicks, bans, role changes and moderator-deleted messages show up here.</div>
+        {:else}
+          <ul class="space-y-2">
+            {#each auditLog as entry (entry.id)}
+              <li class="bg-[#0a0e0a] border border-[#00aa00]/30 px-3 py-2">
+                <div class="text-sm text-[#00ff00]">{describeAuditAction(entry)}</div>
+                <div class="text-[11px] text-[#00aa00] truncate">
+                  {new Date(entry.created_at).toLocaleString()}{entry.reason ? ` · ${entry.reason}` : ''}
+                </div>
+              </li>
+            {/each}
+          </ul>
+          {#if auditLogHasMore}
+            <button
+              type="button"
+              disabled={loadingAuditLog}
+              class="mt-3 w-full px-2 py-1 text-xs border border-[#00ff00] text-[#00ff00] hover:bg-[#00ff00] hover:text-black disabled:opacity-50"
+              on:click={loadMoreAuditLog}
+            >
+              {loadingAuditLog ? 'Loading…' : 'Load more'}
+            </button>
+          {/if}
         {/if}
       {:else if activeTab === 'roles'}
         {#if rolesError}

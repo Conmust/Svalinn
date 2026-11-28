@@ -5,6 +5,7 @@ pub mod conversations;
 pub mod devices;
 pub mod health;
 pub mod members;
+pub mod moderation;
 pub mod messages;
 pub mod reactions;
 pub mod servers;
