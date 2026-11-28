@@ -267,6 +267,15 @@
           {/if}
           {#if joinError}
             <div class="text-xs text-red-500 terminal-glow">{'>'} {joinError}</div>
+            {#if joinError.includes('Verify your email')}
+              <button
+                type="button"
+                class="text-xs text-[#00ff00] underline"
+                on:click={() => { showCreateModal = false; dispatch('openAccountSettings'); }}
+              >
+                Go to account settings to resend it
+              </button>
+            {/if}
           {/if}
           <div class="flex gap-2 pt-2">
             <button type="button" class="flex-1 py-2 border border-[#00aa00] text-[#00aa00] hover:bg-[#00aa00]/10 transition-all text-sm" on:click={() => showCreateModal = false}>Cancel</button>

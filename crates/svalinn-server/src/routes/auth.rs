@@ -27,14 +27,15 @@ use crate::db::Database;
 use crate::disposable_email;
 use crate::email_privacy;
 use crate::errors::AppError;
-use crate::extractors::auth::jwt_secret;
+use crate::extractors::auth::{jwt_secret, CurrentUser};
 use crate::rate_limit::{
     ClientIp, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_FAILURES_PER_ACCOUNT_IP, LOGIN_PER_IP, REGISTER_PER_IP,
+    RESEND_VERIFICATION_PER_USER,
 };
 use crate::sessions::AccessDenied;
 use crate::models::user::{
-    AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, User,
-    VerifyEmailRequest,
+    AuthResponse, Claims, LoginRequest, RefreshRequest, RegisterRequest, ResendVerificationResponse,
+    TokenResponse, User, VerifyEmailRequest,
 };
 
 /// How long an emailed verification link stays usable.
@@ -254,6 +255,52 @@ pub async fn verify_email(
         .map_err(db_err)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/auth/resend-verification
+///
+/// Issues a fresh verification link for the logged-in caller's own account.
+/// Needed because there's currently no real email provider wired up (see
+/// `send_verification_email`) -- without this, anyone whose first link
+/// never arrived, or whose 48-hour link expired, would be permanently
+/// unable to join a server (`accept_invite` requires a verified email),
+/// with no way back in. The old token, if any, is simply left to expire on
+/// its own schedule; it's still independently checked for `used_at` and
+/// `expires_at` in `verify_email`, so leaving it live alongside a new one
+/// is harmless.
+pub async fn resend_verification(
+    State(db): State<Database>,
+    CurrentUser(user_id): CurrentUser,
+) -> Result<Json<ResendVerificationResponse>, AppError> {
+    let key = user_id.to_string();
+    db.limits.check(&RESEND_VERIFICATION_PER_USER, &key)?;
+
+    let (email_encrypted, email_verified): (Option<String>, bool) = sqlx::query_as(
+        "SELECT email_encrypted, email_verified_at IS NOT NULL FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if email_verified {
+        return Err(AppError::BadRequest("This email address is already verified.".into()));
+    }
+
+    db.limits.record(&RESEND_VERIFICATION_PER_USER, &key);
+
+    // Only decrypted to hand to `send_verification_email` -- same one
+    // legitimate use as `get_account`'s email readback; never logged (see
+    // that function's own doc comment).
+    let email = email_encrypted
+        .as_deref()
+        .and_then(|e| email_privacy::decrypt(e).ok())
+        .unwrap_or_default();
+
+    let token = issue_verification_token(&db, user_id).await?;
+    let dev_verification_link = send_verification_email(user_id, &email, &token);
+
+    Ok(Json(ResendVerificationResponse { dev_verification_link }))
 }
 
 /// Generates a one-time verification token, stores only its hash (same
@@ -659,6 +706,103 @@ mod tests {
         match verify_email(State(db.clone()), Query(VerifyEmailRequest { token: raw_token })).await {
             Err(AppError::BadRequest(_)) => {}
             other => panic!("expected a BadRequest for an already-used token, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    // Without this, anyone whose first verification link never arrived (no
+    // real email provider is wired up yet) or expired would be permanently
+    // stuck unable to join a server -- `accept_invite` requires a verified
+    // email with no other way to get one. This is the fix for that gap.
+    #[tokio::test]
+    async fn resend_verification_issues_a_new_working_link() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("Resend-{}@Example.Invalid", Uuid::new_v4());
+
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email, password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let user_id = reg.0.user.id;
+        // Deliberately never using the original registration link -- simulates
+        // it never arriving/expiring, the exact situation this endpoint exists for.
+
+        let resent = resend_verification(State(db.clone()), CurrentUser(user_id))
+            .await
+            .expect("resend should succeed for an unverified account");
+        let link = resent.0.dev_verification_link.expect("dev env should return a verification link");
+        let raw_token = link.rsplit_once("token=").map(|(_, t)| t.to_string()).expect("link should carry a token");
+
+        verify_email(State(db.clone()), Query(VerifyEmailRequest { token: raw_token }))
+            .await
+            .expect("the resent link should verify the account");
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn resend_verification_rejects_an_already_verified_account() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("AlreadyVerified-{}@Example.Invalid", Uuid::new_v4());
+
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email, password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let user_id = reg.0.user.id;
+        let link = reg.0.dev_verification_link.clone().expect("dev env should return a verification link");
+        let raw_token = link.rsplit_once("token=").map(|(_, t)| t.to_string()).expect("link should carry a token");
+        verify_email(State(db.clone()), Query(VerifyEmailRequest { token: raw_token }))
+            .await
+            .expect("verification should succeed");
+
+        match resend_verification(State(db.clone()), CurrentUser(user_id)).await {
+            Err(AppError::BadRequest(_)) => {}
+            other => panic!("expected a BadRequest for an already-verified account, got {other:?}"),
+        }
+
+        cleanup_user(&db, &username).await;
+    }
+
+    #[tokio::test]
+    async fn resend_verification_is_rate_limited_per_user() {
+        ensure_test_secrets();
+        let db = test_db().await;
+        let username = format!("test_{}", Uuid::new_v4().simple());
+        let email = format!("RateLimited-{}@Example.Invalid", Uuid::new_v4());
+
+        let reg = register(
+            State(db.clone()),
+            test_ip(),
+            Json(RegisterRequest { username: username.clone(), email, password: "password123".into() }),
+        )
+        .await
+        .expect("registration should succeed");
+        let user_id = reg.0.user.id;
+
+        // The rule allows 3 per window (RESEND_VERIFICATION_PER_USER); the
+        // first registration's own `issue_verification_token` call doesn't
+        // count against it (it's a separate code path), so 3 resends here
+        // should all succeed and a 4th should be refused.
+        for _ in 0..3 {
+            let _ = resend_verification(State(db.clone()), CurrentUser(user_id))
+                .await
+                .expect("should be within the rate limit");
+        }
+        match resend_verification(State(db.clone()), CurrentUser(user_id)).await {
+            Err(AppError::TooManyRequests { .. }) => {}
+            other => panic!("expected a TooManyRequests once the per-user limit is exceeded, got {other:?}"),
         }
 
         cleanup_user(&db, &username).await;

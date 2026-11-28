@@ -112,7 +112,8 @@ async fn main() {
         .route("/api/v1/auth/refresh", post(routes::auth::refresh))
         .route("/api/v1/auth/logout", post(routes::auth::logout))
         .route("/api/v1/auth/verify-email", get(routes::auth::verify_email))
-        
+        .route("/api/v1/auth/resend-verification", post(routes::auth::resend_verification))
+
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))
         .route("/api/v1/servers", post(routes::servers::create_server))

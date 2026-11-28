@@ -1,4 +1,4 @@
-import { apiBase, storeTokens, clearSession } from './api';
+import { apiBase, apiFetch, storeTokens, clearSession } from './api';
 
 export interface User {
   id: string;
@@ -76,6 +76,36 @@ export async function register(username: string, email: string, password: string
   }
 
   return data.user;
+}
+
+/**
+ * Requests a fresh verification link for the logged-in account. Needed
+ * because, without this, anyone whose original registration link never
+ * arrived (there's no real email provider wired up yet -- see the server's
+ * `routes::auth::send_verification_email`) or whose 48-hour link expired
+ * would have no way back in: `accept_invite` requires a verified email to
+ * join any server.
+ */
+export async function resendVerificationEmail(): Promise<void> {
+  const response = await apiFetch(`${apiBase()}/api/v1/auth/resend-verification`, { method: 'POST' });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: 'Failed to resend the verification email' }));
+    throw new Error(err.error || 'Failed to resend the verification email');
+  }
+
+  const data = await response.json().catch(() => ({}));
+  // Same dev-only convenience as `register()` above: with no real email
+  // provider wired up, following the link ourselves is how local
+  // dev/testing verifies without an inbox. No-op (and `dev_verification_link`
+  // simply absent) in any other environment.
+  if (data.dev_verification_link) {
+    try {
+      await fetch(data.dev_verification_link);
+    } catch {
+      // Best-effort only -- the resend itself already succeeded.
+    }
+  }
 }
 
 export function setAuth(token: string, user: User, refreshToken?: string): void {
