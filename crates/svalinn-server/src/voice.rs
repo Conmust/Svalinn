@@ -91,12 +91,6 @@ impl VoiceChannels {
         rooms.get(&channel_id).is_some_and(|room| room.contains_key(&user_id))
     }
 
-    /// The current roster of one channel.
-    pub async fn roster(&self, channel_id: Uuid) -> Vec<VoiceParticipant> {
-        let rooms = self.rooms.lock().await;
-        rooms.get(&channel_id).map(|room| room.values().cloned().collect()).unwrap_or_default()
-    }
-
     /// Rosters of several channels at once (e.g. every voice channel in a
     /// server), keyed by channel id. Channels with nobody in them are
     /// simply absent from the map.
@@ -115,6 +109,14 @@ mod tests {
 
     fn name(n: &str) -> String {
         n.to_string()
+    }
+
+    /// Production code only ever needs `rosters` (plural); this is just a
+    /// single-channel convenience for these tests so they read the way
+    /// they did when `roster` existed as its own (otherwise-unused)
+    /// method.
+    async fn roster(voice: &VoiceChannels, channel_id: Uuid) -> Vec<VoiceParticipant> {
+        voice.rosters(&[channel_id]).await.remove(&channel_id).unwrap_or_default()
     }
 
     #[tokio::test]
@@ -143,7 +145,7 @@ mod tests {
         voice.join(channel, alice, name("alice")).await;
         assert!(voice.leave(channel, alice).await);
         assert!(!voice.leave(channel, alice).await); // already gone
-        assert_eq!(voice.roster(channel).await.len(), 0);
+        assert_eq!(roster(&voice, channel).await.len(), 0);
     }
 
     #[tokio::test]
@@ -160,8 +162,8 @@ mod tests {
         let mut expected = vec![c1, c2];
         expected.sort();
         assert_eq!(left, expected);
-        assert!(voice.roster(c1).await.is_empty());
-        assert!(voice.roster(c2).await.is_empty());
+        assert!(roster(&voice, c1).await.is_empty());
+        assert!(roster(&voice, c2).await.is_empty());
     }
 
     #[tokio::test]
@@ -183,7 +185,7 @@ mod tests {
 
         voice.join(channel, alice, name("alice")).await;
         assert!(voice.set_muted(channel, alice, true).await);
-        assert!(voice.roster(channel).await[0].muted);
+        assert!(roster(&voice, channel).await[0].muted);
 
         // No room / not in it: reports false instead of creating one.
         assert!(!voice.set_muted(Uuid::new_v4(), alice, true).await);
