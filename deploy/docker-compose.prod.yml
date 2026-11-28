@@ -1,0 +1,134 @@
+# Full self-hosted stack: Postgres, Redis, coturn (TURN/STUN), a one-shot
+# migration runner, and the server itself. See ../docs/self-hosting.md for
+# the full guide (reverse proxy setup, backups, upgrades, hardening).
+#
+# This is deliberately a separate file from ../docker-compose.yml, which
+# only brings up Postgres/Redis/coturn for someone running the server with
+# `cargo run` on the host during development -- that file's DATABASE_URL
+# convention (localhost) would be wrong inside a container, and running the
+# server itself there too would fight a locally-run instance for port 3001.
+#
+# Usage (from the repository root):
+#   cp .env.example .env               # fill in every value -- see the guide
+#   docker compose -f deploy/docker-compose.prod.yml up -d --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: svalinn-postgres
+    environment:
+      POSTGRES_USER: svalinn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: svalinn
+    # Not published to the host on purpose: only containers on this compose
+    # network (migrate, server) can reach it. See the hardening checklist.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U svalinn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: svalinn-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # TURN/STUN relay for 1:1 voice/video calls -- see the comment in
+  # ../docker-compose.yml for what this does and why it's usually optional.
+  # The 49160-49200 UDP range does need to reach the internet directly (not
+  # just through your reverse proxy), so this is the one service here
+  # that typically needs ports published on the host rather than proxied.
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    container_name: svalinn-coturn
+    environment:
+      TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET in .env}
+      TURN_REALM: ${TURN_REALM:-svalinn.local}
+    command: >
+      -n
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49160
+      --max-port=49200
+      --realm=${TURN_REALM:-svalinn.local}
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET:?set TURN_SECRET in .env}
+      --no-cli
+      --no-multicast-peers
+      --log-file=stdout
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "5349:5349"
+      - "5349:5349/udp"
+      - "49160-49200:49160-49200/udp"
+    restart: unless-stopped
+
+  # One-shot: applies migrations, then exits. `server` waits for this to
+  # exit 0 before it starts (see depends_on below), so a fresh deploy or an
+  # upgrade never races a half-migrated schema.
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: svalinn-server:local
+    container_name: svalinn-migrate
+    entrypoint: ["/app/run-migrations"]
+    env_file: ../.env
+    environment:
+      # Overrides whatever ../.env has for local (non-compose) development --
+      # inside this network, Postgres is reached by its service name, not
+      # localhost. APP_ENV is force-set to production here too: ../.env's
+      # default of "development" is for `cargo run` on the host, and would
+      # silently disable email_delivery's startup requirement for a real
+      # RESEND_API_KEY/EMAIL_FROM (see docs/self-hosting.md).
+      DATABASE_URL: postgres://svalinn:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/svalinn
+      APP_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: svalinn-server:local
+    container_name: svalinn-server
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgres://svalinn:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/svalinn
+      APP_ENV: production
+      REDIS_URL: redis://redis:6379
+      HOST: 0.0.0.0
+      PORT: "3001"
+      # This container sits behind your reverse proxy (see the guide), so
+      # rate limiting needs the real client address from X-Forwarded-For.
+      TRUST_PROXY: "true"
+    # Not published to the host: put a reverse proxy (see the guide) in
+    # front of this and publish 443 from there instead.
+    expose:
+      - "3001"
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:

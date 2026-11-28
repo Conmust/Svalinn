@@ -1,0 +1,30 @@
+# Build artifacts (huge, and rebuilt inside the image anyway).
+target/
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+apps/desktop/dist/
+apps/desktop/build/
+
+# JS dependencies -- not needed to build the server image.
+node_modules/
+**/node_modules/
+
+# VCS / editor / CI
+.git/
+.github/
+.vscode/
+.idea/
+
+# Secrets and local config -- never bake these into an image.
+.env
+.env.*
+!.env.example
+
+# Docs, not needed inside the build context.
+*.md
+LICENSE
+
+# Test artifacts
+e2e/playwright-report/
+e2e/test-results/
+coverage/
