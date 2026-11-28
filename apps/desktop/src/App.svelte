@@ -2,7 +2,7 @@
   import { apiFetch, takeLogoutReason, apiBase, setServerUrl } from './lib/api';
   import { wsClient } from './lib/websocket';
   import { onMount } from 'svelte';
-  import { getCurrentUser, login, register, logout, forgotPassword } from './lib/auth';
+  import { getCurrentUser, login, register, logout, forgotPassword, completeTotpLogin, isTwoFactorRequired } from './lib/auth';
   import { deviceEncryptionReady, recoveryChoiceNeeded, recoveryCheckFailed, resetDeviceEncryptionSetup } from './lib/recovery';
   import ServerRail from './components/ServerRail.svelte';
   import SvalinnGauge from './components/SvalinnGauge.svelte';
@@ -121,6 +121,14 @@
   // shows the generic "check your email" message.
   let forgotDevLink: string | undefined;
 
+  // 2FA login step: `login()` returns a pending token instead of a session
+  // when the account has TOTP enabled. Set, the login card swaps to a
+  // code-entry screen (see template below) in place of the normal form.
+  let pendingTotpToken: string | null = null;
+  let totpLoginCode = '';
+  let totpLoginError = '';
+  let totpLoginBusy = false;
+
   function handleServerSelected(event: CustomEvent<string | null>) {
     activeServer = event.detail;
     activeChannel = null;
@@ -189,8 +197,14 @@
       serverUrl = setServerUrl(serverUrl);
       editingServer = false;
       if (isLoginMode) {
-        const user = await login(authEmail, authPassword);
-        currentUser = user;
+        const result = await login(authEmail, authPassword);
+        if (isTwoFactorRequired(result)) {
+          pendingTotpToken = result.pendingToken;
+          totpLoginCode = '';
+          totpLoginError = '';
+        } else {
+          currentUser = result;
+        }
       } else {
         const user = await register(authUsername, authEmail, authPassword);
         currentUser = user;
@@ -204,6 +218,28 @@
     } finally {
       authLoading = false;
     }
+  }
+
+  async function handleTotpLoginSubmit(e: Event) {
+    e.preventDefault();
+    if (!pendingTotpToken) return;
+    totpLoginError = '';
+    totpLoginBusy = true;
+    try {
+      currentUser = await completeTotpLogin(pendingTotpToken, totpLoginCode);
+      pendingTotpToken = null;
+      totpLoginCode = '';
+    } catch (err: any) {
+      totpLoginError = err.message || 'That code is incorrect';
+    } finally {
+      totpLoginBusy = false;
+    }
+  }
+
+  function cancelTotpLogin() {
+    pendingTotpToken = null;
+    totpLoginCode = '';
+    totpLoginError = '';
   }
 
   function openForgotPassword() {
@@ -358,10 +394,48 @@
         Svalinn
       </h1>
       <p class="text-xs text-[#00aa00] text-center mb-6 terminal-glow">
-        {'>'} {showForgotPassword ? 'Reset your password' : (isLoginMode ? 'Access the network' : 'Join the network')}
+        {'>'} {showForgotPassword ? 'Reset your password' : pendingTotpToken ? 'Two-factor check' : (isLoginMode ? 'Access the network' : 'Join the network')}
       </p>
 
-      {#if showForgotPassword}
+      {#if pendingTotpToken}
+        <form on:submit={handleTotpLoginSubmit} class="space-y-4">
+          <p class="text-xs text-[#00aa00]">
+            Enter the 6-digit code from your authenticator app, or one of your backup codes.
+          </p>
+
+          <div>
+            <label for="totp-login-code" class="block text-xs text-[#00aa00] uppercase tracking-wider mb-1">Code</label>
+            <input
+              id="totp-login-code"
+              bind:value={totpLoginCode}
+              type="text"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              class="w-full bg-black border border-[#00ff00] px-3 py-2 text-[#00ff00] focus:outline-none focus:shadow-[0_0_10px_rgba(0,255,0,0.3)]"
+              placeholder="123456"
+              required
+            />
+          </div>
+
+          {#if totpLoginError}
+            <div class="text-xs text-red-500 terminal-glow">{'>'} {totpLoginError}</div>
+          {/if}
+
+          <button
+            type="submit"
+            disabled={totpLoginBusy}
+            class="w-full py-2 bg-[#00ff00] text-black font-bold uppercase tracking-wider hover:bg-[#00aa00] transition-all terminal-glow disabled:opacity-50"
+          >
+            {totpLoginBusy ? 'Verifying...' : 'Verify'}
+          </button>
+        </form>
+
+        <div class="mt-6 text-center">
+          <button class="text-xs text-[#00aa00] hover:text-[#00ff00] terminal-glow" on:click={cancelTotpLogin}>
+            Back to login
+          </button>
+        </div>
+      {:else if showForgotPassword}
         <form on:submit={handleForgotPasswordSubmit} class="space-y-4">
           <p class="text-xs text-[#00aa00]">
             Enter your account's email and we'll send a link to reset your password.

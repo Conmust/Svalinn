@@ -14,6 +14,7 @@ mod rate_limit;
 mod sessions;
 mod stats;
 mod tiers;
+mod totp;
 mod voice;
 mod routes;
 
@@ -116,6 +117,7 @@ async fn main() {
         .route("/api/v1/auth/forgot-password", post(routes::auth::forgot_password))
         .route("/api/v1/auth/reset-password", post(routes::auth::reset_password))
         .route("/api/v1/auth/reset-password-page", get(routes::auth::reset_password_page))
+        .route("/api/v1/auth/2fa/login", post(routes::auth::totp_login))
 
         // --- Server Routes ---
         .route("/api/v1/servers", get(routes::servers::get_user_servers))
@@ -207,6 +209,10 @@ async fn main() {
         .route("/api/v1/users/me/account", get(routes::users::get_account))
         .route("/api/v1/users/me/email", patch(routes::users::change_email))
         .route("/api/v1/users/me/password", axum::routing::put(routes::users::change_password))
+        .route("/api/v1/users/me/2fa/setup", post(routes::users::setup_totp))
+        .route("/api/v1/users/me/2fa/enable", post(routes::users::enable_totp))
+        .route("/api/v1/users/me/2fa/disable", post(routes::users::disable_totp))
+        .route("/api/v1/users/me/2fa/backup-codes/regenerate", post(routes::users::regenerate_backup_codes))
         .route("/api/v1/users/me/heartbeat", post(routes::users::heartbeat))
         .route("/api/v1/users/me/avatar", patch(routes::users::update_avatar))
         .route("/api/v1/users/me/badge-emblem", patch(routes::users::update_badge_emblem))
