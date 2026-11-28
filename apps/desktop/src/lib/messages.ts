@@ -85,6 +85,12 @@ export interface Message {
   recipients?: MessageRecipientEntry[];
   is_hidden?: boolean;
   reactions?: Reaction[];
+  /** Who this message `@mentions` -- resolved by the SENDING client from
+   * its own plaintext before encrypting it (the server never sees channel
+   * message content, so it can't detect mentions itself; see
+   * `sendChannelMessage`'s `mentionedUserIds` option). Always present from
+   * the server, defaulting to `[]`. */
+  mentioned_user_ids?: string[];
 }
 
 export interface Reaction {
@@ -165,6 +171,12 @@ export interface SendChannelMessageOptions {
    * passed as `attachment` below. Only meaningful alongside an
    * `attachment`. */
   attachmentNonce?: string;
+  /** Who this message `@mentions` -- resolved from the plaintext content
+   * BEFORE it was encrypted (see `ChatArea`'s send flow), since the
+   * server never sees that plaintext and so can't detect mentions
+   * itself. Every id here must currently be able to view this channel; the
+   * server rejects the whole send otherwise. Defaults to `[]`. */
+  mentionedUserIds?: string[];
 }
 
 /** Thrown by `sendChannelMessage` on a non-OK response. Carries the HTTP
@@ -210,6 +222,7 @@ export async function sendChannelMessage(
           attachment_key_ratchet_header_json: r.attachmentKeyRatchetHeaderJson ?? null,
         })),
         sender_device_id: options.senderDeviceId,
+        mentioned_user_ids: options.mentionedUserIds ?? [],
       }),
     }),
     CHANNEL_MESSAGE_NETWORK_TIMEOUT_MS,

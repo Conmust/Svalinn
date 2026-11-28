@@ -4,6 +4,7 @@
   import ReactionPicker from './ReactionPicker.svelte';
   import Avatar from './Avatar.svelte';
   import type { Message } from '../lib/messages';
+  import { splitMentionSegments } from '../lib/mentions';
 
   export let message: Message;
   export let currentUserId: string = '';
@@ -13,6 +14,14 @@
   export let selectionMode: boolean = false;
   export let isSelected: boolean = false;
   export let isHighlighted: boolean = false;
+  /** Usernames this message `@mentions` (resolved from `message.mentioned_user_ids`
+   * by the caller, which has the server's member list) -- only these get
+   * highlighted in the rendered content, never an arbitrary "@word" that
+   * merely looks like a mention. */
+  export let mentionUsernames: string[] = [];
+
+  $: mentionsMe = (message.mentioned_user_ids ?? []).includes(currentUserId);
+  $: contentSegments = message.content ? splitMentionSegments(message.content, mentionUsernames) : [];
 
   const dispatch = createEventDispatcher<{
     select: string;
@@ -87,7 +96,7 @@
   </div>
 {:else}
 <div
-  class="group relative flex gap-3 px-4 py-2 hover:bg-[rgba(0,255,0,0.05)] transition-colors {isHighlighted ? 'bg-[rgba(0,255,0,0.1)] border-l-2 border-[#00ff00]' : ''} {message.is_pinned ? 'border-l-2 border-[#00aa00]' : ''}"
+  class="group relative flex gap-3 px-4 py-2 hover:bg-[rgba(0,255,0,0.05)] transition-colors {isHighlighted ? 'bg-[rgba(0,255,0,0.1)] border-l-2 border-[#00ff00]' : mentionsMe ? 'bg-[rgba(255,204,0,0.08)] border-l-2 border-[#ffcc00]' : ''} {message.is_pinned ? 'border-l-2 border-[#00aa00]' : ''}"
 >
   <!-- Selection Checkbox -->
   {#if selectionMode}
@@ -169,7 +178,7 @@
         class="text-sm whitespace-pre-wrap break-words {message.revealed_fallback ? 'text-[#ffaa00]' : 'text-[#00ff00]'}"
         title={message.revealed_fallback ? "This device has no decryption key for this message -- showing the moderator-revealed copy instead" : undefined}
       >
-        {message.content}{#if message.is_edited && !showHeader}<span class="ml-1 text-[10px] text-[#00aa00] italic">(edited)</span>{/if}
+        {#each contentSegments as segment}{#if segment.isMention}<span class="bg-[#00ff00]/20 text-[#00ff00] font-semibold rounded px-0.5">{segment.text}</span>{:else}{segment.text}{/if}{/each}{#if message.is_edited && !showHeader}<span class="ml-1 text-[10px] text-[#00aa00] italic">(edited)</span>{/if}
       </div>
     {/if}
 

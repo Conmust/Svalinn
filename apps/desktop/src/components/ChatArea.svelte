@@ -29,6 +29,8 @@
   import { withTimeout, TimeoutError } from '../lib/timeout';
   import { encryptMessage, decryptMessage, RatchetNotSupportedError, b64, fromB64, type RatchetEnvelope } from '../lib/ratchet';
   import { getCachedPlaintext, cachePlaintext, deleteCachedPlaintext } from '../lib/message-history';
+  import { fetchServerMembers, type Member } from '../lib/members';
+  import { extractMentionedUsernames } from '../lib/mentions';
 
   // --- Encryption error boundary -------------------------------------------
   // Mirrors `DMChatArea.svelte`'s identically-named helper: a broken
@@ -398,6 +400,43 @@
       fail(e instanceof TimeoutError ? e.message : 'Failed to decrypt attachment');
     }
   }
+
+  /** This server's members, for resolving `@username` mentions typed in
+   * the composer and for rendering a sent message's `mentioned_user_ids`
+   * back into highlighted `@username` text. Fetched fresh per server
+   * (unlike `channelMemberDevices`, membership itself -- not device lists
+   * -- is server-wide, so this doesn't need to reload on every channel
+   * switch within the same server). Best-effort: if this fails to load,
+   * mentions just silently don't resolve for this session rather than
+   * blocking sending. */
+  let serverMembers: Member[] = [];
+  $: usernameToId = new Map(serverMembers.map(m => [m.username.toLowerCase(), m.id]));
+  $: idToUsername = new Map(serverMembers.map(m => [m.id, m.username]));
+  /** This message's `mentioned_user_ids` resolved to usernames, for
+   * `MessageItem`'s `mentionUsernames` prop -- a mentioned member no
+   * longer in `serverMembers` (left since, say) is simply left out, since
+   * there's no username left to highlight. */
+  function mentionUsernamesFor(message: Message): string[] {
+    const usernames: string[] = [];
+    for (const id of message.mentioned_user_ids ?? []) {
+      const username = idToUsername.get(id);
+      if (username) usernames.push(username);
+    }
+    return usernames;
+  }
+  async function loadServerMembers() {
+    const forServer = serverId;
+    try {
+      const members = await fetchServerMembers(forServer);
+      if (forServer !== serverId) return;
+      serverMembers = members;
+    } catch (e) {
+      if (forServer !== serverId) return;
+      console.error('Failed to load server members for @mentions:', e);
+      serverMembers = [];
+    }
+  }
+  $: if (serverId) loadServerMembers();
 
   /** Every registered device of every current member of this channel's
    * server -- fetched fresh per channel, since (unlike a DM's fixed pair)
@@ -794,9 +833,17 @@
     devices: ParticipantDevice[],
     file: File | null
   ): Promise<Message> {
+    // Resolved from the PLAINTEXT content here, before it's encrypted --
+    // the server never sees this text, so it has no way to detect mentions
+    // itself. Only a real server member's username resolves; anything else
+    // typed as "@word" is sent as plain text.
+    const mentionedUserIds = extractMentionedUsernames(content, serverMembers.map(m => m.username)).map(
+      u => usernameToId.get(u.toLowerCase())!
+    );
+
     if (!file) {
       const encryptedFor = await Promise.all(devices.map(d => encryptForDevice(d, content)));
-      return sendChannelMessage(channelId, null, { encryptedFor, senderDeviceId: myDeviceId as string });
+      return sendChannelMessage(channelId, null, { encryptedFor, senderDeviceId: myDeviceId as string, mentionedUserIds });
     }
 
     // Hybrid encryption, same as the DM attachment flow: the file is
@@ -827,7 +874,7 @@
     return sendChannelMessage(
       channelId,
       { url: uploaded.url, filename: file.name, size: file.size, mime_type: file.type || 'application/octet-stream' },
-      { encryptedFor, senderDeviceId: myDeviceId as string, attachmentNonce }
+      { encryptedFor, senderDeviceId: myDeviceId as string, attachmentNonce, mentionedUserIds }
     );
   }
 
@@ -1057,6 +1104,7 @@
           <MessageItem
             {message}
             currentUserId={currentUser?.id ?? ''}
+            mentionUsernames={mentionUsernamesFor(message)}
             {canModerate}
             {showHeader}
             {selectionMode}

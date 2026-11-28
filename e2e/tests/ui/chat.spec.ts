@@ -42,6 +42,37 @@ test('messages arrive live for others, once for the sender', async ({ browser })
   expect(pageErrors(memberPage)).toEqual([]);
 });
 
+test('an @mention is highlighted for everyone, and the mentioned member\'s own row stands out', async ({ browser }) => {
+  const { member, ownerPage, memberPage } = await twoMembers(browser);
+  await sendMessage(ownerPage, `hey @${member.user.username}, check this out`);
+
+  const ownerRow = messageRow(ownerPage, 'check this out');
+  const memberRow = messageRow(memberPage, 'check this out');
+  // Only a real server member's username is turned into a highlighted
+  // span -- rendered as a distinct element, not just matching substring
+  // text -- and it renders the same way in both the sender's and the
+  // recipient's copy of the message. Scoped to the message body itself
+  // (`.whitespace-pre-wrap`), since the row also has unrelated spans
+  // (timestamp, reactions).
+  await expect(ownerRow.locator('.whitespace-pre-wrap span', { hasText: `@${member.user.username}` })).toBeVisible();
+  await expect(memberRow.locator('.whitespace-pre-wrap span', { hasText: `@${member.user.username}` })).toBeVisible();
+
+  // The amber mention-highlight on the row itself is specific to the
+  // mentioned viewer -- the sender's own copy of the same message isn't
+  // highlighted, since the mention isn't of them.
+  await expect(memberRow).toHaveClass(/border-\[#ffcc00\]/);
+  await expect(ownerRow).not.toHaveClass(/border-\[#ffcc00\]/);
+});
+
+test('typing "@word" that matches no server member renders as plain text, not a mention', async ({ browser }) => {
+  const { ownerPage, memberPage } = await twoMembers(browser);
+  await sendMessage(ownerPage, 'reach me at alice@example.com please');
+
+  const memberRow = messageRow(memberPage, 'reach me at alice@example.com please');
+  await expect(memberRow).toBeVisible();
+  await expect(memberRow.locator('.whitespace-pre-wrap span')).toHaveCount(0);
+});
+
 test('image attachments display for everyone', async ({ browser }) => {
   const { ownerPage, memberPage } = await twoMembers(browser);
   await ownerPage.locator('input[type=file]').setInputFiles(pngFile());

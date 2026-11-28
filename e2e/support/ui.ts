@@ -55,9 +55,15 @@ export async function openChannel(page: Page, serverName: string, channel = 'gen
   // Waiting for it here, rather than leaving every caller to discover
   // the race on its own, is what made that flake show up consistently
   // across unrelated tests that otherwise never touched this file.
+  // `ChatArea` only mounts once a channel is selected (see `App.svelte`),
+  // so its server-members fetch -- used to resolve "@username" mentions
+  // typed in the composer -- starts at the same moment, and races a
+  // send the same way.
   const deviceListLoaded = page.waitForResponse((r) => r.url().includes('/member-devices'), { timeout: 10_000 }).catch(() => {});
+  const membersLoaded = page.waitForResponse((r) => /\/servers\/[^/]+\/members$/.test(r.url()), { timeout: 10_000 }).catch(() => {});
   await page.getByText(`# ${channel}`, { exact: true }).click();
   await deviceListLoaded;
+  await membersLoaded;
 }
 
 export async function sendMessage(page: Page, text: string) {
